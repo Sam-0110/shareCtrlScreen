@@ -71,6 +71,10 @@ pub struct Config {
     pub share_display_id: Option<String>,
     /// Remote IDs connected to, most-recent-first (autocomplete). Capped.
     pub recent_ids: Vec<String>,
+    /// Remote ID → a friendly name the user gave it ("Office PC"). Local only,
+    /// never sent anywhere. Kept apart from `recent_ids`, so clearing the
+    /// recents does not forget names, and a named ID stays listed.
+    pub remote_names: BTreeMap<String, String>,
     /// Viewer-side: capture OS-reserved shortcuts (Alt+Tab/Win) locally.
     pub capture_shortcuts: bool,
     /// Mirror clipboard TEXT between the two machines during a session. Host
@@ -103,6 +107,10 @@ pub struct Config {
 }
 
 const MAX_RECENTS: usize = 10;
+/// Upper bound on named remote IDs, so a hand-edited file cannot grow unbounded.
+const MAX_REMOTE_NAMES: usize = 200;
+/// Longest name kept, in characters.
+pub const MAX_REMOTE_NAME_CHARS: usize = 40;
 
 impl Default for Config {
     fn default() -> Self {
@@ -120,6 +128,7 @@ impl Default for Config {
             share_audio: true,
             share_display_id: None,
             recent_ids: Vec::new(),
+            remote_names: BTreeMap::new(),
             capture_shortcuts: false,
             clipboard_sync: true,
             paste_dropped_files: true,
@@ -185,6 +194,35 @@ impl Config {
         self.recent_ids.truncate(MAX_RECENTS);
     }
 
+    /// Name (or rename) a remote ID. An empty or whitespace-only `name`
+    /// removes the name. Returns false, changing nothing, when `id` is not
+    /// usable or the list of names is full.
+    pub fn set_remote_name(&mut self, id: &str, name: &str) -> bool {
+        let Some(key) = remote_name_key(id) else {
+            return false;
+        };
+        match clean_remote_name(name) {
+            None => {
+                self.remote_names.remove(&key);
+            }
+            Some(name) => {
+                if !self.remote_names.contains_key(&key)
+                    && self.remote_names.len() >= MAX_REMOTE_NAMES
+                {
+                    return false;
+                }
+                self.remote_names.insert(key, name);
+            }
+        }
+        true
+    }
+
+    /// The name given to `id`, if any.
+    pub fn remote_name(&self, id: &str) -> Option<&str> {
+        let key = remote_name_key(id)?;
+        self.remote_names.get(&key).map(String::as_str)
+    }
+
     /// Repair an untrusted/partial deserialized value in place: lower-case the
     /// UUID, clamp enums, cap recents (config.js `normalize`).
     pub fn normalize(&mut self) {
@@ -192,6 +230,15 @@ impl Config {
         // Fail-safe: password mode with no hash behaves like approve (§5).
         self.recent_ids.retain(|x| x.len() <= 64);
         self.recent_ids.truncate(MAX_RECENTS);
+        let names = std::mem::take(&mut self.remote_names);
+        for (id, name) in names {
+            if self.remote_names.len() >= MAX_REMOTE_NAMES {
+                break;
+            }
+            if let (Some(key), Some(name)) = (remote_name_key(&id), clean_remote_name(&name)) {
+                self.remote_names.insert(key, name);
+            }
+        }
     }
 
     /// Effective mode honouring the §5 fail-safe: `password` with no hash ⇒
@@ -237,6 +284,29 @@ impl Config {
         std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
         std::fs::rename(&tmp, path)
     }
+}
+
+/// The map key for a remote ID: trimmed and lower-cased (the UI accepts only
+/// lower-case UUIDs, but a hand-edited file may not). `None` if unusable.
+fn remote_name_key(id: &str) -> Option<String> {
+    let id = id.trim();
+    if id.is_empty() || id.len() > 64 {
+        return None;
+    }
+    Some(id.to_lowercase())
+}
+
+/// A name as stored: control characters dropped, runs of whitespace folded to
+/// one space, trimmed, capped at `MAX_REMOTE_NAME_CHARS`. `None` if empty.
+fn clean_remote_name(name: &str) -> Option<String> {
+    let folded = name
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let capped: String = folded.chars().take(MAX_REMOTE_NAME_CHARS).collect();
+    let capped = capped.trim_end().to_string();
+    (!capped.is_empty()).then_some(capped)
 }
 
 /// Constant-time comparison of two equal-purpose hex strings. Returns false if
@@ -301,6 +371,73 @@ mod tests {
         cfg.add_recent("id-14"); // dup moves to front, no growth
         assert_eq!(cfg.recent_ids.len(), MAX_RECENTS);
         assert_eq!(cfg.recent_ids[0], "id-14");
+    }
+
+    #[test]
+    fn remote_names_set_rename_and_remove() {
+        let mut cfg = Config::default();
+        let id = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        assert!(cfg.set_remote_name(id, "  Office \t PC\n "));
+        assert_eq!(cfg.remote_name(id), Some("Office PC"));
+        // Case and surrounding space in the ID do not matter.
+        assert_eq!(
+            cfg.remote_name(&format!(" {} ", id.to_uppercase())),
+            Some("Office PC")
+        );
+        assert!(cfg.set_remote_name(id, "Home"));
+        assert_eq!(cfg.remote_name(id), Some("Home"));
+        assert_eq!(cfg.remote_names.len(), 1);
+        // An empty name removes it.
+        assert!(cfg.set_remote_name(id, "   "));
+        assert_eq!(cfg.remote_name(id), None);
+        assert!(cfg.remote_names.is_empty());
+        // Unusable IDs are refused.
+        assert!(!cfg.set_remote_name("", "x"));
+        assert!(!cfg.set_remote_name(&"a".repeat(65), "x"));
+    }
+
+    #[test]
+    fn remote_names_are_capped_in_length_and_count() {
+        let mut cfg = Config::default();
+        assert!(cfg.set_remote_name("id", &"é".repeat(100)));
+        assert_eq!(
+            cfg.remote_name("id").unwrap().chars().count(),
+            MAX_REMOTE_NAME_CHARS
+        );
+        let mut cfg = Config::default();
+        for i in 0..MAX_REMOTE_NAMES {
+            assert!(cfg.set_remote_name(&format!("id-{i}"), "n"));
+        }
+        assert!(!cfg.set_remote_name("one-too-many", "n"));
+        // Renaming and removing still work when full.
+        assert!(cfg.set_remote_name("id-0", "renamed"));
+        assert!(cfg.set_remote_name("id-1", ""));
+        assert!(cfg.set_remote_name("one-more", "n"));
+    }
+
+    #[test]
+    fn remote_names_survive_clearing_recents_and_older_files() {
+        let old: Config = serde_json::from_str(r#"{"uuid":"u"}"#).unwrap();
+        assert!(old.remote_names.is_empty());
+        let mut cfg = Config::default();
+        cfg.add_recent("abc");
+        cfg.set_remote_name("abc", "Laptop");
+        cfg.recent_ids.clear();
+        assert_eq!(cfg.remote_name("abc"), Some("Laptop"));
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains(r#""remoteNames":{"abc":"Laptop"}"#), "{json}");
+    }
+
+    #[test]
+    fn normalize_cleans_hand_edited_remote_names() {
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"remoteNames":{"ABC":"  Desk  top ","empty":"   ","x":"ok"}}"#,
+        )
+        .unwrap();
+        cfg.normalize();
+        assert_eq!(cfg.remote_names.len(), 2);
+        assert_eq!(cfg.remote_name("abc"), Some("Desk top"));
+        assert_eq!(cfg.remote_name("x"), Some("ok"));
     }
 
     #[test]

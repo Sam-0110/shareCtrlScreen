@@ -490,6 +490,21 @@ impl Engine {
         Vec::new()
     }
 
+    /// UI action: name, rename or (with an empty `name`) un-name a remote ID.
+    /// Returns every name, so the UI can redraw from one source of truth.
+    pub fn set_remote_name(
+        &self,
+        id: &str,
+        name: &str,
+    ) -> std::collections::BTreeMap<String, String> {
+        let mut names = None;
+        self.update_config(|c| {
+            c.set_remote_name(id, name);
+            names = Some(c.remote_names.clone());
+        });
+        names.unwrap_or_default()
+    }
+
     async fn on_password_required(&self, from: String, nonce: String) {
         self.pending_nonce.lock().insert(from.clone(), nonce);
 
