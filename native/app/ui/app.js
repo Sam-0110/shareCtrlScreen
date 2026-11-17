@@ -116,14 +116,39 @@ async function reloadConfig() {
 
 const shortId = (id) => (id.length > 14 ? id.slice(0, 8) + '…' : id);
 
+// Friendly names the user gave remote IDs (config.remoteNames, id -> name).
+const nameOf = (id) =>
+  (config && config.remoteNames && id && config.remoteNames[id.trim().toLowerCase()]) || '';
+// "Office PC (0f8fad5b-…)" when named, else the bare ID.
+const peerLabel = (id) => {
+  const n = nameOf(id);
+  return n ? `${n} (${id})` : id || '';
+};
+
+async function saveRemoteName(id, name) {
+  if (!validUuid(id) || nameOf(id) === name.trim()) return;
+  try {
+    config.remoteNames = await invoke('set_remote_name', { id, name });
+  } catch (_) {
+    toast('Could not save the name', 'error');
+    return;
+  }
+  renderRecents();
+}
+
 function renderRecents() {
-  const ids = (config && config.recentIds) || [];
+  const recent = (config && config.recentIds) || [];
+  const names = (config && config.remoteNames) || {};
+  // Recent IDs first, then named IDs that have dropped off the recents, so a
+  // machine the user named stays one click away.
+  const ids = recent.concat(Object.keys(names).filter((id) => !recent.includes(id)));
 
   const dl = $('recent-ids');
   dl.innerHTML = '';
   for (const id of ids) {
     const o = document.createElement('option');
     o.value = id;
+    if (nameOf(id)) o.label = nameOf(id);
     dl.appendChild(o);
   }
 
@@ -139,9 +164,10 @@ function renderRecents() {
   for (const id of ids) {
     const chip = document.createElement('button');
     chip.type = 'button';
-    chip.className = 'recent-chip';
-    chip.textContent = shortId(id);
-    chip.title = id;
+    const name = nameOf(id);
+    chip.className = 'recent-chip' + (name ? ' named' : '');
+    chip.textContent = name || shortId(id);
+    chip.title = name ? `${name}\n${id}` : id;
     chip.addEventListener('click', () => {
       const input = $('remote-id');
       input.value = id;
@@ -151,10 +177,13 @@ function renderRecents() {
     row.appendChild(chip);
   }
 
+  // "Clear" empties the recents only; named IDs are kept until un-named.
+  if (!recent.length) return;
   const clear = document.createElement('button');
   clear.type = 'button';
   clear.className = 'recent-clear';
   clear.textContent = 'Clear';
+  clear.title = 'Clear recent IDs (named IDs are kept)';
   clear.addEventListener('click', async () => {
     try {
       config.recentIds = await invoke('clear_recents');
@@ -629,15 +658,43 @@ $('btn-copy').addEventListener('click', async () => {
   }
 });
 
+// The ID the name field currently belongs to, so typing a name is not
+// overwritten until the ID itself changes.
+let nameFieldFor = null;
+function syncNameField() {
+  const v = $('remote-id').value.trim();
+  const field = $('remote-name');
+  const id = validUuid(v) ? v : null;
+  field.disabled = !id;
+  if (id !== nameFieldFor) {
+    nameFieldFor = id;
+    field.value = id ? nameOf(id) : '';
+  }
+}
+
 $('remote-id').addEventListener('input', () => {
   const v = $('remote-id').value.trim();
   $('connect-hint').textContent = v && !validUuid(v) ? 'That does not look like a valid ID.' : '';
+  syncNameField();
   render();
+});
+
+// Saved when the field loses focus or on Enter; clearing it removes the name.
+$('remote-name').addEventListener('change', () => {
+  if (nameFieldFor) saveRemoteName(nameFieldFor, $('remote-name').value);
+});
+$('remote-name').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    $('remote-name').blur();
+  }
 });
 
 $('btn-connect').addEventListener('click', async () => {
   const id = $('remote-id').value.trim();
   if (!validUuid(id)) return;
+  // A name typed but not yet committed (no blur) is kept too.
+  if (nameFieldFor === id) await saveRemoteName(id, $('remote-name').value);
   // Input monitoring only matters for the optional shortcut capture, so a plain
   // connection is never held up by it. When capture is on, sort the grant out
   // once before connecting; the user presses Connect again.
@@ -647,7 +704,7 @@ $('btn-connect').addEventListener('click', async () => {
       'Shortcut capture is on in Settings; it needs this permission to forward shortcuts to the other computer.';
     if (await preflight(['inputMonitoring'], intro)) return;
   }
-  $('requesting-peer').textContent = id;
+  $('requesting-peer').textContent = peerLabel(id);
   setState('REQUESTING');
   stopCountdown();
   // Viewer owns the 30 s timeout (contract §3.3).
@@ -742,7 +799,7 @@ listen('server-status', (e) => {
 
 listen('approval-request', (e) => {
   incomingFrom = e.payload.from;
-  $('incoming-peer').textContent = incomingFrom;
+  $('incoming-peer').textContent = peerLabel(incomingFrom);
   setState('INCOMING');
   stopCountdown();
   // The Rust decider auto-denies at 30 s too; this just mirrors the countdown.
@@ -770,11 +827,11 @@ listen('role-changed', (e) => {
   // the "connection lost" panel is stale.
   $('modal-link').classList.add('hidden');
   if (p.role === 'host') {
-    $('host-peer').textContent = p.peer;
+    $('host-peer').textContent = peerLabel(p.peer);
     $('host-perm').value = p.permission;
     setState('HOST_ACTIVE');
   } else if (p.role === 'viewer') {
-    $('view-peer').textContent = p.peer;
+    $('view-peer').textContent = peerLabel(p.peer);
     const control = p.permission === 'control';
     const badge = $('view-badge');
     badge.textContent = control ? 'CONTROL' : 'VIEW ONLY';
@@ -805,6 +862,7 @@ listen('link-restored', () => {
 // ---- boot ------------------------------------------------------------------
 (async () => {
   await reloadConfig();
+  syncNameField();
   await applyPlatformInfo();
   render();
   // Back-fill the server status: the engine registers ~0.5 s after launch and

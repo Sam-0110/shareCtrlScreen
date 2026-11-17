@@ -97,6 +97,7 @@ fn get_config(state: tauri::State<'_, AppState>) -> serde_json::Value {
         "shareAudio": c.share_audio,
         "shareDisplayId": c.share_display_id,
         "recentIds": c.recent_ids,
+        "remoteNames": c.remote_names,
         "captureShortcuts": c.capture_shortcuts,
         "autoLogin": c.auto_login,
         "clipboardSync": c.clipboard_sync,
@@ -147,6 +148,16 @@ fn get_platform_info(state: tauri::State<'_, AppState>) -> serde_json::Value {
 #[tauri::command]
 fn clear_recents(state: tauri::State<'_, AppState>) -> Vec<String> {
     state.engine.clear_recents()
+}
+
+/// Name a remote ID (an empty name removes it). Returns all names.
+#[tauri::command]
+fn set_remote_name(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    name: String,
+) -> std::collections::BTreeMap<String, String> {
+    state.engine.set_remote_name(&id, &name)
 }
 
 /// Current signaling status, queried by the UI on boot. The one-shot
@@ -639,6 +650,7 @@ fn main() {
             get_config,
             get_platform_info,
             clear_recents,
+            set_remote_name,
             get_server_status,
             get_role,
             connect_to,
