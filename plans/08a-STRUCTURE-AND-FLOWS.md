@@ -576,10 +576,20 @@ emitting `tabs-changed` unless it says otherwise.
 
 ### 6.14 Background pause / resume
 1. [H] advertises `vpause` in the connect-response caps → the viewer learns it per session.
-2. `VPause` → the host stops capture+encode for slot 0; ctl, cursor, heartbeat continue;
-   pop-out slots keep streaming. `VResume` → restart + forced keyframe.
-3. Host without `vpause` → the inactive session drops received frames without decoding;
-   activation sends `KeyframeRequest`.
+2. `VPause` → the host stops capture+encode for slot 0 (cursor updates stop with the capture;
+   ctl and heartbeat continue; pop-out slots keep streaming; the BWE is asked for no more than
+   the floor while nothing streams). `VResume` → capture+encode go on; no forced keyframe.
+3. The viewer decodes (without presenting) whatever still arrives for a background tab, so its
+   held frame is exactly the host screen at the pause; the first capture after the resume
+   carries every change since (the capture backends keep it), so the stream simply goes on.
+4. Host without `vpause` → nothing is sent; it keeps streaming and the tab keeps decoding.
+
+As built after the P6 review: the design first had the viewer drop a background tab's video
+undecoded and the host force a keyframe on resume. That leaves an idle host's tab black or
+stale: a host encodes only when its screen changes, so a forced keyframe never comes while
+nothing moves. Decoding the little that arrives before the pause (and an older host's stream)
+keeps every tab's picture right; the CPU saving the plan asked for remains for `vpause` hosts,
+which send nothing while paused.
 
 ### 6.15 Incoming connection while tabs exist (D1)
 1. [E] gate: any viewer session not Released → reply `busy`. An approval pending or a host

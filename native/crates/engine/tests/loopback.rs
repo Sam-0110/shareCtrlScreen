@@ -1843,8 +1843,8 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
     let a = viewer.open(&host_a.uuid);
     eventually("A presents", t, || presented(&surface_a) >= 10).await;
 
-    // B starts while A is on screen: B streams and decodes, but only the
-    // active tab is shown and presented (P3, I2); A keeps presenting.
+    // B starts while A is on screen, in the background: only the active tab
+    // is shown and presented (P3, I2); A keeps presenting.
     let a_before_b = presented(&surface_a);
     let b = viewer
         .engine
@@ -1858,14 +1858,22 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
         || matches!(host_b.engine.role(), Role::Host { ref peer, .. } if *peer == viewer_id),
     )
     .await;
-    // B is in the background, so host B pauses its main stream (P6): after
-    // the pause lands, it sends nothing more.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    let paused_at = host_b.engine.test_main_units().unwrap_or(0);
+    // B is in the background, so host B pauses its main stream (P6). The
+    // mock screen changes every frame, so a host that kept streaming would
+    // keep counting units.
+    eventually("host B paused", t, || {
+        host_b.engine.test_video_paused() == Some(true)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await; // a frame in flight
+    let paused_at = host_b
+        .engine
+        .test_main_units()
+        .expect("host B has a session");
     tokio::time::sleep(Duration::from_millis(1000)).await;
     assert_eq!(
-        host_b.engine.test_main_units().unwrap_or(0),
-        paused_at,
+        host_b.engine.test_main_units(),
+        Some(paused_at),
         "a background tab's host sends no video"
     );
     eventually("A kept presenting while B started", t, || {
@@ -1894,27 +1902,43 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
     viewer.engine.set_active(Some(a));
 
     let switch_to = |on: SessionId| viewer.engine.set_active(Some(on));
-    // Brought to the front, a paused tab shows a picture within about a
-    // second (P6), and the one it replaced pauses in turn.
-    let (woke, b_before) = (Instant::now(), presented(&surface_b));
+    // Brought to the front, a paused tab's host streams again and new
+    // pictures appear promptly (P6); the tab it replaced pauses in turn.
+    eventually("host B paused again", t, || {
+        host_b.engine.test_video_paused() == Some(true)
+    })
+    .await;
+    let woke = Instant::now();
+    let b_units = host_b
+        .engine
+        .test_main_units()
+        .expect("host B has a session");
     switch_to(b);
-    eventually("B presents once on screen", t, || {
-        presented(&surface_b) > b_before
+    eventually("host B streams again", t, || {
+        host_b
+            .engine
+            .test_main_units()
+            .is_some_and(|u| u > b_units + 3)
+    })
+    .await;
+    let b_before = presented(&surface_b);
+    eventually("B presents the new pictures", t, || {
+        presented(&surface_b) > b_before + 3
     })
     .await;
     assert!(
         woke.elapsed() < Duration::from_secs(5),
-        "B took {:?} to show",
+        "B took {:?} to come back",
         woke.elapsed()
     );
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    let a_paused_at = host_a.engine.test_main_units().unwrap_or(0);
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-    assert_eq!(host_a.engine.test_main_units().unwrap_or(0), a_paused_at);
+    eventually("host A paused", t, || {
+        host_a.engine.test_video_paused() == Some(true)
+    })
+    .await;
     switch_to(a);
 
-    // Switching, 20 times: the old tab is hidden and stops presenting, the
-    // new one is shown and presents (I2).
+    // Switching 20 times (10 rounds there and back): the old tab is hidden
+    // and stops presenting, the new one is shown and presents (I2).
     for round in 0..10 {
         for (on, on_s, off_s) in [(b, &surface_b, &surface_a), (a, &surface_a, &surface_b)] {
             let before = presented(on_s);

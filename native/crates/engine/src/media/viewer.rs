@@ -122,18 +122,6 @@ pub(crate) fn viewer_media_loop(
                     pending.push(next);
                 }
 
-                // A background tab (P6): dropped unseen, not decoded. When it is
-                // back on screen the decoder restarts from a keyframe — the
-                // gate asks the host for one (resume, or a keyframe request to
-                // an older host), and `awaiting_keyframe` keeps deltas out and
-                // asks again each second until it comes.
-                if view.as_ref().is_some_and(|v| !v.is_active()) {
-                    skipped += pending.len() as u64;
-                    awaiting_keyframe = true;
-                    last_kf_req = std::time::Instant::now();
-                    continue;
-                }
-
                 if let Some(k) = pending.iter().rposition(|(_, kf)| *kf) {
                     // A keyframe is queued: decoding from the NEWEST one is
                     // always valid — everything older is pure latency. Skip it.
@@ -205,7 +193,12 @@ pub(crate) fn viewer_media_loop(
                             let (cursor, shape) = current_cursor(&shared, surface.as_ref());
                             // A hidden video (another tab is active, a dialog
                             // covers it) is decoded, so its reference frames
-                            // stay current, but not presented (B5).
+                            // stay current, but not presented (B5). Even a
+                            // background tab decodes what still arrives (its
+                            // host pauses within a round trip, P6): the held
+                            // frame is then exactly the screen at the pause,
+                            // which is what an idle host — sending nothing
+                            // until its screen changes — shows on return.
                             if view.as_ref().is_none_or(|v| v.is_shown()) {
                                 present_frame(
                                     presenter.as_mut(),

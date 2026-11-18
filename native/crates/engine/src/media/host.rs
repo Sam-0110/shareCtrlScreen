@@ -375,9 +375,15 @@ pub(crate) fn host_media_loop(
                 .is_some_and(|s| s.load(Ordering::SeqCst))
     };
     // The bitrate this stream may use: the session's target, split evenly
-    // across the live streams (main + pop-outs).
+    // across the live streams (main + pop-outs) — a paused main stream (P6)
+    // sends nothing, so it takes no share.
     let my_bitrate = || {
-        let n = shared.live_streams.load(Ordering::SeqCst).max(1);
+        let paused = u32::from(shared.video_paused.load(Ordering::SeqCst));
+        let n = shared
+            .live_streams
+            .load(Ordering::SeqCst)
+            .saturating_sub(paused)
+            .max(1);
         (bitrate.load(Ordering::SeqCst) / n).max(crate::tuning::MIN_BITRATE)
     };
     // The host's cursor images (D9). Per session: a new session (including a
@@ -461,16 +467,6 @@ pub(crate) fn host_media_loop(
             std::thread::sleep(MAX_FPS_INTERVAL - since);
         }
         last_frame_at = std::time::Instant::now();
-
-        // Paused by the viewer (its tab is in the background, P6): no capture,
-        // no encode, nothing on the wire for the main stream. Pop-out streams
-        // go on. Checked at a relaxed pace — resuming within a frame or two
-        // of the request is plenty, the resume's keyframe is what the viewer
-        // waits for.
-        if main && shared.video_paused.load(Ordering::SeqCst) {
-            std::thread::sleep(PAUSED_POLL);
-            continue;
-        }
 
         // A monitor switch (host UI, or a controlling viewer). The new capture
         // is opened next to the old one and only replaces it once it AND an
@@ -645,6 +641,18 @@ pub(crate) fn host_media_loop(
             deferred_keys = 0;
         }
 
+        // Paused by the viewer (its tab is in the background, P6): no capture,
+        // no encode, nothing on the wire for the main stream; monitor switches
+        // and size changes above are still applied (and announced). Pop-out
+        // streams go on. Nothing is lost by not capturing: the backends keep
+        // what changed meanwhile (DXGI accumulates it, SCK and PipeWire keep
+        // the newest frame, X11 accumulates damage), so the first capture after
+        // the resume carries every change since the pause, and the viewer —
+        // which decoded everything up to the pause — follows on from there.
+        if main && shared.video_paused.load(Ordering::SeqCst) {
+            std::thread::sleep(PAUSED_POLL);
+            continue;
+        }
         let acquired = cap.acquire(std::time::Duration::from_millis(16));
         match acquired {
             Ok(Some(frame)) => {

@@ -230,13 +230,15 @@ impl TabGate {
         if self.streaming.swap(active, Ordering::SeqCst) == active {
             return;
         }
-        let msg = match (self.host_vpause, active) {
-            (true, false) => ControlMsg::VideoPause,
-            (true, true) => ControlMsg::VideoResume,
-            // An older host keeps streaming; the viewer just stops decoding
-            // (media/viewer.rs) and asks for a fresh start when back.
-            (false, false) => return,
-            (false, true) => ControlMsg::KeyframeRequest { s: 0 },
+        // An older host keeps streaming, and the tab keeps decoding it (only
+        // not presenting), so nothing needs saying: its picture stays current.
+        if !self.host_vpause {
+            return;
+        }
+        let msg = if active {
+            ControlMsg::VideoResume
+        } else {
+            ControlMsg::VideoPause
         };
         let _ = self.ctl.send(serialize(&msg));
     }
@@ -1365,6 +1367,13 @@ impl Session {
             ((v >> 32) as u32, v as u32)
         })
     }
+    /// Whether the viewer paused the main stream (P6), or `None` on a viewer
+    /// session.
+    pub(crate) fn video_paused(&self) -> Option<bool> {
+        self.hooks
+            .as_ref()
+            .map(|h| h.shared.video_paused.load(Ordering::SeqCst))
+    }
     /// Encoded units the main stream has sent, or `None` on a viewer session.
     pub(crate) fn main_units(&self) -> Option<u64> {
         self.hooks
@@ -1396,8 +1405,8 @@ mod tests {
     }
 
     /// What a tab's host is told as it goes to the background and back (P6):
-    /// pause / resume to a host that offers it, a keyframe request to an older
-    /// one when back; never a repeat of the same state.
+    /// pause / resume to a host that offers it, nothing to an older one;
+    /// never a repeat of the same state.
     #[test]
     fn background_tabs_pause_their_host() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1431,7 +1440,8 @@ mod tests {
                 r#"{"t":"vpause"}"#
             ]
         );
-        assert_eq!(sent_for(false, &[false, true]), [r#"{"t":"kf"}"#]);
+        // An older host is told nothing: it keeps streaming, the tab decoding.
+        assert!(sent_for(false, &[false, true, false]).is_empty());
     }
 
     /// D14: a pop-out window's pointer input is preceded by ONE switch of the

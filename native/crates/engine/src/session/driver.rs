@@ -281,6 +281,8 @@ pub(super) fn transport_driver(d: Driver) {
     if host_side {
         tp.set_desired_bitrate(DESIRED_BITRATE);
     }
+    // Host: the desired bitrate last given to the BWE (see 2.7 below).
+    let mut desired_applied = DESIRED_BITRATE;
 
     // ctl messages are QUEUED until the ctl channel opens (they're control
     // state like the initial Perm — losing them desyncs the session) and again
@@ -605,6 +607,24 @@ pub(super) fn transport_driver(d: Driver) {
             }
         }
 
+        // 2.7) Host, background tab (P6): with the main stream paused and no
+        // pop-out streaming, ask the BWE for no more than the floor, so it
+        // does not keep probing (padding) the link up toward a rate nothing
+        // will use; back to the full rate on resume or when a pop-out opens.
+        if host_side {
+            let idle = shared.video_paused.load(Ordering::SeqCst)
+                && shared.host_streams.lock().popouts.is_empty();
+            let want = if idle {
+                crate::tuning::MIN_BITRATE
+            } else {
+                DESIRED_BITRATE
+            };
+            if want != desired_applied {
+                tp.set_desired_bitrate(want);
+                desired_applied = want;
+            }
+        }
+
         // 3) Drive str0m: emit transmits, handle timeouts, surface events.
         match tp.poll_output() {
             Ok(str0m::Output::Transmit(t)) => {
@@ -823,9 +843,8 @@ pub(super) fn transport_driver(d: Driver) {
                                     host_force_key(s, &force_key, &shared);
                                     continue;
                                 }
-                                // Background tab (P6): the main stream stops; a
-                                // resume restarts it with a keyframe, the only
-                                // thing the viewer can decode from after a gap.
+                                // Background tab (P6): the main stream stops until
+                                // the resume.
                                 Ok(protocol::ControlMsg::VideoPause) if host_side => {
                                     tracing::info!(
                                         "viewer paused the main stream (background tab)"
@@ -835,9 +854,10 @@ pub(super) fn transport_driver(d: Driver) {
                                 }
                                 Ok(protocol::ControlMsg::VideoResume) if host_side => {
                                     tracing::info!("viewer resumed the main stream");
-                                    // Keyframe first, so the first frame after the
-                                    // pause is one.
-                                    host_force_key(0, &force_key, &shared);
+                                    // No keyframe needed: the viewer decoded every
+                                    // frame up to the pause, so the stream goes on
+                                    // from there (and an IDR burst is the costliest
+                                    // frame there is).
                                     shared.video_paused.store(false, Ordering::SeqCst);
                                     continue;
                                 }

@@ -150,8 +150,7 @@ falls back to a safe default (H.264 first). The server relays the field opaquely
 
 Optional native-app additions (relayed opaquely; older peers ignore them): an accepting
 response may carry `codec`, `os` and `caps`. `caps.vpause: true` means the host pauses its
-main video on `{"t":"vpause"}` and resumes it, starting with a keyframe, on
-`{"t":"vresume"}` (§4.2); the viewer sends those for a tab in the background
+main video on `{"t":"vpause"}` and resumes it on `{"t":"vresume"}` (§4.2); the viewer sends those for a tab in the background
 (`plans/08-MULTI-SESSION-TABS.md` §3.7).
 
 **Step 4 — WebRTC negotiation.** The **host is the offerer** (it owns the media). Host

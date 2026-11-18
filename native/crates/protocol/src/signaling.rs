@@ -152,9 +152,8 @@ pub struct Caps {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostCaps {
     /// The host pauses the main video on [`crate::ControlMsg::VideoPause`] and
-    /// resumes it with a keyframe on [`crate::ControlMsg::VideoResume`]
-    /// (background tabs, plans/08 §3.7). Without it the viewer keeps
-    /// receiving and simply does not decode a background tab.
+    /// resumes it on [`crate::ControlMsg::VideoResume`] (background tabs,
+    /// plans/08 §3.7). Without it the host keeps streaming to a background tab.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub vpause: bool,
 }

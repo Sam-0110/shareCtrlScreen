@@ -32,8 +32,8 @@ pub enum ControlMsg {
     /// (plans/08 §3.7, 08a §6.14).
     #[serde(rename = "vpause")]
     VideoPause,
-    /// Viewer → Host: back on screen — resume the main stream, starting with a
-    /// keyframe.
+    /// Viewer → Host: back on screen — resume the main stream where it
+    /// stopped (the viewer decoded everything up to the pause).
     #[serde(rename = "vresume")]
     VideoResume,
     /// Host → Viewer: out-of-band cursor position + optional shape id

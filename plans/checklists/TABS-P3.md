@@ -69,5 +69,7 @@ What **is** covered on every OS by `cargo test`:
     0 kbps for video (Task Manager / `nethogs`); the active host streams normally.
 11. Switch to a background tab: a picture appears within about a second
     (`viewer resumed the main stream` in that host's log), and the tab you left pauses.
-12. With a host on an older version (no `vpause`): switching still works; its video keeps
-    flowing while in the background but the viewer's CPU/GPU does not decode it.
+12. With a host on an older version (no `vpause`): switching still works and its video keeps
+    flowing while in the background (the tab decodes but does not draw it).
+13. Background a tab while its host screen is idle (nothing moving), wait a minute, switch
+    back: the picture is right at once, not black or stale.

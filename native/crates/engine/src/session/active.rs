@@ -105,9 +105,6 @@ pub(crate) struct SessionView {
     /// Lock-free copy of `state.shown` for the present loop (B5): a hidden
     /// video is decoded (its reference frames stay current) but not presented.
     shown: AtomicBool,
-    /// Lock-free copy of `state.active` for the media thread: a background
-    /// tab's video is not decoded at all (P6, 08a §6.14).
-    active: AtomicBool,
 }
 
 impl SessionView {
@@ -128,15 +125,7 @@ impl SessionView {
                 ..ViewState::default()
             }),
             shown: AtomicBool::new(false),
-            active: AtomicBool::new(active),
         })
-    }
-
-    /// Whether it is the tab on screen. A background tab drops its video
-    /// unseen: decoding it would only spend CPU/GPU (an older host keeps
-    /// sending; one with `vpause` stops).
-    pub(crate) fn is_active(&self) -> bool {
-        self.active.load(Ordering::SeqCst)
     }
 
     /// Whether its video is (to be) shown: the present loop presents only then.
@@ -181,7 +170,6 @@ impl SessionView {
     fn update(&self, change: impl FnOnce(&mut ViewState)) {
         let mut s = self.state.lock();
         change(&mut s);
-        self.active.store(s.active, Ordering::SeqCst);
         let want =
             !s.gone && s.active && s.ready && !s.trouble && !self.overlay.load(Ordering::SeqCst);
         if want == s.shown {

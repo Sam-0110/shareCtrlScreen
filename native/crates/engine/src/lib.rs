@@ -633,6 +633,12 @@ impl Engine {
         self.with_host_session(|s| s.raw_link_bps())
     }
 
+    /// Whether the host session's viewer paused its main stream (P6).
+    #[doc(hidden)]
+    pub fn test_video_paused(&self) -> Option<bool> {
+        self.with_host_session(|s| s.video_paused())
+    }
+
     /// Encoded units the host session's main stream has sent.
     #[doc(hidden)]
     pub fn test_main_units(&self) -> Option<u64> {
