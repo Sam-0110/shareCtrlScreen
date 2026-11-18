@@ -34,6 +34,17 @@ opening, closing, reordering and the active tab in the workspace
 10. Pop-outs: open a pop-out on tab A, switch to tab B and open one there: both stay open; closing
     tab A closes only A's.
 11. While being viewed by another computer, connecting a tab is refused with the reason.
+12. **P5, two computers on one account.** On laptop A open 3 named tabs; sign in on desktop B:
+    the same 3 tabs appear, disconnected. Rename one on B: A shows it after its next sync. Close
+    one on A: it disappears on B — unless it is connected on B, where it stays until it is
+    disconnected, then goes. Take B offline for a week (or set its clock back): the closed tab
+    does not come back.
+13. Hold Ctrl+Alt+PageDown (Cmd+Option on macOS) inside a video: the tabs keep stepping and no
+    host ever receives a PageDown. One press steps exactly one tab (the menu and the page do not
+    step it twice). On a keyboard with AltGr (Windows), note whether AltGr+PageDown switches
+    tabs.
+14. Quit with ⌘Q (macOS) / the window's close (all OSes) while connected: each host sees the
+    session end at once.
 
 ## Record
 

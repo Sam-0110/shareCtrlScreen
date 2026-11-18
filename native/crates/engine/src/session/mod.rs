@@ -712,9 +712,12 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
         let ui = engine.ui_sender();
         Arc::new(Mutex::new(
             KeyTranslator::new(viewer_os, host_os, engine.translate_modifiers_handle())
-                .with_tab_shortcuts(Box::new(move |step| {
-                    let _ = ui.send(crate::UiEvent::TabShortcut(step));
-                })),
+                .with_tab_shortcuts(
+                    Box::new(move |step| {
+                        let _ = ui.send(crate::UiEvent::TabShortcut(step));
+                    }),
+                    engine.tab_chord_keys(),
+                ),
         ))
     };
 

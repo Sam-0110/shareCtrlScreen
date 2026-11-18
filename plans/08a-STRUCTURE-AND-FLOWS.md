@@ -169,8 +169,13 @@ As built in P4: `connect` keeps returning the `SessionId` (no separate `reserve_
 TabManager holds its lock across `Engine::connect` and the bridge takes the same lock for every
 viewer event, so the id is recorded before the session's first event is applied (I4). A
 surface is made (on the UI thread) before `connect` and destroyed on `Released`, keyed by
-session, so a reconnect never races its predecessor's teardown. A disconnect while the surface
-is still being made cancels the connection before the host is asked. The snapshot is
+session; a reconnect while the previous session with that host is still being torn down waits
+for it (up to 5 s) instead of failing. A disconnect, an account switch or the app exiting while
+the surface is still being made stops the connection before the host is asked. A tab closed on
+another computer while connected here stays in the strip, and on screen, until it disconnects
+(§6.12 step 5, P5); the tab on screen is the TabManager's, so a sync clearing the workspace's
+`active_tab` does not take it away. The tab on screen is decided and applied under the
+TabManager's lock, so two callers cannot cross. The snapshot is
 `{tabs: [{remoteId, name, phase, passwordReason, permission, troubleSecs, lastEnd, autoSignIn,
 displays}], active, connected, hosting, signedOut}`; `phase` is
 `disconnected | connecting | password | live`. A wrong typed password ends the session with

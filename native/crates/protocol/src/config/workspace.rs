@@ -675,6 +675,38 @@ mod tests {
             .collect();
         assert!(keys.windows(2).all(|p| p[0] < p[1]), "{keys:?}");
     }
+
+    /// P5 acceptance, as data: tabs opened on one computer appear on another,
+    /// a rename follows, and a close stays closed even after the other
+    /// computer comes back a week later with its old copy.
+    #[test]
+    fn tabs_follow_the_account_and_a_close_stays_closed() {
+        const DAY: u64 = 24 * 3600 * 1000;
+        let t0 = 1_800_000_000_000;
+        let mut laptop = Workspace::default();
+        for (i, t) in [T1, T2, T3].iter().enumerate() {
+            laptop.open_tab(t, t0 + i as u64);
+        }
+        laptop.set_remote_name(T1, "Office", t0 + 5);
+        let mut desktop = Workspace::default();
+        desktop.apply_sync_doc(&laptop.sync_doc(true, true), t0 + 10, true, true);
+        assert_eq!(desktop.open_tabs(), laptop.open_tabs());
+        assert_eq!(desktop.remote_name(T1), Some("Office"));
+
+        // Renamed on the desktop: the laptop shows it after its next sync.
+        desktop.set_remote_name(T1, "Office PC", t0 + 20);
+        laptop.apply_sync_doc(&desktop.sync_doc(true, true), t0 + 30, true, true);
+        assert_eq!(laptop.remote_name(T1), Some("Office PC"));
+
+        // Closed on the laptop while the desktop is away for a week; the
+        // desktop's stale copy (T2 still open) does not bring it back.
+        let stale = desktop.sync_doc(true, true);
+        laptop.close_tab(T2, t0 + 40);
+        laptop.apply_sync_doc(&stale, t0 + 7 * DAY, true, true);
+        assert_eq!(laptop.open_tabs(), [T1, T3]);
+        desktop.apply_sync_doc(&laptop.sync_doc(true, true), t0 + 7 * DAY, true, true);
+        assert_eq!(desktop.open_tabs(), [T1, T3]);
+    }
     use crate::sync::{now_ms, FEATURE_PREFS};
 
     const X: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";

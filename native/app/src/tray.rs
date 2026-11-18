@@ -25,7 +25,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use engine::Role;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
@@ -86,10 +85,9 @@ pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
         return;
     }
     api.prevent_close();
-    let engine = &window.app_handle().state::<AppState>().engine;
-    if !matches!(engine.role(), Role::Idle) {
-        engine.end_all();
-    }
+    // Every session, including tabs still connecting or waiting for a
+    // password (a late accept must not go live behind a hidden window).
+    window.app_handle().state::<AppState>().engine.end_all();
     if let Err(e) = window.hide() {
         tracing::warn!("hiding the window to the tray failed: {e}");
     } else {
@@ -117,12 +115,9 @@ pub fn handle_menu_event(app: &tauri::AppHandle, id: &str) -> bool {
             // Exit only once every session is released (≤ 3 s): a host's
             // transport thread then has released remotely held keys and
             // sent its Bye (08a §6.17, I9).
-            let engine = app.state::<AppState>().engine.clone();
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                engine
-                    .end_all_and_wait(std::time::Duration::from_secs(3))
-                    .await;
+                crate::end_sessions_for_exit(&app).await;
                 app.exit(0);
             });
         }

@@ -133,7 +133,12 @@ function confirmAccountChange(title, detail) {
   $('account-confirm-detail').textContent = detail || '';
   $('account-confirm-detail').classList.toggle('hidden', !detail);
   $('account-confirm-session').classList.toggle('hidden', !ending);
-  $('account-confirm-peer').textContent = $('view-peer').textContent || peerLabel('');
+  // D6: every connected tab goes, not just the one on screen.
+  const busy = S.tabs.tabs.filter((t) => t.phase !== 'disconnected');
+  $('account-confirm-peer').textContent =
+    busy.length === 1
+      ? `your session with ${busy[0].name || peerLabel(busy[0].remoteId)}`
+      : `your ${busy.length} connected tabs`;
   $('modal-account-confirm').classList.remove('hidden');
   $('btn-account-confirm-cancel').focus();
   return new Promise((resolve) => {

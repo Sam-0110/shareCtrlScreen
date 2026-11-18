@@ -150,6 +150,23 @@ impl Engine {
         Some(r)
     }
 
+    /// The tab on screen on this computer. Saved, but the sync is not woken:
+    /// it is per computer and never synced, and switching tabs must not
+    /// cost a sync round. Nothing while the selected account is signed out.
+    pub fn set_active_tab(&self, remote: Option<String>) {
+        let ws = self.ws.lock();
+        let Some(key) = ws.sel.workspace_key() else {
+            return;
+        };
+        let mut cfg = self.config.lock();
+        let w = cfg.workspace_mut(key);
+        if w.active_tab == remote {
+            return;
+        }
+        w.active_tab = remote;
+        self.save(&cfg);
+    }
+
     /// Record a connection to `peer` in the recents of workspace `key`, if no
     /// switch happened since `epoch` (the connection was started in that
     /// workspace; a later one must not receive it, I13).

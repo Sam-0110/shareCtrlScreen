@@ -21,8 +21,9 @@
 //!   thread, sends an event or awaits while holding it.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use engine::{
     ConnectError, Engine, PwReason, Role, SessionEvent, SessionId, SessionPhase, TabStep,
@@ -43,6 +44,21 @@ pub(crate) const TAB_WARN_AT: usize = 8;
 /// simultaneous ICE gathers and host prompts helps nobody.
 const CONNECT_ALL_STAGGER: Duration = Duration::from_millis(500);
 
+/// How long a reconnect waits for the host's previous session to finish
+/// tearing down (its threads joined; normally well under a second), and how
+/// often it looks.
+const ENDING_WAIT: Duration = Duration::from_secs(5);
+const ENDING_POLL: Duration = Duration::from_millis(100);
+
+/// How one connection attempt went.
+enum Attempt {
+    /// The host's previous session is still ending: try again shortly.
+    Retry,
+    Connected,
+    /// Refused, failed or called off; the tab shows why.
+    Stopped,
+}
+
 /// What a tab is doing (08a §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Phase {
@@ -54,7 +70,7 @@ enum Phase {
 }
 
 /// A host's monitors as the native Monitor menu shows them.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct MonitorMenu {
     list: Vec<protocol::RemoteDisplay>,
     current: String,
@@ -91,6 +107,15 @@ struct Inner {
     /// Of those, the ones the user disconnected or closed meanwhile: the
     /// setup stops before asking the host.
     cancelled: HashSet<String>,
+    /// The tab on screen, as this computer's user last chose it (`Some(None)`:
+    /// the connect page); `None` until the first choice, when the
+    /// workspace's `active_tab` is shown. Kept apart from the workspace's
+    /// copy because a sync may close the tab on screen elsewhere while it is
+    /// connected here: it stays on screen until it disconnects (08a §6.12).
+    shown: Option<Option<String>>,
+    /// The Monitor menu as last applied (`Some(None)`: emptied); `None`:
+    /// unknown, so the next pass applies it.
+    menu_applied: Option<Option<MonitorMenu>>,
 }
 
 /// The result of a command that may start connections.
@@ -117,6 +142,9 @@ pub(crate) struct TabManager {
     engine: Arc<Engine>,
     surfaces: SurfaceFactory,
     inner: Mutex<Inner>,
+    /// The app is exiting: no connection starts any more (Connect all
+    /// included), so the sessions being ended stay ended (I9).
+    closing: AtomicBool,
 }
 
 impl TabManager {
@@ -126,7 +154,14 @@ impl TabManager {
             app,
             engine,
             inner: Mutex::default(),
+            closing: AtomicBool::new(false),
         })
+    }
+
+    /// The app is about to exit: start nothing new. Call before ending the
+    /// sessions.
+    pub(crate) fn begin_exit(&self) {
+        self.closing.store(true, Ordering::SeqCst);
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -164,6 +199,7 @@ impl TabManager {
         if opened.is_none() {
             return Err(ConnectError::SignedOut.to_string());
         }
+        self.lock().shown = Some(opened);
         self.apply_active();
         if self.is_connected(&remote) {
             self.emit_snapshot();
@@ -172,16 +208,27 @@ impl TabManager {
         self.connect(&remote, confirmed).await
     }
 
-    /// Connect the open tab for `remote` (08a §6.2).
+    /// Connect the open tab for `remote` (08a §6.2). A refusal (the host is
+    /// offline, this computer is being viewed, ...) is the tab's to show
+    /// (`lastEnd`); only a command that cannot apply is an error.
     pub(crate) async fn connect(
         self: &Arc<Self>,
         remote: &str,
         confirmed: bool,
     ) -> Result<Started, String> {
         let remote = remote.trim().to_lowercase();
+        if self.closing.load(Ordering::SeqCst) {
+            return Err("The app is closing".into());
+        }
+        if self.engine.workspace().is_none() {
+            return Err(ConnectError::SignedOut.to_string());
+        }
         if !self.is_open(&remote) {
             return Err("That tab is not open".into());
         }
+        // The workspace it is connected in: a switch while the surface is
+        // being made stops it (it would start in the next one, unreachable).
+        let epoch = self.engine.workspace_epoch();
         {
             let mut inner = self.lock();
             if inner.starting.contains(&remote) || connected(&inner, &remote) {
@@ -198,50 +245,66 @@ impl TabManager {
         }
         self.emit_snapshot();
         let made = self.surfaces.create().await;
-        let result = {
-            let mut inner = self.lock();
-            inner.starting.remove(&remote);
-            if inner.cancelled.remove(&remote) {
-                if let Ok(surface) = made {
-                    self.surfaces.destroy(surface);
-                }
-                if let Some(tab) = inner.live.get_mut(&remote) {
-                    tab.phase = Phase::Disconnected;
-                }
-                drop(inner);
-                self.apply_active();
-                return Ok(Started::Done);
+        // A session that just ended with this host may still be being torn
+        // down (its threads joined): a quick reconnect waits for that.
+        let deadline = Instant::now() + ENDING_WAIT;
+        let connected = loop {
+            match self.try_connect(&remote, &made, epoch, Instant::now() < deadline) {
+                Attempt::Retry => tokio::time::sleep(ENDING_POLL).await,
+                Attempt::Connected => break true,
+                Attempt::Stopped => break false,
             }
+        };
+        // An unused surface goes, outside the lock (the UI thread does it).
+        if let (false, Ok(surface)) = (connected, made) {
+            self.surfaces.destroy(surface);
+        }
+        self.apply_active();
+        Ok(Started::Done)
+    }
+
+    /// One attempt of [`connect`](Self::connect), under the lock the
+    /// session's first event waits on, so its id is recorded first (I4).
+    fn try_connect(
+        &self,
+        remote: &str,
+        made: &Result<Arc<dyn VideoSurface>, String>,
+        epoch: u64,
+        may_retry: bool,
+    ) -> Attempt {
+        let mut inner = self.lock();
+        let stopped = inner.cancelled.remove(remote)
+            || self.closing.load(Ordering::SeqCst)
+            || self.engine.workspace_epoch() != epoch
+            || !self.is_open(remote);
+        let refused = if stopped {
+            None
+        } else {
             match made {
-                Err(e) => Err(e),
-                Ok(surface) => match self.engine.connect(&remote, Some(surface.clone())) {
+                Err(e) => Some(e.clone()),
+                Ok(surface) => match self.engine.connect(remote, Some(surface.clone())) {
                     Ok(id) => {
-                        // Recorded under the same lock the session's first
-                        // event waits on (see the module docs).
-                        inner.surfaces.insert(id, surface);
-                        let tab = inner.live.entry(remote.clone()).or_default();
+                        inner.starting.remove(remote);
+                        inner.surfaces.insert(id, surface.clone());
+                        let tab = inner.live.entry(remote.to_string()).or_default();
                         tab.session = Some(id);
                         tab.phase = Phase::Connecting;
                         tab.trouble = None;
                         tab.displays = None;
                         tab.menu = None;
-                        Ok(())
+                        return Attempt::Connected;
                     }
-                    Err(e) => {
-                        self.surfaces.destroy(surface);
-                        Err(e.to_string())
-                    }
+                    Err(ConnectError::Ending(_)) if may_retry => return Attempt::Retry,
+                    Err(e) => Some(e.to_string()),
                 },
             }
         };
-        if let Err(e) = &result {
-            let mut inner = self.lock();
-            let tab = inner.live.entry(remote.clone()).or_default();
+        inner.starting.remove(remote);
+        if let Some(tab) = inner.live.get_mut(remote) {
             tab.phase = Phase::Disconnected;
-            tab.last_end = Some(e.clone());
+            tab.last_end = refused;
         }
-        self.apply_active();
-        result.map(|()| Started::Done)
+        Attempt::Stopped
     }
 
     /// End `remote`'s session (or its request); the tab stays.
@@ -272,6 +335,10 @@ impl TabManager {
             if inner.live.get(&remote).is_some_and(|t| t.session.is_none()) {
                 inner.live.remove(&remote);
             }
+            // The neighbour the workspace chose takes its place on screen.
+            if inner.shown.as_ref() == Some(&Some(remote)) {
+                inner.shown = None;
+            }
         }
         self.apply_active();
     }
@@ -280,11 +347,16 @@ impl TabManager {
     pub(crate) fn activate(&self, remote: Option<&str>) -> Result<(), String> {
         let remote = remote.map(|r| r.trim().to_lowercase());
         if let Some(r) = &remote {
-            if !self.is_open(r) {
+            let shown = self
+                .engine
+                .workspace()
+                .is_some_and(|w| visible(&w, &self.lock()).contains(r));
+            if !shown {
                 return Err("That tab is not open".into());
             }
         }
-        self.engine.with_workspace(|w, _| w.active_tab = remote);
+        self.engine.set_active_tab(remote.clone());
+        self.lock().shown = Some(remote);
         self.apply_active();
         Ok(())
     }
@@ -294,12 +366,14 @@ impl TabManager {
         let Some(ws) = self.engine.workspace() else {
             return;
         };
-        let open = ws.open_tabs();
+        let (open, active) = {
+            let inner = self.lock();
+            (visible(&ws, &inner), shown_tab(&ws, &inner))
+        };
         if open.is_empty() {
             return;
         }
-        let at = ws
-            .active_tab
+        let at = active
             .as_ref()
             .and_then(|a| open.iter().position(|k| k == a));
         let n = open.len();
@@ -399,7 +473,11 @@ impl TabManager {
 
     /// A viewer session's event (08a §5.1). `peer` is the remote: its tab.
     pub(crate) fn on_session(&self, id: SessionId, peer: &str, ev: SessionEvent) {
+        // A tab closed on another computer while connected here stays until
+        // it disconnects; read before the lock (lock order: engine first).
+        let still_open = self.is_open(peer);
         let mut out: Vec<(&'static str, Value)> = Vec::new();
+        let mut forget = false;
         let mut released = None;
         {
             let mut inner = self.lock();
@@ -432,6 +510,7 @@ impl TabManager {
                     tab.menu = None;
                     tab.permission = None;
                     tab.last_end = reason.message();
+                    forget = !still_open;
                 }
                 SessionEvent::LinkTrouble { secs_left } => tab.trouble = Some(secs_left),
                 SessionEvent::LinkRestored => tab.trouble = None,
@@ -457,6 +536,9 @@ impl TabManager {
                     out.push(("tab-toast", json!({ "remoteId": peer, "message": message })));
                 }
                 SessionEvent::Released => {}
+            }
+            if forget {
+                inner.live.remove(peer);
             }
         }
         if let Some(s) = released {
@@ -500,20 +582,35 @@ impl TabManager {
     /// Put the workspace's active tab on screen (its session, if connected,
     /// else none: the UI shows that tab's card), then redraw.
     fn apply_active(&self) {
-        let active = self.engine.workspace().and_then(|w| w.active_tab);
-        let (session, menu) = active
-            .and_then(|r| {
-                self.lock()
-                    .live
-                    .get(&r)
-                    .filter(|t| t.phase != Phase::Disconnected)
-                    .map(|t| (t.session, t.menu.clone()))
-            })
-            .unwrap_or_default();
-        self.engine.set_active(session);
-        // The Monitor menu belongs to the tab on screen (or, hosting, to this
-        // computer's own monitors: their events keep it then).
-        if !matches!(self.engine.role(), Role::Host { .. }) {
+        let hosting = matches!(self.engine.role(), Role::Host { .. });
+        let menu = {
+            let mut inner = self.lock();
+            let ws = self.engine.workspace();
+            let (session, menu) = ws
+                .as_ref()
+                .and_then(|ws| shown_tab(ws, &inner))
+                .and_then(|r| inner.live.get(&r))
+                .filter(|t| t.phase != Phase::Disconnected)
+                .map(|t| (t.session, t.menu.clone()))
+                .unwrap_or_default();
+            // Read and applied under `inner`, so a click and a session event
+            // deciding at the same time cannot cross (the later decision is
+            // the one on screen). `set_active` never blocks.
+            self.engine.set_active(session);
+            // The Monitor menu belongs to the tab on screen — or, hosting, to
+            // this computer's own monitors, whose events keep it. Rebuilt only
+            // when it changes: it is a round trip to the UI thread.
+            if hosting {
+                inner.menu_applied = None;
+                None
+            } else if inner.menu_applied.as_ref() == Some(&menu) {
+                None
+            } else {
+                inner.menu_applied = Some(menu.clone());
+                Some(menu)
+            }
+        };
+        if let Some(menu) = menu {
             match &menu {
                 Some(m) => {
                     update_monitor_menu(&self.app, &m.list, &m.current, m.can_switch, &m.popouts)
@@ -533,8 +630,7 @@ impl TabManager {
                            "signedOut": true });
         };
         let inner = self.lock();
-        let tabs: Vec<Value> = ws
-            .open_tabs()
+        let tabs: Vec<Value> = visible(&ws, &inner)
             .into_iter()
             .map(|remote| {
                 let live = inner.live.get(&remote);
@@ -565,7 +661,7 @@ impl TabManager {
             .collect();
         json!({
             "tabs": tabs,
-            "active": ws.active_tab,
+            "active": shown_tab(&ws, &inner),
             "connected": connected_count(&inner),
             "hosting": hosting,
             "signedOut": false,
@@ -590,4 +686,30 @@ fn connected_count(inner: &Inner) -> usize {
         .values()
         .filter(|t| t.session.is_some() && t.phase != Phase::Disconnected)
         .count()
+}
+
+/// The tabs in the strip, in order: the open ones, and those closed on
+/// another computer while connected here (they stay until they disconnect,
+/// 08a §6.12 step 5).
+fn visible(ws: &protocol::Workspace, inner: &Inner) -> Vec<String> {
+    let mut tabs: Vec<(&str, &str)> = ws
+        .tabs
+        .iter()
+        .filter(|(remote, t)| t.is_open() || connected(inner, remote))
+        .map(|(remote, t)| (t.order.as_str(), remote.as_str()))
+        .collect();
+    tabs.sort_unstable();
+    tabs.into_iter()
+        .map(|(_, remote)| remote.to_string())
+        .collect()
+}
+
+/// The tab on screen: the user's last choice while it is still in the strip,
+/// else the workspace's active tab.
+fn shown_tab(ws: &protocol::Workspace, inner: &Inner) -> Option<String> {
+    let strip = visible(ws, inner);
+    match &inner.shown {
+        Some(choice) if choice.as_ref().is_none_or(|r| strip.contains(r)) => choice.clone(),
+        _ => ws.active_tab.clone().filter(|r| strip.contains(r)),
+    }
 }

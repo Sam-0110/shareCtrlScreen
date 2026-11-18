@@ -236,10 +236,7 @@ fn main() {
                     api.prevent_close();
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
-                        engine
-                            .end_all_and_wait(std::time::Duration::from_secs(3))
-                            .await;
-                        SESSIONS_ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
+                        end_sessions_for_exit(&app).await;
                         app.exit(0);
                     });
                 }
@@ -374,6 +371,11 @@ fn on_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
     let tauri::RunEvent::ExitRequested { api, code, .. } = event else {
         return;
     };
+    // A restart (the updater) cannot be held, and the updater ended the
+    // sessions itself.
+    if code == Some(tauri::RESTART_EXIT_CODE) {
+        return;
+    }
     let engine = app.state::<AppState>().engine.clone();
     // Nothing to end (the updater and the tray's Quit end the sessions
     // themselves first; a restart must then go ahead untouched).
@@ -385,10 +387,22 @@ fn on_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
     api.prevent_exit();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        engine
-            .end_all_and_wait(std::time::Duration::from_secs(3))
-            .await;
-        SESSIONS_ENDED.store(true, Ordering::SeqCst);
+        end_sessions_for_exit(&app).await;
         app.exit(code.unwrap_or(0));
     });
+}
+
+/// Before any exit: no tab starts a connection any more (Connect all
+/// included), then every session ends and is released — held keys let go,
+/// Byes sent — waiting at most 3 s (08a §6.17, I9). Marks the sessions
+/// ended, so the exit that follows goes ahead.
+pub(crate) async fn end_sessions_for_exit(app: &tauri::AppHandle) {
+    if let Some(tabs) = app.try_state::<Arc<tabs::TabManager>>() {
+        tabs.begin_exit();
+    }
+    let engine = app.state::<AppState>().engine.clone();
+    engine
+        .end_all_and_wait(std::time::Duration::from_secs(3))
+        .await;
+    SESSIONS_ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
 }

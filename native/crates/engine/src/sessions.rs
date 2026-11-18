@@ -860,6 +860,11 @@ impl Engine {
         }
     }
 
+    /// The app-wide held tab-chord keys (see `KeyTranslator::swallowed`).
+    pub(crate) fn tab_chord_keys(&self) -> crate::modifiers::TabChordKeys {
+        Arc::clone(&self.tab_chord_keys)
+    }
+
     /// The UI event channel, for threads that report app-level events.
     pub(crate) fn ui_sender(&self) -> tokio::sync::mpsc::UnboundedSender<UiEvent> {
         self.ui.clone()

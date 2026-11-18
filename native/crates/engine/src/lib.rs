@@ -204,6 +204,10 @@ pub struct Engine {
     view_ops: session::active::ViewOps,
     /// The viewer session holding the shortcut hook, one at a time (B2).
     hook_owner: Arc<Mutex<Option<SessionId>>>,
+    /// The tab-switch chord keys being held, shared by every session's key
+    /// translator (D3: a held chord key's repeats and release follow the
+    /// keyboard into the next tab, and are taken there too).
+    tab_chord_keys: modifiers::TabChordKeys,
     /// Test hook (`test-hooks` feature only): how long a viewer session's
     /// start waits before building anything (ms), so a test can end a session
     /// in the middle of its start.
@@ -263,6 +267,7 @@ impl Engine {
             overlay: Arc::new(AtomicBool::new(false)),
             view_ops: session::active::applier(&tokio::runtime::Handle::current()),
             hook_owner: Arc::new(Mutex::new(None)),
+            tab_chord_keys: Default::default(),
             #[cfg(feature = "test-hooks")]
             test_start_delay_ms: Default::default(),
         });

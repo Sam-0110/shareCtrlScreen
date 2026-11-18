@@ -7,7 +7,6 @@
 
 import * as api from './api.js';
 
-import * as api from './api.js';
 
 export const $ = (id) => document.getElementById(id);
 

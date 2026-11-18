@@ -36,23 +36,12 @@ pub(crate) fn install_native_menu(app: &tauri::App) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let session = Submenu::with_items(app, "Session", true, &[&settings, &disconnect, &updates])?;
-    // Tabs (plans/08 P4, D3). The switch chords are also taken out of the
-    // video's key stream by the engine; these are for when the page has the
-    // keyboard (a disconnected tab's card, the connect page).
-    let next = MenuItem::with_id(
-        app,
-        "menu-tab-next",
-        "Next Tab",
-        true,
-        Some("CmdOrCtrl+Alt+PageDown"),
-    )?;
-    let prev = MenuItem::with_id(
-        app,
-        "menu-tab-prev",
-        "Previous Tab",
-        true,
-        Some("CmdOrCtrl+Alt+PageUp"),
-    )?;
+    // Tabs (plans/08 P4). No accelerators: the switch chords (D3) are taken
+    // out of the video's key stream by the engine and handled by the page
+    // when it has the keyboard; a menu key equivalent as well would switch
+    // twice.
+    let next = MenuItem::with_id(app, "menu-tab-next", "Next Tab", true, None::<&str>)?;
+    let prev = MenuItem::with_id(app, "menu-tab-prev", "Previous Tab", true, None::<&str>)?;
     let new_tab = MenuItem::with_id(app, "menu-tab-new", "New Tab", true, None::<&str>)?;
     let close_tab = MenuItem::with_id(app, "menu-tab-close", "Close Tab", true, None::<&str>)?;
     let tabs = Submenu::with_items(app, "Tabs", true, &[&new_tab, &next, &prev, &close_tab])?;

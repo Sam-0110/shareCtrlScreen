@@ -17,8 +17,12 @@ import { $, S, activeTab, errorText, overlayClose, overlayOpen, render, toast } 
 const shortId = (id) => (id.length > 14 ? id.slice(0, 8) + '…' : id);
 const tabLabel = (t) => t.name || shortId(t.remoteId);
 
-// The remote being renamed in place, and the one being dragged.
+// The remote being renamed in place, its text so far (the strip is redrawn on
+// every snapshot, which must not lose it), and the one being dragged.
 let renaming = null;
+let renameDraft = '';
+let redrawing = false;
+let renameStarting = false;
 let dragging = null;
 // The password field belongs to this tab: switching tabs clears it.
 let passwordFor = null;
@@ -28,12 +32,14 @@ let passwordFor = null;
 // does nothing; asked, the user repeats it confirmed.
 let confirmAction = null;
 
-function askToContinue(wouldBe, action) {
+async function askToContinue(wouldBe, action) {
   $('tab-confirm-text').textContent =
     `You're about to have ${wouldBe} connected tabs. Each one uses its own connection ` +
     'and video decoder, and this computer may slow down. Continue?';
   confirmAction = action;
-  overlayOpen('modal-tab-confirm');
+  // Shown once the video is out of the way; focus only then (a hidden
+  // button takes no focus, and Escape would not reach the dialog).
+  await overlayOpen('modal-tab-confirm');
   $('btn-tab-confirm-cancel').focus();
 }
 
@@ -70,7 +76,11 @@ function dotClass(t) {
 
 function renderStrip() {
   const list = $('tab-list');
+  // Removing a focused rename field may fire its blur: that is a redraw,
+  // not the user leaving the field.
+  redrawing = true;
   list.textContent = '';
+  redrawing = false;
   for (const t of S.tabs.tabs) {
     const el = document.createElement('div');
     el.className = 'tab' + (t.remoteId === S.tabs.active ? ' active' : '');
@@ -87,10 +97,13 @@ function renderStrip() {
     if (renaming === t.remoteId) {
       const input = document.createElement('input');
       input.className = 'tab-name-edit';
-      input.value = t.name;
+      input.value = renameDraft;
       input.maxLength = 40;
+      input.addEventListener('input', () => {
+        renameDraft = input.value;
+      });
       const commit = () => {
-        if (renaming !== t.remoteId) return;
+        if (redrawing || renaming !== t.remoteId) return;
         renaming = null;
         api.tabRename(t.remoteId, input.value).catch((e) => toast(errorText(e), 'error'));
         renderStrip();
@@ -106,7 +119,11 @@ function renderStrip() {
       el.appendChild(input);
       setTimeout(() => {
         input.focus();
-        input.select();
+        // Selected when the rename starts; after a redraw the caret goes
+        // back to the end of what was typed.
+        if (renameStarting) input.select();
+        else input.setSelectionRange(input.value.length, input.value.length);
+        renameStarting = false;
       }, 0);
     } else {
       const name = document.createElement('span');
@@ -115,6 +132,8 @@ function renderStrip() {
       name.addEventListener('dblclick', (e) => {
         e.stopPropagation();
         renaming = t.remoteId;
+        renameDraft = t.name;
+        renameStarting = true;
         renderStrip();
       });
       el.appendChild(name);

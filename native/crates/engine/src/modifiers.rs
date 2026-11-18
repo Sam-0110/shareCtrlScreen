@@ -179,9 +179,15 @@ pub(crate) struct KeyTranslator {
     /// Where a tab-switch chord goes (D3, 08a §6.19); `None`: not taken out.
     tab_step: Option<Box<dyn Fn(TabStep) + Send>>,
     /// PageUp/PageDown keys whose press was taken as a tab switch: their
-    /// release is taken too, so the host never sees half a key.
-    swallowed: Vec<String>,
+    /// repeats and release are taken too, so no host sees half a key. Shared
+    /// by every session's translator: the switch moves the keyboard to
+    /// another tab, whose translator never saw the chord's modifiers but
+    /// gets the key's repeats and its release.
+    swallowed: TabChordKeys,
 }
+
+/// The tab-chord keys being held, app-wide (see `KeyTranslator::swallowed`).
+pub(crate) type TabChordKeys = Arc<parking_lot::Mutex<Vec<(String, TabStep)>>>;
 
 impl KeyTranslator {
     pub(crate) fn new(viewer: OsFamily, host: OsFamily, enabled: Arc<AtomicBool>) -> Self {
@@ -191,7 +197,7 @@ impl KeyTranslator {
             enabled,
             held: Vec::with_capacity(8),
             tab_step: None,
-            swallowed: Vec::new(),
+            swallowed: TabChordKeys::default(),
         }
     }
 
@@ -200,8 +206,13 @@ impl KeyTranslator {
     /// whether or not shortcut capture is on (08a §6.19). Their modifiers
     /// were already forwarded and are released normally — a bare Ctrl+Alt
     /// means nothing to the host.
-    pub(crate) fn with_tab_shortcuts(mut self, f: Box<dyn Fn(TabStep) + Send>) -> Self {
+    pub(crate) fn with_tab_shortcuts(
+        mut self,
+        f: Box<dyn Fn(TabStep) + Send>,
+        held: TabChordKeys,
+    ) -> Self {
         self.tab_step = Some(f);
+        self.swallowed = held;
         self
     }
 
@@ -225,21 +236,23 @@ impl KeyTranslator {
     /// Translate one physical key event; `emit` receives the messages to send
     /// to the host, in order (zero, one or several).
     pub(crate) fn key(&mut self, code: &str, down: bool, emit: &mut impl FnMut(InputMsg)) {
-        if self.tab_step.is_some() {
+        if let Some(report) = &self.tab_step {
+            let mut held = self.swallowed.lock();
+            let taken = held.iter().position(|(c, _)| c == code);
             if down {
-                if let Some(step) = self.tab_chord(code) {
-                    if !self.swallowed.iter().any(|c| c == code) {
-                        self.swallowed.push(code.to_string());
+                // A held key repeats: every repeat steps again, as a browser's
+                // tab chords do — also once it lands in the next tab.
+                let step = self.tab_chord(code).or(taken.map(|i| held[i].1));
+                if let Some(step) = step {
+                    if taken.is_none() {
+                        held.push((code.to_string(), step));
                     }
-                    // A held key repeats: every repeat steps again, as a
-                    // browser's tab chords do.
-                    if let Some(report) = &self.tab_step {
-                        report(step);
-                    }
+                    drop(held);
+                    report(step);
                     return;
                 }
-            } else if let Some(i) = self.swallowed.iter().position(|c| c == code) {
-                self.swallowed.remove(i);
+            } else if let Some(i) = taken {
+                held.remove(i);
                 return;
             }
         }
@@ -361,7 +374,10 @@ mod tests {
             let steps = Arc::new(std::sync::Mutex::new(Vec::new()));
             let seen = steps.clone();
             let mut t = KeyTranslator::new(viewer, viewer, Arc::new(AtomicBool::new(true)))
-                .with_tab_shortcuts(Box::new(move |s| seen.lock().unwrap().push(s)));
+                .with_tab_shortcuts(
+                    Box::new(move |s| seen.lock().unwrap().push(s)),
+                    TabChordKeys::default(),
+                );
             let down = format!("+{primary}");
             let up = format!("-{primary}");
             let sent = run(
@@ -388,6 +404,31 @@ mod tests {
                 ["+PageDown", "-PageDown"]
             );
         }
+        // The switch moves the keyboard to the next tab: the held key's
+        // repeats and release land in its translator, which never saw the
+        // chord's modifiers, and are still taken (shared state).
+        let held = TabChordKeys::default();
+        let steps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let make = |held: &TabChordKeys| {
+            let seen = steps.clone();
+            KeyTranslator::new(
+                OsFamily::Windows,
+                OsFamily::Windows,
+                Arc::new(AtomicBool::new(true)),
+            )
+            .with_tab_shortcuts(
+                Box::new(move |s| seen.lock().unwrap().push(s)),
+                held.clone(),
+            )
+        };
+        let (mut first, mut next) = (make(&held), make(&held));
+        assert_eq!(
+            run(&mut first, &["+ControlLeft", "+AltLeft", "+PageDown"]),
+            ["+ControlLeft", "+AltLeft"]
+        );
+        assert!(run(&mut next, &["+PageDown", "-PageDown"]).is_empty());
+        assert_eq!(*steps.lock().unwrap(), [TabStep::Next, TabStep::Next]);
+        assert_eq!(run(&mut next, &["+PageDown"]), ["+PageDown"]);
         // Without a receiver nothing is taken out.
         let (mut t, _) = translator(OsFamily::Windows, OsFamily::Windows);
         assert_eq!(
