@@ -135,6 +135,11 @@ pub struct IceServers {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Caps {
     pub decode: Vec<String>,
+    /// The viewer can show more host monitors in pop-out windows (D14), so the
+    /// host may offer spare video tracks. Older viewers omit it and get the
+    /// single-track session they understand; older hosts ignore it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub popout: bool,
 }
 
 /// The opaque WebRTC negotiation payload carried inside `signal.data`
@@ -166,6 +171,31 @@ pub const PONG_LITERAL: &str = "{\"type\":\"pong\"}";
 
 #[cfg(test)]
 mod tests {
+
+    /// D14: pop-out support rides on `caps` without disturbing either side's
+    /// older peers: an old viewer's caps read as "no pop-outs", and a viewer
+    /// that cannot show them sends exactly the old shape.
+    #[test]
+    fn popout_capability_is_optional_both_ways() {
+        let old: Caps = serde_json::from_str(r#"{"decode":["H264"]}"#).unwrap();
+        assert!(!old.popout);
+        let none = Caps {
+            decode: vec!["H264".into()],
+            popout: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&none).unwrap(),
+            r#"{"decode":["H264"]}"#
+        );
+        let new = Caps {
+            decode: vec![],
+            popout: true,
+        };
+        assert!(serde_json::to_string(&new)
+            .unwrap()
+            .contains(r#""popout":true"#));
+    }
+
     use super::*;
 
     #[test]

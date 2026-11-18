@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>ShareCtrlScreen</title>
+    <!-- A pop-out window (D14): one more of the host's monitors. The native
+         video surface covers this page; it only shows before the first frame
+         (and behind the top-edge reveal on Windows). No script, no IPC: the
+         window is opened, fed and closed from Rust. -->
+    <style>
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: #000;
+        color: #8a93a6;
+        font: 13px system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        user-select: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div>Waiting for the remote monitor&hellip;</div>
+  </body>
+</html>

@@ -302,6 +302,17 @@ publishes nothing. To build this machine's assets locally the same way, run
   sharing a non-primary monitor maps input through the Win32 virtual desktop
   (`VIRTUALDESK`, DPI-corrected). Capture and injection stay consistent for the
   chosen monitor. (One monitor at a time; no all-monitors view.)
+- **Switching monitors mid-session:** without reconnecting, the host can change the shared
+  monitor from its session card, and a viewer **with control** can switch from the session bar
+  (Windows) or the **Monitor** menu (macOS/Linux). A view-only viewer cannot. The switch lasts
+  for the session; "Monitor to share" stays the default. Linux Wayland hosts offer no list (the
+  portal picks the output).
+- **Pop-out windows (other monitors side by side):** a viewer **with control** can open more of
+  the host's monitors, each in its own window (session bar "Pop out…" on Windows, **Monitor →
+  Open in New Window** on macOS/Linux; up to 3). Each window has its own video stream and mouse
+  mapping; the bandwidth is shared between them. Closing a window stops its stream, and revoking
+  control closes them all. The host's session card lists them. Both sides need this version (an
+  older peer just doesn't offer it). File drop and shortcut capture work in the main window only.
 - **Elevated windows are not controllable (Windows).** A non-elevated host cannot inject
   into UAC prompts or apps running as administrator — this is the Windows UIPI
   security boundary, not a bug. Run the host as administrator if you need to

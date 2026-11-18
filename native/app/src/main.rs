@@ -19,6 +19,7 @@
 mod account;
 #[cfg(windows)]
 mod tray;
+mod popout;
 mod uiaccess;
 mod updater;
 
@@ -222,6 +223,64 @@ fn end_session(state: tauri::State<'_, AppState>) {
 #[tauri::command]
 fn request_refresh(state: tauri::State<'_, AppState>) {
     state.engine.request_refresh();
+}
+
+/// Switch the shared monitor mid-session (host: directly; viewer: asks the
+/// host, which needs control). The result arrives as a `displays` event.
+#[tauri::command]
+fn select_display(state: tauri::State<'_, AppState>, id: String) {
+    state.engine.select_display(id);
+}
+
+/// The `displays` event payload: the host's monitors, the one shared now, and
+/// whether this side may switch.
+fn displays_json(
+    list: &[protocol::RemoteDisplay],
+    current: &str,
+    can_switch: bool,
+    popouts: &[protocol::PopoutStream],
+) -> serde_json::Value {
+    let popouts: Vec<_> = popouts
+        .iter()
+        .map(|p| serde_json::json!({ "slot": p.s, "id": p.id }))
+        .collect();
+    let displays: Vec<_> = list
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id,
+                "name": d.name,
+                "width": d.width,
+                "height": d.height,
+                "primary": d.primary,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "displays": displays,
+        "current": current,
+        "canSwitch": can_switch,
+        "popouts": popouts,
+    })
+}
+
+/// Viewer: ask the host to also show monitor `id` in a separate window (D14;
+/// needs control). The window opens when the host's `displays` lists it.
+#[tauri::command]
+fn popout_display(state: tauri::State<'_, AppState>, id: String) {
+    state.engine.popout_display(id);
+}
+
+/// How a monitor is labelled in the pickers and pop-out titles (the web UI
+/// builds the same label in `app.js`).
+fn display_label(d: &protocol::RemoteDisplay) -> String {
+    let name = if d.name.is_empty() {
+        d.id.as_str()
+    } else {
+        d.name.as_str()
+    };
+    let primary = if d.primary { ", primary" } else { "" };
+    format!("{name} ({}\u{d7}{}{primary})", d.width, d.height)
 }
 
 /// Viewer: hide/show the native video surface so web modals (settings) are
@@ -536,18 +595,118 @@ fn install_native_menu(app: &tauri::App) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let session = Submenu::with_items(app, "Session", true, &[&settings, &disconnect, &updates])?;
+    // The host's monitors during a session, rebuilt on every `displays` event
+    // (see `update_monitor_menu`); a placeholder until then.
+    let monitor = Submenu::with_id(app, "menu-monitor", "Monitor", true)?;
     #[cfg(target_os = "macos")]
     {
         let menu = Menu::default(app.handle())?;
         menu.append(&session)?;
+        menu.append(&monitor)?;
         app.set_menu(menu)?;
     }
     #[cfg(target_os = "linux")]
     {
-        let menu = Menu::with_items(app, &[&session])?;
+        let menu = Menu::with_items(app, &[&session, &monitor])?;
         app.set_menu(menu)?;
     }
+    app.manage(MonitorMenu(std::sync::Mutex::new(Some(monitor.clone()))));
+    update_monitor_menu(app.handle(), &[], "", false, &[]);
     Ok(())
+}
+
+/// The native "Monitor" submenu (macOS + Linux), kept so it can be rebuilt.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct MonitorMenu(std::sync::Mutex<Option<tauri::menu::Submenu<tauri::Wry>>>);
+
+/// Menu item id prefix for a monitor; the rest is the display id.
+const MENU_DISPLAY_PREFIX: &str = "menu-display:";
+/// Menu item id prefix for "open this monitor in a new window" (D14).
+const MENU_POPOUT_PREFIX: &str = "menu-popout:";
+
+/// Rebuild the native "Monitor" submenu: one checkable item per monitor, the
+/// shared one checked, all disabled while this side may not switch. Fewer than
+/// two monitors (or no session) shows one disabled placeholder. A no-op on
+/// Windows, where the web drawer has the picker.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn update_monitor_menu(
+    app: &tauri::AppHandle,
+    list: &[protocol::RemoteDisplay],
+    current: &str,
+    can_switch: bool,
+    popouts: &[protocol::PopoutStream],
+) {
+    use tauri::menu::{CheckMenuItem, MenuItem, PredefinedMenuItem, Submenu};
+    let Some(state) = app.try_state::<MonitorMenu>() else {
+        return;
+    };
+    let Some(sub) = state.0.lock().ok().and_then(|g| g.clone()) else {
+        return;
+    };
+    let rebuild = || -> tauri::Result<()> {
+        while sub.remove_at(0)?.is_some() {}
+        if list.len() < 2 {
+            let none = MenuItem::with_id(
+                app,
+                "menu-display-none",
+                "No other monitors",
+                false,
+                None::<&str>,
+            )?;
+            sub.append(&none)?;
+            return Ok(());
+        }
+        for d in list {
+            let mut label = display_label(d);
+            if !can_switch {
+                label.push_str(" \u{2014} needs control");
+            }
+            let item = CheckMenuItem::with_id(
+                app,
+                format!("{MENU_DISPLAY_PREFIX}{}", d.id),
+                label,
+                can_switch,
+                d.id == current,
+                None::<&str>,
+            )?;
+            sub.append(&item)?;
+        }
+        // D14: "Open in New Window" for every monitor not already on screen
+        // (only the viewer acts on it; on the host the engine ignores it).
+        let others: Vec<&protocol::RemoteDisplay> = list
+            .iter()
+            .filter(|d| d.id != current && !popouts.iter().any(|p| p.id == d.id))
+            .collect();
+        if !others.is_empty() {
+            sub.append(&PredefinedMenuItem::separator(app)?)?;
+            let open = Submenu::with_id(app, "menu-popout", "Open in New Window", can_switch)?;
+            for d in others {
+                let item = MenuItem::with_id(
+                    app,
+                    format!("{MENU_POPOUT_PREFIX}{}", d.id),
+                    display_label(d),
+                    can_switch,
+                    None::<&str>,
+                )?;
+                open.append(&item)?;
+            }
+            sub.append(&open)?;
+        }
+        Ok(())
+    };
+    if let Err(e) = rebuild() {
+        tracing::warn!("monitor menu: {e}");
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn update_monitor_menu(
+    _app: &tauri::AppHandle,
+    _list: &[protocol::RemoteDisplay],
+    _current: &str,
+    _can_switch: bool,
+    _popouts: &[protocol::PopoutStream],
+) {
 }
 
 /// Dispatch a click on one of the native menu items (task M15). Settings and
@@ -571,7 +730,17 @@ fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
         "menu-end-session" => {
             app.state::<AppState>().engine.end_session();
         }
-        _ => {}
+        other => {
+            if let Some(id) = other.strip_prefix(MENU_DISPLAY_PREFIX) {
+                app.state::<AppState>()
+                    .engine
+                    .select_display(id.to_string());
+            } else if let Some(id) = other.strip_prefix(MENU_POPOUT_PREFIX) {
+                app.state::<AppState>()
+                    .engine
+                    .popout_display(id.to_string());
+            }
+        }
     }
 }
 
@@ -657,6 +826,18 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(state)
+        .manage(popout::PopoutWindows::default())
+        // A pop-out window (D14) is closed only once the engine has let go of
+        // its video surface; see `popout::on_close_requested`.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                let engine = app.state::<AppState>().engine.clone();
+                if popout::on_close_requested(app, &engine, window.label()) {
+                    api.prevent_close();
+                }
+            }
+        })
         // Native menu clicks (macOS + Linux), and the Windows service host's
         // tray menu.
         .on_menu_event(handle_menu_event)
@@ -683,6 +864,8 @@ fn main() {
             set_permission,
             end_session,
             request_refresh,
+            select_display,
+            popout_display,
             set_video_visible,
             approve,
             save_settings,
@@ -723,6 +906,7 @@ fn main() {
             }
 
             // Bridge engine UiEvents → WebView2 events (replaces ipcRenderer.on).
+            let bridge_engine = engine.clone();
             tauri::async_runtime::spawn(async move {
                 while let Some(ev) = ui_rx.recv().await {
                     let (name, payload) = match ev {
@@ -760,7 +944,29 @@ fn main() {
                             ("link-trouble", serde_json::json!({ "secsLeft": secs_left }))
                         }
                         UiEvent::LinkRestored => ("link-restored", serde_json::json!({})),
+                        UiEvent::Displays {
+                            list,
+                            current,
+                            can_switch,
+                            popouts,
+                        } => {
+                            update_monitor_menu(&handle, &list, &current, can_switch, &popouts);
+                            // Viewer: open/close pop-out windows to match.
+                            if matches!(bridge_engine.role(), Role::Viewer { .. }) {
+                                popout::reconcile(&handle, &bridge_engine, &list, &popouts);
+                            }
+                            (
+                                "displays",
+                                displays_json(&list, &current, can_switch, &popouts),
+                            )
+                        }
                     };
+                    // A session that ended takes its monitor list and its
+                    // pop-out windows with it.
+                    if name == "role-changed" && payload["role"] == "idle" {
+                        update_monitor_menu(&handle, &[], "", false, &[]);
+                        popout::close_all(&handle, &bridge_engine);
+                    }
                     let _ = handle.emit(name, payload);
                 }
             });

@@ -93,12 +93,16 @@ pub enum Inbound {
     /// has already depacketized and reassembled it; `contiguous` is false when a
     /// gap (unrecovered loss) preceded it, which may warrant a keyframe request.
     Video {
+        /// Which video stream (0 = main; 1.. = pop-out windows), by the
+        /// track's position in the offer.
+        slot: u8,
         data: Vec<u8>,
         keyframe: bool,
         contiguous: bool,
     },
-    /// The remote peer asked us (the host) for a keyframe (PLI/FIR over RTCP).
-    KeyframeRequest,
+    /// The remote peer asked us (the host) for a keyframe (PLI/FIR over RTCP)
+    /// on video stream `slot`.
+    KeyframeRequest(u8),
     /// A fresh send-bandwidth estimate in bits/sec from str0m's congestion
     /// control (host side). This is the real BWE that steers the encoder bitrate,
     /// replacing the old hand-rolled AIMD on the SCTP send-queue depth.
@@ -119,13 +123,14 @@ pub struct Transport {
     ctl: Option<ChannelId>,
     cursor: Option<ChannelId>,
     bulk: Option<ChannelId>,
-    /// The video RTP media track's mid. Host: set from `add_media` via
-    /// [`Self::set_video_mid`]. Viewer: learned from `Event::MediaAdded`.
-    video_mid: Option<Mid>,
-    /// Negotiated video payload type + clock, resolved lazily on first send once
-    /// the SDP answer is in (the remote PTs aren't known before that).
-    video_pt: Option<Pt>,
-    video_freq: Option<Frequency>,
+    /// The video RTP media tracks' mids, indexed by stream slot (0 = main,
+    /// 1.. = pop-outs). Host: from `add_media` via [`Self::set_video_mids`].
+    /// Viewer: from the offer's m-line order ([`video_mids_in_sdp`]), or, if
+    /// that found none, learned from `Event::MediaAdded`.
+    video_mids: Vec<Mid>,
+    /// Negotiated video payload type + clock per slot, resolved lazily on first
+    /// send once the SDP answer is in (the remote PTs aren't known before that).
+    video_pt: Vec<Option<(Pt, Frequency)>>,
     /// Monotonic origin for RTP media timestamps.
     media_start: Instant,
 }
@@ -139,9 +144,8 @@ impl Transport {
             ctl: None,
             cursor: None,
             bulk: None,
-            video_mid: None,
-            video_pt: None,
-            video_freq: None,
+            video_mids: Vec::new(),
+            video_pt: Vec::new(),
             media_start: Instant::now(),
         }
     }
@@ -154,9 +158,18 @@ impl Transport {
         self.bulk = Some(ch.bulk);
     }
 
-    /// Host side: adopt the video media track's mid returned by `add_media`.
-    pub fn set_video_mid(&mut self, mid: Mid) {
-        self.video_mid = Some(mid);
+    /// Adopt the video media tracks' mids, in slot order: the host's from
+    /// `add_media`, the viewer's from [`video_mids_in_sdp`] on the offer.
+    pub fn set_video_mids(&mut self, mids: Vec<Mid>) {
+        self.video_pt = vec![None; mids.len()];
+        self.video_mids = mids;
+    }
+
+    fn slot_of(&self, mid: Mid) -> Option<u8> {
+        self.video_mids
+            .iter()
+            .position(|m| *m == mid)
+            .and_then(|i| u8::try_from(i).ok())
     }
 
     pub fn rtc_mut(&mut self) -> &mut Rtc {
@@ -188,25 +201,22 @@ impl Transport {
     /// loss via NACK from its send buffer. A no-op until the track is negotiated
     /// and connected — str0m drops pre-connect media anyway, and the engine forces
     /// a keyframe on connect so the first *delivered* frame is decodable.
-    pub fn send_video(&mut self, au: &[u8]) -> Result<(), Error> {
-        let Some(mid) = self.video_mid else {
+    pub fn send_video(&mut self, slot: u8, au: &[u8]) -> Result<(), Error> {
+        let i = usize::from(slot);
+        let Some(&mid) = self.video_mids.get(i) else {
             return Ok(());
         };
         // Resolve the negotiated PT + clock once. `payload_params()` is filtered by
         // the remote's PTs, which are only populated after the answer is accepted;
         // before that it's empty and we skip (the frame would be dropped anyway).
-        if self.video_pt.is_none() {
-            let resolved = self.rtc.writer(mid).and_then(|w| {
+        if self.video_pt[i].is_none() {
+            self.video_pt[i] = self.rtc.writer(mid).and_then(|w| {
                 w.payload_params()
                     .next()
                     .map(|p| (p.pt(), p.spec().clock_rate))
             });
-            if let Some((pt, freq)) = resolved {
-                self.video_pt = Some(pt);
-                self.video_freq = Some(freq);
-            }
         }
-        let (Some(pt), Some(freq)) = (self.video_pt, self.video_freq) else {
+        let Some((pt, freq)) = self.video_pt[i] else {
             return Ok(());
         };
 
@@ -225,8 +235,8 @@ impl Transport {
     /// Viewer: ask the sender for a fresh keyframe via native RTCP PLI. (The
     /// engine also has a reliable `ctl`-channel keyframe request; this is the
     /// RTP-native path, used when str0m's reorder window reports a gap.)
-    pub fn request_keyframe(&mut self) {
-        if let Some(mid) = self.video_mid {
+    pub fn request_keyframe(&mut self, slot: u8) {
+        if let Some(&mid) = self.video_mids.get(usize::from(slot)) {
             if let Some(mut writer) = self.rtc.writer(mid) {
                 let _ = writer.request_keyframe(None, KeyframeRequestKind::Pli);
             }
@@ -298,7 +308,10 @@ impl Transport {
                 // Viewer: learn the incoming video track's mid (host set it from
                 // add_media). Nothing for the engine to act on directly.
                 if m.kind == MediaKind::Video {
-                    self.video_mid = Some(m.mid);
+                    if self.slot_of(m.mid).is_none() {
+                        self.video_mids.push(m.mid);
+                        self.video_pt.push(None);
+                    }
                     tracing::info!("transport: video media track added ({:?})", m.mid);
                 }
                 None
@@ -307,13 +320,15 @@ impl Transport {
                 if d.data.is_empty() {
                     return None;
                 }
+                let slot = self.slot_of(d.mid)?;
                 Some(Inbound::Video {
+                    slot,
                     keyframe: d.is_keyframe(),
                     contiguous: d.contiguous,
                     data: d.data.to_vec(),
                 })
             }
-            Event::KeyframeRequest(_) => Some(Inbound::KeyframeRequest),
+            Event::KeyframeRequest(r) => Some(Inbound::KeyframeRequest(self.slot_of(r.mid)?)),
             Event::EgressBitrateEstimate(kind) => {
                 let bps = match kind {
                     BweKind::Twcc(b) | BweKind::Remb(_, b) => b.as_u64(),
@@ -344,5 +359,38 @@ impl Transport {
             }
             _ => None,
         }
+    }
+}
+
+/// The `a=mid` of every video m-line in `sdp`, in order: the stream slots the
+/// host created them for (0 = main, then the pop-out spares).
+pub fn video_mids_in_sdp(sdp: &str) -> Vec<Mid> {
+    let mut out = Vec::new();
+    let mut in_video = false;
+    for line in sdp.lines() {
+        let line = line.trim_end();
+        if let Some(m) = line.strip_prefix("m=") {
+            in_video = m.starts_with("video ");
+        } else if in_video {
+            if let Some(mid) = line.strip_prefix("a=mid:") {
+                out.push(Mid::from(mid));
+                in_video = false;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod sdp_tests {
+    use super::*;
+
+    #[test]
+    fn video_mids_come_out_in_m_line_order_and_skip_other_media() {
+        let sdp = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendonly\r\na=mid:abc\r\n\
+                   m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:dc0\r\n\
+                   m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:xyz\r\n";
+        let mids = video_mids_in_sdp(sdp);
+        assert_eq!(mids, vec![Mid::from("abc"), Mid::from("xyz")]);
     }
 }

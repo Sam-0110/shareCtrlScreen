@@ -164,6 +164,9 @@ html, body {
 .btn-danger:hover:not(:disabled) { background: #cc453e; }
 .btn-ghost { background: transparent; border-color: transparent; font-size: 17px; padding: 6px 10px; }
 .btn-sm { padding: 5px 11px; font-size: 12px; }
+/* A compact select for toolbars (the viewer's monitor picker). */
+.input-sm { flex: 0 1 auto; padding: 4px 8px; font-size: 12px; max-width: 260px; }
+.input:disabled { opacity: 0.55; cursor: not-allowed; }
 
 /* ---------- viewer ---------- */
 .view-bar {

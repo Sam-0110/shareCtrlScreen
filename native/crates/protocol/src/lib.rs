@@ -18,7 +18,7 @@ pub mod sync;
 pub mod transfer;
 
 pub use config::{Account, Config, IceServer, IdStamp, Mode, Permission};
-pub use control::ControlMsg;
+pub use control::{ControlMsg, PopoutStream, RemoteDisplay};
 pub use input::{Button, InputMsg};
 pub use signaling::{IceCandidate, IceServers, SignalData, SignalMsg};
 pub use sync::{SyncDoc, SyncEntry};

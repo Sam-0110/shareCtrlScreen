@@ -79,11 +79,24 @@ pub(crate) struct HostCursor {
     /// The id position messages name; `None` = the viewer draws its arrow.
     current: Option<u32>,
     /// Ids sent this session, oldest first: a mirror of the viewer's cache
-    /// (same capacity, same insertion order, reliable ordered channel).
-    sent: VecDeque<u32>,
+    /// (same capacity, same insertion order, reliable ordered channel). SHARED
+    /// by every video stream of the session ([`Self::sharing`]): the viewer
+    /// keeps one cache for all its windows, so the mirror must be one too.
+    /// Callers serialise `update` + sending its messages across streams (see
+    /// `Shared::cursor_send`) so the viewer inserts in this same order.
+    sent: Arc<parking_lot::Mutex<VecDeque<u32>>>,
 }
 
 impl HostCursor {
+    /// A tracker for another video stream of the same session: its own current
+    /// image, the same record of what the viewer holds.
+    pub(crate) fn sharing(&self) -> Self {
+        Self {
+            sent: self.sent.clone(),
+            ..Self::default()
+        }
+    }
+
     /// The id to put in position messages.
     pub(crate) fn current(&self) -> Option<u32> {
         self.current
@@ -113,13 +126,14 @@ impl HostCursor {
             return Vec::new();
         };
         self.current = Some(img.id);
-        if self.sent.contains(&img.id) {
+        let mut sent = self.sent.lock();
+        if sent.contains(&img.id) {
             return Vec::new();
         }
-        if self.sent.len() == CACHE_SHAPES {
-            self.sent.pop_front();
+        if sent.len() == CACHE_SHAPES {
+            sent.pop_front();
         }
-        self.sent.push_back(img.id);
+        sent.push_back(img.id);
         img.to_messages()
     }
 }
@@ -230,6 +244,26 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             })
             .collect()
+    }
+
+    /// D14: the streams of one session share the record of what the viewer
+    /// holds (one cache there), so an image one stream sent is never sent
+    /// again by another; each still tracks its own current image.
+    #[test]
+    fn streams_sharing_a_record_send_each_image_once() {
+        let main = HostCursor::default();
+        let mut a = main.sharing();
+        let mut b = main.sharing();
+        let arrow = shape(8, 8, 1, (0, 0));
+        assert!(!a.update(Some(&arrow), (1920, 1080)).is_empty());
+        assert!(
+            b.update(Some(&arrow), (1920, 1080)).is_empty(),
+            "already sent by the other stream"
+        );
+        assert_eq!(a.current(), b.current());
+        let beam = shape(4, 12, 2, (2, 6));
+        assert!(!b.update(Some(&beam), (1920, 1080)).is_empty());
+        assert_ne!(a.current(), b.current());
     }
 
     #[test]

@@ -999,12 +999,110 @@ listen('role-changed', (e) => {
     badge.className = 'badge ' + (control ? 'badge-control' : 'badge-view');
     setState('VIEW_ACTIVE');
   } else {
+    // The session is over: its monitor list goes with it.
+    renderDisplays(null);
     setState('READY');
   }
   reloadConfig();
 });
 
 listen('toast', (e) => toast(e.payload.message || '', 'error'));
+
+// ---- monitor switching (mid-session) -----------------------------------------
+// The host announces its monitors and the one being shared; both sides get a
+// `displays` event (the host from its own capture thread, the viewer from the
+// host). The pickers show only with two or more monitors. The viewer's is
+// disabled without control — the host would ignore the request anyway. On
+// macOS/Linux the viewer's picker is the native "Monitor" menu (the drawer
+// holding this one is not shown there).
+//
+// Pop-out windows (D14): the viewer can also open other monitors in separate
+// windows ("Pop out…" here, "Open in New Window" in the native menu). The
+// windows themselves are opened and closed by the app's Rust side, following
+// the host's list; this page only asks.
+function displayLabel(d) {
+  const name = d.name || d.id;
+  return `${name} (${d.width}\u00d7${d.height}${d.primary ? ', primary' : ''})`;
+}
+
+function renderDisplayPicker(select, info) {
+  const list = (info && info.displays) || [];
+  select.textContent = '';
+  for (const d of list) {
+    const opt = document.createElement('option');
+    opt.value = d.id;
+    opt.textContent = displayLabel(d);
+    select.appendChild(opt);
+  }
+  select.value = (info && info.current) || '';
+  return list.length >= 2;
+}
+
+function renderPopoutPicker(info) {
+  const select = $('view-popout');
+  const list = (info && info.displays) || [];
+  const popped = new Set(((info && info.popouts) || []).map((p) => p.id));
+  const others = list.filter((d) => d.id !== info.current && !popped.has(d.id));
+  select.textContent = '';
+  const head = document.createElement('option');
+  head.value = '';
+  head.textContent = 'Pop out\u2026';
+  select.appendChild(head);
+  for (const d of others) {
+    const opt = document.createElement('option');
+    opt.value = d.id;
+    opt.textContent = displayLabel(d);
+    select.appendChild(opt);
+  }
+  select.value = '';
+  select.classList.toggle('hidden', others.length === 0);
+  select.disabled = !info.canSwitch;
+  select.title = select.disabled
+    ? 'Separate windows need control'
+    : 'Show another monitor in a separate window';
+}
+
+function renderDisplays(info) {
+  const hostShown = renderDisplayPicker($('host-display'), info);
+  $('host-display-row').classList.toggle('hidden', !hostShown);
+  // Host: say which monitors the viewer ALSO sees, in separate windows.
+  const list = (info && info.displays) || [];
+  const popouts = (info && info.popouts) || [];
+  const names = popouts.map((p) => {
+    const d = list.find((x) => x.id === p.id);
+    return d ? displayLabel(d) : p.id;
+  });
+  const note = $('host-popouts');
+  note.textContent = names.length
+    ? 'Also shown in separate windows: ' + names.join(', ')
+    : '';
+  note.classList.toggle('hidden', names.length === 0);
+  if (info) {
+    renderPopoutPicker(info);
+  } else {
+    $('view-popout').classList.add('hidden');
+  }
+  const view = $('view-display');
+  const viewShown = renderDisplayPicker(view, info);
+  view.classList.toggle('hidden', !viewShown);
+  view.disabled = !(info && info.canSwitch);
+  view.title = view.disabled
+    ? 'Switching monitors needs control'
+    : 'Monitor to show';
+}
+
+listen('displays', (e) => renderDisplays(e.payload));
+
+for (const id of ['host-display', 'view-display']) {
+  $(id).addEventListener('change', (e) => {
+    invoke('select_display', { id: e.target.value });
+  });
+}
+$('view-popout').addEventListener('change', (e) => {
+  const id = e.target.value;
+  e.target.value = '';
+  if (id) invoke('popout_display', { id });
+});
 
 // The peer went quiet. The engine has already hidden the native video (a frozen
 // frame is indistinguishable from a live one), so this panel is what the user
