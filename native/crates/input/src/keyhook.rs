@@ -1,7 +1,16 @@
 //! Low-level keyboard hook (`WH_KEYBOARD_LL`) ported from `app/main/keyhook.js`
 //! (Plan 04 §8a). While the viewer is focused and controlling a remote, capture
 //! OS-reserved combos (Alt+Tab, Alt+Esc, the Win keys) **locally** so Windows
-//! does not act on them, and forward them to the remote instead.
+//! does not act on them, and forward them to the remote instead — and the
+//! remote's own tab switching (Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+PageUp / PageDown,
+//! plans/08 P7), which the web view would otherwise take whenever it has the
+//! keyboard. The chord's held modifiers are sent ahead of it.
+//!
+//! ## References
+//! * `LowLevelKeyboardProc`, `KBDLLHOOKSTRUCT` (`vkCode` is the left/right key,
+//!   e.g. `VK_LMENU`): <https://learn.microsoft.com/windows/win32/winmsg/lowlevelkeyboardproc>,
+//!   <https://learn.microsoft.com/windows/win32/api/winuser/ns-winuser-kbdllhookstruct>
+//! * `GetAsyncKeyState`: <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getasynckeystate>
 //!
 //! SAFETY posture (global input machinery — matches the JS original):
 //!   * Disabled by default; installed only while the caller wants it and the
@@ -26,6 +35,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const VK_TAB: i32 = 0x09;
 const VK_ESCAPE: i32 = 0x1b;
 const VK_MENU: i32 = 0x12; // Alt
+const VK_CONTROL: i32 = 0x11;
+const VK_SHIFT: i32 = 0x10;
+const VK_PRIOR: i32 = 0x21; // PageUp
+const VK_NEXT: i32 = 0x22; // PageDown
 const VK_LWIN: i32 = 0x5b;
 const VK_RWIN: i32 = 0x5c;
 
@@ -87,26 +100,35 @@ fn vk_to_code(vk: u32) -> Option<&'static str> {
         VK_RWIN => Some("MetaRight"),
         VK_TAB => Some("Tab"),
         VK_ESCAPE => Some("Escape"),
+        VK_PRIOR => Some("PageUp"),
+        VK_NEXT => Some("PageDown"),
         _ => None,
     }
 }
 
-fn alt_down() -> bool {
+fn key_down(vk: i32) -> bool {
     // SAFETY: pure key-state read.
-    (unsafe { GetAsyncKeyState(VK_MENU) } as u16 & 0x8000) != 0
+    (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0
 }
 
-/// Win keys always; Tab/Esc only while Alt is held. Everything else passes
-/// through untouched.
 fn should_suppress(vk: u32) -> bool {
-    let vk = vk as i32;
-    if vk == VK_LWIN || vk == VK_RWIN {
-        return true;
+    takes(vk as i32, key_down(VK_MENU), key_down(VK_CONTROL))
+}
+
+/// The keys the hook takes for the remote (with the modifiers held): the Win
+/// keys; Alt+Tab and Alt+Esc (the OS acts on them before any window);
+/// Ctrl+Tab and Ctrl+Shift+Tab, and Ctrl+PageUp / PageDown without Alt
+/// (plans/08 P7: the remote's tab switching — the web view would take them
+/// when it has the keyboard; Ctrl+Alt+PageUp / PageDown is this app's own
+/// tab switch and goes to the window). Everything else passes through.
+fn takes(vk: i32, alt: bool, ctrl: bool) -> bool {
+    match vk {
+        VK_LWIN | VK_RWIN => true,
+        VK_TAB => alt || ctrl,
+        VK_ESCAPE => alt,
+        VK_PRIOR | VK_NEXT => ctrl && !alt,
+        _ => false,
     }
-    if (vk == VK_TAB || vk == VK_ESCAPE) && alt_down() {
-        return true;
-    }
-    false
 }
 
 unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
@@ -134,21 +156,24 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
         return fallthrough();
     }
 
-    // If we synthesized an Alt-down for the remote (see below), mirror the REAL
-    // Alt release to the remote — the video window may not have keyboard focus,
-    // so its wndproc can't be relied on for the matching key-up. Never
+    // If we synthesized a modifier's down for the remote (see below), mirror
+    // the REAL release to the remote — the video window may not have keyboard
+    // focus, so its wndproc can't be relied on for the matching key-up. Never
     // suppressed locally.
-    {
-        use std::sync::atomic::Ordering;
-        if info.vkCode as i32 == VK_MENU && is_up && SYNTH_ALT.swap(false, Ordering::SeqCst) {
-            forward_key("AltLeft", false);
+    if is_up {
+        if let Some(m) = modifier_of(info.vkCode as i32) {
+            if m.synthesized
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                forward_key(m.code, false);
+            }
         }
     }
 
     // INVARIANT (stuck-key prevention): once we forwarded a key-DOWN to the
     // remote, the matching key-UP is forwarded UNCONDITIONALLY — even if the
     // suppress conditions no longer hold. E.g. quick Alt+Tab releases Alt
-    // *before* Tab: Tab-up then fails the alt_down() test; or focus moved off
+    // *before* Tab: Tab-up then fails the Alt test; or focus moved off
     // mid-Win-press. Without this the host keeps the key held forever.
     if is_up {
         if let Some(code) = vk_to_code(info.vkCode) {
@@ -181,17 +206,19 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
     );
 
     if let Some(code) = vk_to_code(info.vkCode) {
-        // Alt+Tab / Alt+Esc: the remote only opens its switcher if it has Alt
-        // down. The user's Alt may have gone to the WebView (not the video
-        // window), so guarantee it: synthesize AltLeft-down once per hold.
-        {
-            use std::sync::atomic::Ordering;
-            let vk = info.vkCode as i32;
-            if (vk == VK_TAB || vk == VK_ESCAPE)
-                && is_down
-                && !SYNTH_ALT.swap(true, Ordering::SeqCst)
-            {
-                forward_key("AltLeft", true);
+        // Alt+Tab, Ctrl+Tab, Ctrl+Shift+Tab ...: the remote acts on the chord
+        // only with its modifiers down. The user's modifiers may have gone to
+        // the WebView (not the video window), so guarantee them: synthesize
+        // each held one's down once per hold, before the key.
+        if is_down {
+            for m in &MODIFIERS {
+                if key_down(m.vk)
+                    && !m
+                        .synthesized
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    forward_key(m.code, true);
+                }
             }
         }
         if is_down {
@@ -202,9 +229,46 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
     LRESULT(1) // non-zero => suppress locally
 }
 
-/// Whether we synthesized an AltLeft-down for the remote that still needs its
-/// matching release when the user lets go of the real Alt.
-static SYNTH_ALT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A modifier the hook may synthesize for the remote (see `hook_proc`).
+struct Modifier {
+    /// The generic virtual key, for `GetAsyncKeyState`.
+    vk: i32,
+    /// The left and right keys, as a low-level hook reports them.
+    sides: [i32; 2],
+    /// What the remote is sent.
+    code: &'static str,
+    /// Its down was synthesized and its release is still owed.
+    synthesized: std::sync::atomic::AtomicBool,
+}
+
+static MODIFIERS: [Modifier; 3] = [
+    Modifier {
+        vk: VK_MENU,
+        sides: [0xa4, 0xa5],
+        code: "AltLeft",
+        synthesized: std::sync::atomic::AtomicBool::new(false),
+    },
+    Modifier {
+        vk: VK_CONTROL,
+        sides: [0xa2, 0xa3],
+        code: "ControlLeft",
+        synthesized: std::sync::atomic::AtomicBool::new(false),
+    },
+    Modifier {
+        vk: VK_SHIFT,
+        sides: [0xa0, 0xa1],
+        code: "ShiftLeft",
+        synthesized: std::sync::atomic::AtomicBool::new(false),
+    },
+];
+
+/// The modifier a low-level hook's key code is (it reports the left / right
+/// keys, `VK_LMENU`…, not the generic `VK_MENU`).
+fn modifier_of(vk: i32) -> Option<&'static Modifier> {
+    MODIFIERS
+        .iter()
+        .find(|m| m.vk == vk || m.sides.contains(&vk))
+}
 
 /// Keys whose DOWN we forwarded to the remote and whose UP is therefore owed
 /// unconditionally (see the invariant in `hook_proc`).
@@ -284,8 +348,12 @@ pub fn uninstall() {
     for code in held {
         forward_key(code, false);
     }
-    if SYNTH_ALT.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        forward_key("AltLeft", false);
+    for m in &MODIFIERS {
+        if m.synthesized
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            forward_key(m.code, false);
+        }
     }
     if let Ok(mut state) = STATE.lock() {
         if state.hook != 0 {
@@ -320,5 +388,41 @@ pub fn message_pump(stop: &std::sync::atomic::AtomicBool) {
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn takes_the_os_chords_and_the_remotes_tab_switching_only() {
+        // Win, and Alt+Tab / Alt+Esc (as before).
+        assert!(takes(VK_LWIN, false, false));
+        assert!(takes(VK_TAB, true, false));
+        assert!(takes(VK_ESCAPE, true, false));
+        // P7: Ctrl+Tab (Shift is not looked at, so Ctrl+Shift+Tab too) and
+        // Ctrl+PageUp / PageDown.
+        assert!(takes(VK_TAB, false, true));
+        assert!(takes(VK_NEXT, false, true));
+        assert!(takes(VK_PRIOR, false, true));
+        // Ctrl+Alt+PageUp / PageDown is this app's own tab switch.
+        assert!(!takes(VK_NEXT, true, true));
+        assert!(!takes(VK_PRIOR, true, true));
+        // Plain keys pass.
+        assert!(!takes(VK_TAB, false, false));
+        assert!(!takes(VK_NEXT, false, false));
+        assert!(!takes(VK_ESCAPE, false, true));
+        assert!(!takes(0x41, true, true));
+    }
+
+    #[test]
+    fn modifiers_are_recognized_by_side() {
+        assert_eq!(modifier_of(0xa4).map(|m| m.code), Some("AltLeft"));
+        assert_eq!(modifier_of(0xa5).map(|m| m.code), Some("AltLeft"));
+        assert_eq!(modifier_of(0xa3).map(|m| m.code), Some("ControlLeft"));
+        assert_eq!(modifier_of(0xa0).map(|m| m.code), Some("ShiftLeft"));
+        assert_eq!(modifier_of(VK_MENU).map(|m| m.code), Some("AltLeft"));
+        assert!(modifier_of(VK_TAB).is_none());
     }
 }
