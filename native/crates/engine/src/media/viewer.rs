@@ -73,6 +73,10 @@ pub(crate) fn viewer_media_loop(
     let mut rendered: u64 = 0;
     let mut render_errors: u64 = 0;
     let mut skipped: u64 = 0;
+    // Decode errors since the last picture: the first few log the access
+    // unit's first bytes, so a stream no decoder takes can be told apart
+    // from loss in the log (the 2.3.0 macOS AV1 report).
+    let mut decode_errors: u32 = 0;
     // Keyframe watchdog: if AUs arrive but the decoder produces nothing, the
     // keyframe was lost (unreliable channel) — ask the host for a fresh one,
     // rate-limited to ~1/s so a slow link isn't flooded.
@@ -221,11 +225,14 @@ pub(crate) fn viewer_media_loop(
                     // AV1 MFT) can stall on nonsense timestamps like 1,2,3….
                     ts += 166_667;
                     match decoder.decode(&au, keyframe, ts) {
-                        Ok(Some(_)) => note_decoded(&mut rendered, &mut undecoded_streak, skipped),
+                        Ok(Some(_)) => {
+                            note_decoded(&mut rendered, &mut undecoded_streak, skipped);
+                            decode_errors = 0;
+                        }
                         Ok(None) => {
                             on_no_picture(&mut undecoded_streak, &mut last_kf_req, &ctl_tx, slot)
                         }
-                        Err(e) => tracing::warn!("decode error: {e}"),
+                        Err(e) => note_decode_error(&mut decode_errors, &e, &au),
                     }
                 }
                 // The newest frame: decode, draw the cursor on top, present, and
@@ -235,6 +242,7 @@ pub(crate) fn viewer_media_loop(
                     match decoder.decode(&au, keyframe, ts) {
                         Ok(Some(frame)) => {
                             note_decoded(&mut rendered, &mut undecoded_streak, skipped);
+                            decode_errors = 0;
                             // The SHAPE is always the host's (D9); the POSITION
                             // follows the LOCAL pointer while controlling over the
                             // video (D10/D11 — instant, no round-trip lag), and
@@ -265,7 +273,7 @@ pub(crate) fn viewer_media_loop(
                         Ok(None) => {
                             on_no_picture(&mut undecoded_streak, &mut last_kf_req, &ctl_tx, slot)
                         }
-                        Err(e) => tracing::warn!("decode error: {e}"),
+                        Err(e) => note_decode_error(&mut decode_errors, &e, &au),
                     }
                 }
             }
@@ -312,6 +320,22 @@ pub(crate) fn viewer_media_loop(
         }
     }
     Ok(())
+}
+
+/// A decode error: logged, with the access unit's first bytes for the
+/// first few in a row (then only the error, so a broken stream does not
+/// flood the log).
+fn note_decode_error(count: &mut u32, e: &dyn std::fmt::Display, au: &[u8]) {
+    *count = count.saturating_add(1);
+    if *count <= 3 {
+        tracing::warn!(
+            "decode error: {e} ({} bytes: {})",
+            au.len(),
+            crate::media::av1::hex_prefix(au)
+        );
+    } else {
+        tracing::warn!("decode error: {e}");
+    }
 }
 
 /// Bookkeeping for a decoded picture: reset the keyframe watchdog and log a

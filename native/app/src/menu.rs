@@ -44,7 +44,28 @@ pub(crate) fn install_native_menu(app: &tauri::App) -> tauri::Result<()> {
     let prev = MenuItem::with_id(app, "menu-tab-prev", "Previous Tab", true, None::<&str>)?;
     let new_tab = MenuItem::with_id(app, "menu-tab-new", "New Tab", true, None::<&str>)?;
     let close_tab = MenuItem::with_id(app, "menu-tab-close", "Close Tab", true, None::<&str>)?;
-    let tabs = Submenu::with_items(app, "Tabs", true, &[&new_tab, &next, &prev, &close_tab])?;
+    // plans/09: the session bar holding Detach / Dock sits under the video on
+    // macOS (the reveal is retired there, M15), so the menu offers them too.
+    let detach = MenuItem::with_id(
+        app,
+        "menu-tab-detach",
+        "Move Tab to New Window",
+        true,
+        None::<&str>,
+    )?;
+    let dock = MenuItem::with_id(
+        app,
+        "menu-tab-dock",
+        "Move Tab to Main Window",
+        true,
+        None::<&str>,
+    )?;
+    let tabs = Submenu::with_items(
+        app,
+        "Tabs",
+        true,
+        &[&new_tab, &next, &prev, &detach, &dock, &close_tab],
+    )?;
     // The host's monitors during a session, rebuilt on every `displays` event
     // (see `update_monitor_menu`); a placeholder until then.
     let monitor = Submenu::with_id(app, "menu-monitor", "Monitor", true)?;
@@ -215,6 +236,32 @@ pub(crate) fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::Menu
         "menu-tab-new" => {
             if let Some(tabs) = tabs_of(app) {
                 let _ = tabs.activate(None);
+            }
+        }
+        // The window in use's tab: the strip's tab on screen moves out; a
+        // detached window's tab moves back.
+        "menu-tab-detach" => {
+            if let Some(tabs) = tabs_of(app) {
+                if let (None, Some(remote)) = (tabs.window_in_use(), tabs.shown_remote()) {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = tabs.detach(&remote).await {
+                            let _ = app.emit("toast", serde_json::json!({ "message": e }));
+                        }
+                    });
+                }
+            }
+        }
+        "menu-tab-dock" => {
+            if let Some(tabs) = tabs_of(app) {
+                if let Some((_, remote)) = tabs.window_in_use() {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = tabs.dock(&remote).await {
+                            let _ = app.emit("toast", serde_json::json!({ "message": e }));
+                        }
+                    });
+                }
             }
         }
         "menu-tab-close" => {

@@ -20,6 +20,7 @@
 //! * `crate::tuning`: the pure [`encoder_target`](crate::tuning::encoder_target)
 //!   bitrate policy.
 
+use super::av1 as media_av1;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -419,6 +420,9 @@ pub(crate) fn host_media_loop(
     };
     // Encoder shares the capture device (§5c zero-copy).
     let mut encoder = codecs.new_encoder(cap.device(), cfg)?;
+    // AV1: the encoder's temporal units in the form RTP expects (decided
+    // once, logged; see media/av1.rs).
+    let mut av1 = media_av1::Normalizer::default();
     tracing::info!(
         "host: capture+encoder ready ({}x{} @{}fps, {}, {} kbps)",
         cfg.width,
@@ -511,6 +515,8 @@ pub(crate) fn host_media_loop(
                                     // Encoder first: it may hold a reference into
                                     // the old capture's device.
                                     encoder = e;
+                                    // A new encoder (new size): its own sequence header comes next.
+                                    av1.encoder_changed();
                                     cap = new_cap;
                                     cfg = new_cfg;
                                     (cap_w, cap_h) = (w, h);
@@ -603,6 +609,8 @@ pub(crate) fn host_media_loop(
             match codecs.new_encoder(cap.device(), cfg) {
                 Ok(e) => {
                     encoder = e;
+                    // A new encoder (new size): its own sequence header comes next.
+                    av1.encoder_changed();
                     encoder.force_keyframe(); // new SPS/PPS — restart the decoder
                     applied_bitrate = cfg.bitrate_bps;
                     encoder_size = want;
@@ -759,7 +767,12 @@ pub(crate) fn host_media_loop(
                                     applied_bitrate / 1000
                                 );
                             }
-                            let _ = frame_tx.send((slot, u.data, u.keyframe));
+                            let data = if codec == Codec::Av1 {
+                                av1.normalize(u.data, u.keyframe)
+                            } else {
+                                u.data
+                            };
+                            let _ = frame_tx.send((slot, data, u.keyframe));
                         }
                     }
                     Err(e) => tracing::warn!("encode error: {e}"),
