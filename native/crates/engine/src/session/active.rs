@@ -27,10 +27,11 @@ use parking_lot::Mutex;
 use platform_api::VideoSurface;
 
 use super::Shared;
+use crate::WindowId;
 
-/// The windows with a web dialog open over their video (by `WindowId` value).
-/// Shared by every view; a leaf lock (nothing is taken while it is held).
-pub(crate) type Overlays = Arc<Mutex<BTreeSet<u32>>>;
+/// The windows with a web dialog open over their video. Shared by every
+/// view; a leaf lock (nothing is taken while it is held).
+pub(crate) type Overlays = Arc<Mutex<BTreeSet<WindowId>>>;
 
 /// One show/hide, performed by the applier.
 pub(crate) enum ViewOp {
@@ -113,7 +114,8 @@ pub(crate) struct SessionView {
     /// Which windows have a web dialog open; this view is covered when its
     /// own window has one.
     overlays: Overlays,
-    /// The window its video is in (`WindowId` value; 0 = the main window).
+    /// The window its video is in (a `WindowId` value; the main window
+    /// until a move hands the session to another, plans/09 W2).
     window: AtomicU32,
     /// The applier queue (shared by every view: one order for all of them).
     ops: ViewOps,
@@ -134,7 +136,7 @@ impl SessionView {
             surface,
             shared,
             overlays,
-            window: AtomicU32::new(0),
+            window: AtomicU32::new(WindowId::MAIN.0),
             ops,
             state: Mutex::new(ViewState::default()),
             shown: AtomicBool::new(false),
@@ -147,8 +149,8 @@ impl SessionView {
     }
 
     /// The window its video is in.
-    pub(crate) fn window(&self) -> u32 {
-        self.window.load(Ordering::SeqCst)
+    pub(crate) fn window(&self) -> WindowId {
+        WindowId(self.window.load(Ordering::SeqCst))
     }
 
     /// A web dialog is open over its window.
@@ -276,10 +278,10 @@ mod tests {
         settle(&surface, true);
 
         // A dialog in another window does not cover it; one in its own does.
-        overlays.lock().insert(1);
+        overlays.lock().insert(WindowId(1));
         view.refresh();
         assert!(view.is_shown(), "another window's dialog");
-        overlays.lock().insert(0);
+        overlays.lock().insert(WindowId::MAIN);
         view.refresh();
         assert!(!view.is_shown(), "a web dialog covers it");
         settle(&surface, false);
@@ -343,5 +345,36 @@ mod tests {
         }
         assert_eq!(a.state().focus_requests, 0);
         assert!(a.state().visible, "the unfocused one stays on screen");
+    }
+
+    /// A session focused before its video is ready (a new connection) gets
+    /// the keyboard with its first show, once.
+    #[test]
+    fn focused_before_ready_takes_the_keys_on_its_first_show() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let surface = MockSurface::new((10, 10));
+        let view = SessionView::new(
+            surface.clone(),
+            Arc::default(),
+            Overlays::default(),
+            applier(rt.handle()),
+        );
+        view.set_on_screen(true);
+        view.set_focused(true);
+        assert_eq!(surface.state().focus_requests, 0);
+        view.set_ready();
+        settle(&surface, true);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while surface.state().focus_requests == 0 {
+            assert!(Instant::now() < deadline, "never took the keys");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // A re-show (link restored) does not take them again.
+        view.set_trouble(true);
+        settle(&surface, false);
+        view.set_trouble(false);
+        settle(&surface, true);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(surface.state().focus_requests, 1);
     }
 }

@@ -784,10 +784,11 @@ impl Engine {
     /// ready (not under their window's dialog, not in link trouble) and their
     /// hosts stream; every other viewer session is hidden and its host paused.
     /// Only `focused` exchanges the clipboard (re-baselined when it becomes
-    /// focused, so text copied for another session is never sent here) and
-    /// holds the shortcut hook. `focused` need not be on screen: the clipboard
-    /// stays with the session used last while another app is in front
-    /// (plans/09 §7, answer 5).
+    /// focused, so text copied for another session is never sent here).
+    /// `focused` need not be on screen: the clipboard stays with the session
+    /// used last while another app is in front (plans/09 §7, blocker 5). It
+    /// holds the shortcut hook only while it is also on screen and not under
+    /// a dialog in its window.
     ///
     /// One atomic change under `reg`, so two racing callers cannot leave a
     /// mix of both answers. The gates only store atomics and queue to the
@@ -849,9 +850,9 @@ impl Engine {
         {
             let mut overlays = self.overlays.lock();
             if open {
-                overlays.insert(window.0);
+                overlays.insert(window);
             } else {
-                overlays.remove(&window.0);
+                overlays.remove(&window);
             }
         }
         let gates: Vec<_> = {
@@ -859,11 +860,11 @@ impl Engine {
             reg.viewers
                 .values()
                 .filter_map(|v| v.gate.clone())
-                .filter(|g| g.window() == window.0)
+                .filter(|g| g.window() == window)
                 .collect()
         };
         for g in gates {
-            g.set_overlay(open);
+            g.overlay_changed();
         }
         // Bounded: a UI thread stuck elsewhere must not hang the dialog.
         let (done, applied) = tokio::sync::oneshot::channel();

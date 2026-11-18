@@ -2133,6 +2133,12 @@ async fn several_sessions_on_screen_one_focused() {
         hosts[0].platform.clipboard.get_text().as_deref() == Some("for A")
     })
     .await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_ne!(
+        hosts[1].platform.clipboard.get_text().as_deref(),
+        Some("for A"),
+        "no longer focused: B gets nothing"
+    );
     let (pa, pb) = (presented(&surfaces[0]), presented(&surfaces[1]));
     eventually("both keep presenting", t, || {
         presented(&surfaces[0]) > pa + 5 && presented(&surfaces[1]) > pb + 5
@@ -2148,6 +2154,7 @@ async fn several_sessions_on_screen_one_focused() {
     eventually("C presents", t, || presented(&surfaces[2]) > 3).await;
     viewer.engine.end_all_and_wait(Duration::from_secs(3)).await;
 }
+
 /// Ending a session while its start is still building it (a slow ICE gather)
 /// waits for the start to finish, then ends it for real: its threads are
 /// joined before `Released`, its surface is hidden, its sinks are gone and the

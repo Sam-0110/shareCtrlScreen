@@ -67,8 +67,9 @@ impl Engine {
     /// Replaces `set_active`. Atomic under `reg`: each session in `on_screen` is shown on its
     /// current surface once ready there (not under its window's dialog, not in link trouble);
     /// every other viewer session is hidden and paused (`vpause` when supported); `focused`
-    /// (∈ on_screen, or the last focused if `None` was not asked for) alone gets the clipboard
-    /// and the shortcut hook. Never blocks.
+    /// alone gets the clipboard (sticky: it may be off screen, 09 §7 blocker 5), the keyboard
+    /// and — only while it is also on screen and not under its window's dialog — the shortcut
+    /// hook. Never blocks.
     pub fn set_screen(&self, on_screen: &[SessionId], focused: Option<SessionId>);
     /// A web dialog opened / the last one closed in `window`: hides / shows that window's video.
     pub async fn set_overlay(&self, window: WindowId, open: bool);

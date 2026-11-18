@@ -176,7 +176,7 @@ pub(crate) struct Session {
     threads: Vec<JoinHandle<()>>,
     /// Viewer: its main video as the ActiveGate sees it (`None` on a host).
     view: Option<Arc<active::SessionView>>,
-    /// Viewer: whether it is the active session, and what follows that (the
+    /// Viewer: whether it is the focused session, and what follows that (the
     /// clipboard, the shortcut hook). `None` on a host.
     activity: Option<Arc<Activity>>,
     /// Test hooks (`test-hooks` feature only): the host's rate state, so the
@@ -200,7 +200,7 @@ pub(crate) struct TabGate {
     /// The host advertised `vpause`.
     host_vpause: bool,
     /// Whether the host is (to be) streaming the main video to this tab: it
-    /// starts streaming, so a session born active sends nothing.
+    /// starts streaming, so a session born on screen sends nothing.
     streaming: AtomicBool,
 }
 
@@ -224,13 +224,13 @@ impl TabGate {
     /// closed: its video is hidden meanwhile (the overlay set changed
     /// already; this re-decides), and so is shortcut capture — a dialog's
     /// typing and Ctrl+Tab are this computer's, not the hidden session's.
-    pub(crate) fn set_overlay(&self, open: bool) {
-        self.activity.overlay(open);
+    pub(crate) fn overlay_changed(&self) {
         self.view.refresh();
+        self.activity.overlay_changed(&self.view);
     }
 
-    /// The session's window (`WindowId` value) — the view reads it.
-    pub(crate) fn window(&self) -> u32 {
+    /// The session's window — the view reads it.
+    pub(crate) fn window(&self) -> crate::WindowId {
         self.view.window()
     }
 
@@ -238,7 +238,7 @@ impl TabGate {
     /// clipboard and the shortcut hook follow it (plans/09 W1). Only atomics
     /// and non-blocking queue sends: safe under `reg`.
     pub(crate) fn set_focused(&self, focused: bool) {
-        self.activity.set(focused);
+        self.activity.set(focused, &self.view);
         self.view.set_focused(focused);
     }
 
@@ -247,6 +247,7 @@ impl TabGate {
     /// under `reg`.
     pub(crate) fn set_on_screen(&self, active: bool) {
         self.view.set_on_screen(active);
+        self.activity.set_on_screen(active, &self.view);
         // Off-screen sessions pause (08a §6.14). Ordered on the reliable control
         // channel, so a quick back-and-forth ends in the right state; queued
         // until the channel opens when the session is still starting.
@@ -268,24 +269,45 @@ impl TabGate {
 }
 
 /// Viewer: what follows the session being the **focused** one (plans/08 P3,
-/// plans/09 W1; `active` below means focused). Only the focused session
-/// exchanges the clipboard (B3: otherwise text copied from one host would be
-/// forwarded to another) and holds the shortcut hook (B2).
+/// plans/09 W1). Only the focused session exchanges the clipboard (B3:
+/// otherwise text copied from one host would be forwarded to another), and
+/// focus is sticky for it: it stays while another app is in front
+/// (plans/09 §7, blocker 5). The shortcut hook (B2) asks more: focused **and**
+/// on screen **and** not under a web dialog in its window, so a session kept
+/// focused for the clipboard while the strip shows another tab never takes
+/// that window's Win / Alt+Tab.
 pub(crate) struct Activity {
+    /// Focused.
     active: AtomicBool,
-    /// The clipboard loop's gate: the user's setting AND active.
+    /// The clipboard loop's gate: the user's setting AND focused.
     clip_on: Arc<AtomicBool>,
     clipboard_setting: bool,
-    /// Tells the shortcut thread to uninstall its hook: set while inactive and
-    /// once the session stops.
+    /// Tells the shortcut thread to uninstall its hook: set whenever the hook
+    /// is not wanted (see [`HookInputs`]) and once the session stops.
     hook_quit: AtomicBool,
-    /// Bumped on every activation, so the shortcut thread can tell "still the
-    /// same activation" from "deactivated and activated again since".
+    /// Bumped each time the hook becomes wanted, so the shortcut thread can
+    /// tell "still the same claim" from "dropped and wanted again since".
     generation: AtomicU64,
     /// Wakes the clipboard loop when its gate changes, so it re-baselines at
     /// once rather than up to a poll later — a copy made right after switching
     /// to this tab then counts as new (and is sent), not as the baseline.
     clip_wake: std::sync::mpsc::Sender<()>,
+    /// What the hook follows. Every change re-decides `hook_quit` from all of
+    /// it under this lock (a leaf lock; the overlay set it reads is one too),
+    /// so racing changes — a dialog closing while another opens, focus moving
+    /// as the tab leaves the screen — always end on the answer for the final
+    /// inputs, never on whichever store came last.
+    hook: Mutex<HookInputs>,
+}
+
+/// The inputs of the shortcut hook's decision.
+#[derive(Default)]
+struct HookInputs {
+    focused: bool,
+    on_screen: bool,
+    stopped: bool,
+    /// The last decision.
+    wanted: bool,
 }
 
 impl Activity {
@@ -296,37 +318,64 @@ impl Activity {
             active: AtomicBool::new(active),
             clip_on: Arc::new(AtomicBool::new(clipboard_setting && active)),
             clipboard_setting,
-            hook_quit: AtomicBool::new(!active),
+            hook_quit: AtomicBool::new(true),
             generation: AtomicU64::new(0),
             clip_wake,
+            hook: Mutex::new(HookInputs {
+                focused: active,
+                ..HookInputs::default()
+            }),
         };
         (activity, wake_rx)
     }
 
-    /// A web dialog opened (`true`) or the last one closed: the shortcut
-    /// hook goes while it is open, and comes back for the active session.
-    fn overlay(&self, open: bool) {
-        if open {
-            self.hook_quit.store(true, Ordering::SeqCst);
-        } else if self.active.load(Ordering::SeqCst) {
-            // A fresh activation for the hook thread, which waits for one.
-            self.generation.fetch_add(1, Ordering::SeqCst);
-            self.hook_quit.store(false, Ordering::SeqCst);
-        }
+    /// A web dialog opened or the last one closed over the session's window
+    /// (the overlay set changed already): the hook goes while one is open.
+    fn overlay_changed(&self, view: &active::SessionView) {
+        self.decide(view, |_| {});
     }
 
-    fn set(&self, active: bool) {
+    fn set(&self, active: bool, view: &active::SessionView) {
         self.active.store(active, Ordering::SeqCst);
         // The clipboard loop re-baselines when its gate opens, so text copied
-        // while another tab was active is never forwarded here (08a §6.4 step 4).
+        // while another tab was focused is never forwarded here (08a §6.4 step 4).
         self.clip_on
             .store(active && self.clipboard_setting, Ordering::SeqCst);
-        if active {
-            self.generation.fetch_add(1, Ordering::SeqCst);
-        }
-        self.hook_quit.store(!active, Ordering::SeqCst);
+        self.decide(view, |h| h.focused = active);
         // Never blocks; fails only once the loop is gone (session over).
         let _ = self.clip_wake.send(());
+    }
+
+    fn set_on_screen(&self, on: bool, view: &active::SessionView) {
+        self.decide(view, |h| h.on_screen = on);
+    }
+
+    /// The session is stopping: the hook goes for good.
+    fn stop(&self) {
+        let mut h = self.hook.lock();
+        h.stopped = true;
+        h.wanted = false;
+        self.hook_quit.store(true, Ordering::SeqCst);
+    }
+
+    /// Apply `change`, then re-decide the hook from every input, reading the
+    /// overlay set now (under the lock), not a value passed in that a racing
+    /// change may have overtaken.
+    fn decide(&self, view: &active::SessionView, change: impl FnOnce(&mut HookInputs)) {
+        let mut h = self.hook.lock();
+        change(&mut h);
+        let wanted = !h.stopped && h.focused && h.on_screen && !view.covered();
+        if wanted && !h.wanted {
+            // A fresh claim for the hook thread, which waits for one.
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+        h.wanted = wanted;
+        self.hook_quit.store(!wanted, Ordering::SeqCst);
+    }
+
+    /// Whether the shortcut hook is wanted right now.
+    fn hook_wanted(&self) -> bool {
+        !self.hook_quit.load(Ordering::SeqCst)
     }
 }
 
@@ -845,14 +894,12 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
             activity.clone(),
             engine.hook_owner(),
         );
-        let covered = view.clone();
         spawn_or_abort!(engine, id, stop, threads, "shortcuts", move || {
             shortcut_loop(
                 id,
                 platform.as_ref(),
                 surface.as_ref(),
                 &activity,
-                &covered,
                 &owner,
                 &stop_k,
                 || hook_forwarder(hook_input.clone(), keys.clone(), ctl.clone()),
@@ -902,9 +949,9 @@ fn send_input(ctl: &Sender<Vec<u8>>, msg: &InputMsg) {
     let _ = ctl.send(serde_json::to_vec(msg).unwrap_or_default());
 }
 
-/// Session `id`'s shortcut capture: whenever the session is active and no
-/// other session holds the hook, install it, run it until the session stops
-/// being active (or stops), uninstall it and hand the owner slot back.
+/// Session `id`'s shortcut capture: whenever its hook is wanted (Activity)
+/// and no other session holds the hook, install it, run it until it is no
+/// longer wanted (or the session stops), uninstall it and hand the owner slot back.
 /// Polls at 50 ms: activation is a user action, and a hook a tick late is
 /// invisible.
 fn shortcut_loop(
@@ -912,16 +959,15 @@ fn shortcut_loop(
     platform: &dyn platform_api::Platform,
     surface: &dyn platform_api::VideoSurface,
     activity: &Activity,
-    view: &active::SessionView,
     owner: &Mutex<Option<SessionId>>,
     stop: &AtomicBool,
     forwarder: impl Fn() -> KeyForwarder,
 ) {
     const TICK: Duration = Duration::from_millis(50);
     while !stop.load(Ordering::SeqCst) {
-        // Not while a web dialog is open over the video (its keys are this
-        // computer's).
-        let claimed = activity.active.load(Ordering::SeqCst) && !view.covered() && {
+        // Only while focused, on screen and not under a web dialog (its keys
+        // are this computer's): see Activity.
+        let claimed = activity.hook_wanted() && {
             let mut o = owner.lock();
             if o.is_none() {
                 *o = Some(id);
@@ -958,7 +1004,7 @@ fn shortcut_loop(
         // the top. Ended while this activation lasts (it would not install,
         // or the OS dropped it): not straight back in, so it is not retried
         // in a tight loop — wait for the next activation.
-        while activity.active.load(Ordering::SeqCst)
+        while activity.hook_wanted()
             && !stop.load(Ordering::SeqCst)
             && activity.generation.load(Ordering::SeqCst) == generation
         {
@@ -1156,7 +1202,7 @@ impl Session {
     pub(crate) fn signal_stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(a) = &self.activity {
-            a.hook_quit.store(true, Ordering::SeqCst);
+            a.stop();
         }
     }
 
@@ -1447,6 +1493,50 @@ mod tests {
             slot: 0,
             current: Arc::default(),
         }
+    }
+
+    /// plans/09 W1: the shortcut hook is wanted only while the session is
+    /// focused, on screen and not under a dialog in its window — focus kept
+    /// for the clipboard alone never takes the window's keys — and never once
+    /// the session stops.
+    #[test]
+    fn the_hook_follows_focus_screen_and_dialogs() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let overlays = active::Overlays::default();
+        let view = active::SessionView::new(
+            platform_api::mock::MockSurface::new((64, 64)),
+            Arc::default(),
+            overlays.clone(),
+            active::applier(rt.handle()),
+        );
+        let (activity, _wake) = Activity::new(true, false);
+        let generation = || activity.generation.load(Ordering::SeqCst);
+        activity.set(true, &view);
+        assert!(!activity.hook_wanted(), "focused but off screen");
+        assert!(
+            activity.clip_on.load(Ordering::SeqCst),
+            "the clipboard is sticky"
+        );
+        activity.set_on_screen(true, &view);
+        assert!(activity.hook_wanted());
+        let claim = generation();
+        overlays.lock().insert(crate::WindowId(3));
+        activity.overlay_changed(&view);
+        assert!(activity.hook_wanted(), "a dialog in another window");
+        overlays.lock().insert(crate::WindowId::MAIN);
+        activity.overlay_changed(&view);
+        assert!(!activity.hook_wanted(), "a dialog in its own window");
+        overlays.lock().remove(&crate::WindowId::MAIN);
+        activity.overlay_changed(&view);
+        assert!(activity.hook_wanted());
+        assert!(generation() > claim, "wanted again: a fresh claim");
+        activity.set_on_screen(false, &view);
+        assert!(!activity.hook_wanted());
+        activity.set_on_screen(true, &view);
+        activity.stop();
+        activity.set(true, &view);
+        activity.overlay_changed(&view);
+        assert!(!activity.hook_wanted(), "stopped for good");
     }
 
     /// What a tab's host is told as it goes to the background and back (P6):
