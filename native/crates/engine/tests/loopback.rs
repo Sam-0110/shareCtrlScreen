@@ -14,7 +14,7 @@ use engine::{Engine, IcePolicy, Role, UiEvent};
 use futures_util::{SinkExt, StreamExt};
 use platform_api::mock::MockPlatform;
 use platform_api::{Clipboard, FileDrop, VideoInput};
-use protocol::{Config, InputMsg, Permission};
+use protocol::{Config, InputMsg, Mode, Permission};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio_tungstenite::tungstenite::Message;
@@ -146,6 +146,8 @@ struct Peer {
     platform: Arc<MockPlatform>,
     uuid: String,
     toasts: Arc<std::sync::Mutex<Vec<String>>>,
+    /// How many password prompts the engine asked this side's UI to show.
+    password_prompts: Arc<std::sync::atomic::AtomicU32>,
     /// Every role the engine reported, in order.
     roles: Arc<std::sync::Mutex<Vec<Role>>>,
     /// How many "link trouble" countdown ticks the engine reported.
@@ -229,6 +231,8 @@ fn start_peer_full(
     let toasts: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
     let roles: Arc<std::sync::Mutex<Vec<Role>>> = Arc::default();
     let link_trouble: Arc<std::sync::atomic::AtomicU32> = Arc::default();
+    let password_prompts: Arc<std::sync::atomic::AtomicU32> = Arc::default();
+    let pp = password_prompts.clone();
     let displays: Arc<std::sync::Mutex<Vec<Announced>>> = Arc::default();
     let popouts: Arc<std::sync::Mutex<Vec<(u8, String)>>> = Arc::default();
     let (t, r, lt, ds, po) = (
@@ -243,6 +247,9 @@ fn start_peer_full(
             match ev {
                 UiEvent::Toast(msg) => t.lock().unwrap().push(msg),
                 UiEvent::RoleChanged(role) => r.lock().unwrap().push(role),
+                UiEvent::PasswordRequired { .. } => {
+                    pp.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 UiEvent::LinkTrouble { .. } => {
                     lt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -268,6 +275,7 @@ fn start_peer_full(
         platform,
         uuid,
         toasts,
+        password_prompts,
         roles,
         link_trouble,
         displays,
@@ -324,13 +332,19 @@ async fn a_second_viewer_is_told_busy_while_the_first_awaits_approval() {
     })
     .await;
 
-    first.engine.connect_to(host.uuid.clone());
+    first
+        .engine
+        .connect_to(host.uuid.clone())
+        .expect("this computer is not hosting");
     eventually("the host's prompt is open for the first viewer", t, || {
         asked.load(std::sync::atomic::Ordering::SeqCst)
     })
     .await;
 
-    second.engine.connect_to(host.uuid.clone());
+    second
+        .engine
+        .connect_to(host.uuid.clone())
+        .expect("this computer is not hosting");
     eventually("the second viewer is told busy", t, || {
         second
             .toasts
@@ -359,6 +373,69 @@ async fn a_second_viewer_is_told_busy_while_the_first_awaits_approval() {
     );
 }
 
+/// A pending connect-request makes this computer busy for incoming ones (D1),
+/// and cancelling its password prompt ends it, so this computer takes incoming
+/// connections again (P0 review: a cancelled prompt used to leave it answering
+/// "busy" to everyone until a restart).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_password_prompt_does_not_leave_this_computer_busy() {
+    let relay = start_relay().await;
+    let locked = start_peer("host-password", &relay);
+    locked.engine.update_config(|c| {
+        c.mode = Mode::Password;
+        c.set_password(Some("correct horse"));
+    });
+    let me = start_peer("viewer-then-host", &relay);
+    let other = start_peer("other-viewer", &relay);
+    let t = Duration::from_secs(15);
+    eventually("all registered", t, || {
+        locked.engine.server_connected()
+            && me.engine.server_connected()
+            && other.engine.server_connected()
+    })
+    .await;
+
+    me.engine
+        .connect_to(locked.uuid.clone())
+        .expect("this computer is not hosting");
+    eventually("the password prompt", t, || {
+        me.password_prompts
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+    })
+    .await;
+
+    // The prompt is up: this computer is connecting, so it is busy.
+    other
+        .engine
+        .connect_to(me.uuid.clone())
+        .expect("this computer is not hosting");
+    eventually("the other viewer is told busy", t, || {
+        other
+            .toasts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m == "connection busy")
+    })
+    .await;
+
+    // Cancel, as the prompt's Cancel button does.
+    me.engine.end_session();
+    other
+        .engine
+        .connect_to(me.uuid.clone())
+        .expect("this computer is not hosting");
+    let other_id = other.uuid.clone();
+    eventually("the other viewer is let in", t, || {
+        matches!(me.engine.role(), Role::Host { ref peer, .. } if *peer == other_id)
+            && matches!(other.engine.role(), Role::Viewer { .. })
+    })
+    .await;
+    // And while hosting, this computer cannot connect out (D1).
+    assert!(me.engine.connect_to(locked.uuid.clone()).is_err());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_session_over_real_webrtc() {
     let relay = start_relay().await;
@@ -372,7 +449,10 @@ async fn full_session_over_real_webrtc() {
     .await;
 
     // Handshake (approve mode → AllowControl), then WebRTC over loopback UDP.
-    viewer.engine.connect_to(host.uuid.clone());
+    viewer
+        .engine
+        .connect_to(host.uuid.clone())
+        .expect("this computer is not hosting");
     eventually("roles set", t, || {
         matches!(
             host.engine.role(),
@@ -520,7 +600,10 @@ async fn host_cursor_image_reaches_the_viewer_and_lands_on_the_hotspot() {
         host.engine.server_connected() && viewer.engine.server_connected()
     })
     .await;
-    viewer.engine.connect_to(host.uuid.clone());
+    viewer
+        .engine
+        .connect_to(host.uuid.clone())
+        .expect("this computer is not hosting");
 
     // The mock host reports its image once, with its first frame, before any
     // channel is open: it must still arrive (reliable ctl, buffered until open)
@@ -645,7 +728,10 @@ async fn maximum_size_cursor_images_in_a_burst_all_arrive_intact() {
         host.engine.server_connected() && viewer.engine.server_connected()
     })
     .await;
-    viewer.engine.connect_to(host.uuid.clone());
+    viewer
+        .engine
+        .connect_to(host.uuid.clone())
+        .expect("this computer is not hosting");
 
     eventually("the last 256×256 image installed and drawn", t, || {
         let s = viewer.platform.surface.state();
@@ -790,7 +876,10 @@ async fn controlled_session(
         host.engine.server_connected() && viewer.engine.server_connected()
     })
     .await;
-    viewer.engine.connect_to(host.uuid.clone());
+    viewer
+        .engine
+        .connect_to(host.uuid.clone())
+        .expect("this computer is not hosting");
     eventually("video presented", t, || {
         matches!(
             host.engine.role(),
@@ -954,7 +1043,10 @@ async fn constrained_link_tracks_bwe_down_and_recovers() {
         host.engine.server_connected() && viewer.engine.server_connected()
     })
     .await;
-    viewer.engine.connect_to(host.uuid.clone());
+    viewer
+        .engine
+        .connect_to(host.uuid.clone())
+        .expect("this computer is not hosting");
 
     // Up and running at full resolution, with frames reaching the viewer, before
     // we touch the link.
@@ -1092,7 +1184,10 @@ async fn noisy_link_stays_steady_but_follows_a_sustained_trend() {
         host.engine.server_connected() && viewer.engine.server_connected()
     })
     .await;
-    viewer.engine.connect_to(host.uuid.clone());
+    viewer
+        .engine
+        .connect_to(host.uuid.clone())
+        .expect("this computer is not hosting");
     eventually("video flowing at full size", t, || {
         host.engine.test_encode_dims() == Some((640, 360))
             && !viewer.platform.surface.state().presented.is_empty()
@@ -1248,7 +1343,10 @@ async fn monitor_switch_follows_picture_input_and_the_control_gate() {
         host.engine.server_connected() && viewer.engine.server_connected()
     })
     .await;
-    viewer.engine.connect_to(host.uuid.clone());
+    viewer
+        .engine
+        .connect_to(host.uuid.clone())
+        .expect("this computer is not hosting");
 
     // Both UIs learn the host's monitors; the viewer may switch (control).
     let both = vec!["mock-0".to_string(), "mock-1".to_string()];
@@ -1388,7 +1486,10 @@ async fn popout_window_streams_a_second_monitor_with_its_own_input() {
         host.engine.server_connected() && viewer.engine.server_connected()
     })
     .await;
-    viewer.engine.connect_to(host.uuid.clone());
+    viewer
+        .engine
+        .connect_to(host.uuid.clone())
+        .expect("this computer is not hosting");
     eventually("main window presenting", t, || {
         viewer.last_displays().is_some_and(|d| d.2)
             && !viewer.platform.surface.state().presented.is_empty()

@@ -18,7 +18,7 @@ Each row is marked complete in the commit that finishes it.
 | Step | What | Status |
 |---|---|---|
 | S | Structure, contracts and flows ([08a](08a-STRUCTURE-AND-FLOWS.md)), adversarial review folded in | **complete** (plan commit on the feature branch) |
-| P0 | Bugs + signaling dispatcher + UI/main.rs split + server CI | **complete**, review pending (gate TABS-08 Windows + TABS-09 WSL PASS; macOS compile of the moved menu code is CI-pending; UI split smoke-tested in Node, not yet run in the app) |
+| P0 | Bugs + signaling dispatcher + UI/main.rs split + server CI | **complete**: 5454fc1, reviewed; the review's blocker (a cancelled password prompt left the computer busy), two majors (D1 check not atomic with the role change; bad proofs could hold the admission) and two minors fixed in the following commit, with a loopback test (gates TABS-10 Windows + TABS-11 WSL PASS). Unverified: macOS compile of the moved menu code (CI); server-tests.yml has not run on GitHub yet; the UI split has been smoke-tested in Node, not in the app |
 | P1 | Accounts own the workspace + sync v2 + synced prefs + migration | not started |
 | P2 | Engine multi-session core | not started |
 | P3 | Platform multi-surface (inset, active gate, focus, hooks, clipboard) | not started |

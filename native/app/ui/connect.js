@@ -8,6 +8,7 @@ import { preflight } from './settings.js';
 import {
   $,
   S,
+  errorText,
   render,
   setState,
   startRequestCountdown,
@@ -153,14 +154,26 @@ async function connect() {
   setState('REQUESTING');
   // Viewer owns the 30 s timeout (contract §3.3).
   startRequestCountdown();
-  api.connectTo(id);
+  try {
+    await api.connectTo(id);
+  } catch (err) {
+    // Refused before anything was sent (someone is connected or connecting to
+    // this computer): back to the home screen with the reason.
+    stopCountdown();
+    setState('READY');
+    toast(errorText(err), 'error');
+    return;
+  }
   scheduleSync(3000); // connect_to added it to the recents
 }
 
 // ---- password prompt (viewer) ---------------------------------------------------
+// Cancel ends the pending request in the engine too: until then this computer
+// counts as connecting and answers incoming requests "busy" (D1).
 function cancelPassword() {
   S.passwordFrom = null;
   $('password-input').value = '';
+  api.endSession();
   setState('READY');
 }
 

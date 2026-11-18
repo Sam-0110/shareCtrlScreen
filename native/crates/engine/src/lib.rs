@@ -120,6 +120,55 @@ fn signal_peer(msg: &SignalMsg) -> Option<String> {
     }
 }
 
+/// How long an unanswered connect-request keeps this computer busy for
+/// incoming ones: the viewer's own 30 s answer timeout (contract §3.3) plus
+/// room for the answer in flight. Past it the request is treated as abandoned
+/// for the busy check, even if the UI never cancelled it, so a lost answer can
+/// never leave this computer refusing everyone.
+const OUTBOUND_BUSY_FOR: Duration = Duration::from_secs(35);
+
+/// A connect-request this computer sent and is waiting on (viewer side).
+struct Outbound {
+    host: String,
+    /// Until when it counts as "connecting" for the one-session rule (D1).
+    /// `None` while the user is answering this host's password prompt: that
+    /// wait has no limit, and the UI cancels it with `end_session`.
+    busy_until: Option<std::time::Instant>,
+}
+
+impl Outbound {
+    fn sent_to(host: String) -> Self {
+        Outbound {
+            host,
+            busy_until: Some(std::time::Instant::now() + OUTBOUND_BUSY_FOR),
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        self.busy_until
+            .is_none_or(|t| std::time::Instant::now() < t)
+    }
+}
+
+/// Why [`Engine::connect_to`] refused to start a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectError {
+    /// This computer is hosting, or letting a viewer in (D1).
+    Hosting,
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ConnectError::Hosting => {
+                "Someone is connected or connecting to this computer: end that first"
+            }
+        })
+    }
+}
+
+impl std::error::Error for ConnectError {}
+
 /// Holds [`Engine::admitting`] for one peer and clears it when dropped, so an
 /// admission that ends any way (accepted, denied, a wrong password, a panic)
 /// never leaves this computer stuck "busy".
@@ -171,7 +220,7 @@ pub struct Engine {
     /// Viewer: the host we sent a connect-request to and are waiting on. A
     /// connect-response from anyone else is ignored — otherwise any peer that
     /// knows our id could make us start a viewer session with it.
-    outbound: Mutex<Option<String>>,
+    outbound: Mutex<Option<Outbound>>,
     /// Host: the one peer currently being admitted — its approval prompt is open
     /// or its password proof is being checked. While it is set, every other
     /// connect-request is answered "busy" and no outgoing session may start, so
@@ -335,8 +384,9 @@ impl Engine {
         }
     }
 
-    /// Drive one inbound signaling event to completion, serially. The loopback
-    /// tests use this; the app uses [`Engine::dispatch_signaling`].
+    /// Drive one inbound signaling event to completion. Reached through
+    /// [`Engine::dispatch_signaling`], which calls it for the events that
+    /// concern no single peer (registration, server loss).
     pub async fn handle_signaling(&self, event: SigEvent) {
         match event {
             SigEvent::Registered => {
@@ -477,10 +527,16 @@ impl Engine {
     ) {
         let cfg = self.config.lock().clone();
         let mode = cfg.effective_mode();
-        // An approval prompt or a password proof is an admission in progress; a
-        // bare first password request (we only send a challenge) is not — the
-        // viewer may never answer it.
-        let admits = mode == Mode::Approve || password.is_some();
+        // An approval prompt, or a password proof answering a challenge we
+        // issued, is an admission in progress. A bare first password request
+        // (we only send a challenge) is not — the viewer may never answer it —
+        // and neither is a proof with no challenge behind it: it cannot succeed,
+        // and letting it claim the admission would let any peer that knows our
+        // ID keep this computer "busy" by streaming bad proofs.
+        let admits = match mode {
+            Mode::Approve => true,
+            Mode::Password => password.is_some() && self.pending_nonce.lock().contains_key(&from),
+        };
 
         // Busy: one session at a time, and one admission at a time. Checked and
         // claimed under the same locks, because each peer is handled on its own
@@ -491,7 +547,7 @@ impl Engine {
             let mut admitting = self.admitting.lock();
             let busy = !matches!(*role, Role::Idle)
                 || admitting.as_deref().is_some_and(|p| p != from)
-                || self.outbound.lock().is_some();
+                || self.outbound.lock().as_ref().is_some_and(Outbound::is_busy);
             if !busy && admits {
                 *admitting = Some(from.clone());
             }
@@ -511,7 +567,7 @@ impl Engine {
         }
         // Released however the admission ends (accepted, denied, wrong password).
         // On accept the role is Host before this drops, so there is no gap.
-        let _admission = admits.then(|| Admission {
+        let admission = admits.then(|| Admission {
             engine: self,
             peer: from.clone(),
         });
@@ -524,18 +580,27 @@ impl Engine {
         }
 
         match mode {
-            Mode::Password => self.handle_password_request(from, password, &cfg).await,
-            Mode::Approve => self.handle_approve_request(from).await,
+            Mode::Password => {
+                self.handle_password_request(from, password, &cfg, admission)
+                    .await
+            }
+            Mode::Approve => {
+                self.handle_approve_request(from).await;
+                drop(admission);
+            }
         }
     }
 
-    /// Whether this computer is hosting or admitting a viewer — when it may not
-    /// start a session of its own (plans/08 D1).
-    fn hosting_or_admitting(&self) -> bool {
-        matches!(*self.role.lock(), Role::Host { .. }) || self.admitting.lock().is_some()
-    }
-
-    async fn handle_password_request(&self, from: String, password: Option<String>, cfg: &Config) {
+    /// `admission` is held while the proof is checked and through `accept`; a
+    /// wrong proof releases it before the anti-guessing delay, which slows
+    /// that one peer down but must not keep everyone else out.
+    async fn handle_password_request(
+        &self,
+        from: String,
+        password: Option<String>,
+        cfg: &Config,
+        admission: Option<Admission<'_>>,
+    ) {
         match password {
             None => {
                 // Issue a fresh nonce (contract §3.2).
@@ -551,9 +616,11 @@ impl Engine {
             }
             Some(proof) => {
                 let nonce = self.pending_nonce.lock().remove(&from).unwrap_or_default();
-                if cfg.verify_proof(&nonce, &proof) {
+                if admission.is_some() && cfg.verify_proof(&nonce, &proof) {
                     self.accept(from, cfg.password_permission).await;
+                    drop(admission);
                 } else {
+                    drop(admission);
                     // §6 security: 2 s artificial delay before rejecting.
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let _ = self.signaling.send(SignalMsg::ConnectResponse {
@@ -593,6 +660,32 @@ impl Engine {
     /// Accept a viewer with `permission`, become Host, and begin negotiation as
     /// the offerer (the host owns the media, contract §3.2 step 4).
     async fn accept(&self, peer: String, permission: Permission) {
+        // Become Host first, under the role lock, and only from Idle. The
+        // admission held by our caller already keeps every other session out
+        // (`connect_to` and `on_connect_response` check it under the same
+        // locks), so this cannot fail today; it is the last line of the
+        // one-session rule (D1) should that ever change.
+        {
+            let mut role = self.role.lock();
+            if !matches!(*role, Role::Idle) {
+                drop(role);
+                tracing::warn!("not accepting {peer}: a session started meanwhile");
+                let _ = self.signaling.send(SignalMsg::ConnectResponse {
+                    to: Some(peer),
+                    from: None,
+                    accepted: false,
+                    permission: None,
+                    reason: Some("busy".into()),
+                    codec: None,
+                    os: None,
+                });
+                return;
+            }
+            *role = Role::Host {
+                peer: peer.clone(),
+                permission,
+            };
+        }
         // Codec negotiation from the viewer's advertised caps (§3) — done before
         // the response so the viewer is told which codec to decode with.
         let decode = self.pending_caps.lock().remove(&peer).unwrap_or_default();
@@ -617,10 +710,6 @@ impl Engine {
                 .wire_name()
                 .map(String::from),
         });
-        *self.role.lock() = Role::Host {
-            peer: peer.clone(),
-            permission,
-        };
         let _ = self.ui.send(UiEvent::RoleChanged(self.role.lock().clone()));
         // Persist, not just mutate in memory, so recents survive a restart.
         self.update_config(|c| c.add_recent(&peer));
@@ -631,14 +720,19 @@ impl Engine {
     // ---- Viewer side (contract §3.2) -------------------------------------
 
     /// UI action: connect out to `host_uuid`. Sends the first connect-request.
-    pub fn connect_to(&self, host_uuid: String) {
-        // Not while this computer is controlled or letting someone in (D1): the
-        // two sessions would fight over the one session slot.
-        if self.hosting_or_admitting() {
-            let _ = self.ui.send(UiEvent::Toast(
-                "This computer is being controlled: end that session first".into(),
-            ));
-            return;
+    ///
+    /// Refused while this computer is hosting or letting a viewer in (D1): the
+    /// two sessions would fight over the one session slot. Checked and claimed
+    /// under the same locks as an incoming request's admission (role →
+    /// admitting → outbound), so the two cannot both get through.
+    pub fn connect_to(&self, host_uuid: String) -> Result<(), ConnectError> {
+        {
+            let role = self.role.lock();
+            let admitting = self.admitting.lock();
+            if matches!(*role, Role::Host { .. }) || admitting.is_some() {
+                return Err(ConnectError::Hosting);
+            }
+            *self.outbound.lock() = Some(Outbound::sent_to(host_uuid.clone()));
         }
         // Advertise only codecs this viewer can actually hardware-decode. A
         // hardcoded list (e.g. always claiming AV1) makes the host negotiate a
@@ -650,7 +744,6 @@ impl Engine {
             .iter()
             .map(|c| c.as_caps_str().to_string())
             .collect();
-        *self.outbound.lock() = Some(host_uuid.clone());
         let _ = self.signaling.send(SignalMsg::ConnectRequest {
             to: Some(host_uuid.clone()),
             from: None,
@@ -661,6 +754,7 @@ impl Engine {
             }),
         });
         self.update_config(|c| c.add_recent(&host_uuid));
+        Ok(())
     }
 
     /// UI action: clear the recent-ids list. Returns the (now empty) list.
@@ -697,7 +791,7 @@ impl Engine {
             let _ = self
                 .ui
                 .send(UiEvent::Toast("Saved password no longer works".into()));
-            let _ = self.ui.send(UiEvent::PasswordRequired { from });
+            self.prompt_for_password(from);
             return;
         }
 
@@ -708,7 +802,19 @@ impl Engine {
             self.submit_password(from, plain, false);
             return;
         }
-        let _ = self.ui.send(UiEvent::PasswordRequired { from });
+        self.prompt_for_password(from);
+    }
+
+    /// Ask the user for `host`'s password. While the prompt is up the request
+    /// waits on the user, not the network, so it keeps this computer busy for
+    /// as long as it takes; Cancel ends it through `end_session`.
+    fn prompt_for_password(&self, host: String) {
+        if let Some(o) = self.outbound.lock().as_mut() {
+            if o.host == host {
+                o.busy_until = None;
+            }
+        }
+        let _ = self.ui.send(UiEvent::PasswordRequired { from: host });
     }
 
     /// The stored password for `host`, if auto-login is on and we can decrypt it.
@@ -821,6 +927,12 @@ impl Engine {
         // proof = SHA256( SHA256(plaintext) + ":" + nonce ).
         let proof = handshake::compute_proof(&plaintext, &nonce);
         *self.pending_login.lock() = Some((host.clone(), plaintext, remember));
+        // Waiting on the network again: the answer timeout starts over.
+        if let Some(o) = self.outbound.lock().as_mut() {
+            if o.host == host {
+                *o = Outbound::sent_to(host.clone());
+            }
+        }
         let _ = self.signaling.send(SignalMsg::ConnectRequest {
             to: Some(host),
             from: None,
@@ -847,25 +959,49 @@ impl Engine {
         codec: Option<String>,
         os: Option<String>,
     ) {
-        // Only the host we asked may answer, and only once.
-        {
+        let perm = permission
+            .as_deref()
+            .map(|p| match p {
+                "control" => Permission::Control,
+                _ => Permission::View,
+            })
+            .unwrap_or(Permission::View);
+        // Only the host we asked may answer, and only once. On acceptance we
+        // become its viewer in the same step, under role → admitting →
+        // outbound, unless this computer started hosting (or admitting a
+        // viewer) while waiting: then a second session must not start (D1).
+        // One critical section, so an incoming request cannot slip between the
+        // check and the role change.
+        let blocked_by_hosting = {
+            let mut role = self.role.lock();
+            let admitting = self.admitting.lock();
             let mut outbound = self.outbound.lock();
-            if outbound.as_deref() != Some(from.as_str()) {
+            if outbound.as_ref().map(|o| o.host.as_str()) != Some(from.as_str()) {
+                drop((role, admitting, outbound));
                 tracing::warn!("ignoring a connect-response from {from}: we did not ask it");
                 return;
             }
             *outbound = None;
-        }
-        // We started hosting (or admitting a viewer) while waiting for this
-        // answer: a second session must not start (D1). Tell that host to drop
-        // the session it just opened for us.
-        if accepted && self.hosting_or_admitting() {
+            let blocked = matches!(*role, Role::Host { .. }) || admitting.is_some();
+            if accepted && !blocked {
+                *role = Role::Viewer {
+                    peer: from.clone(),
+                    permission: perm,
+                };
+            }
+            blocked
+        };
+        if accepted && blocked_by_hosting {
+            // The attempt is cancelled: nothing from it is saved or carried over.
+            *self.pending_login.lock() = None;
+            *self.auto_attempted.lock() = None;
+            // Tell that host to drop the session it just opened for us.
             let _ = self.signaling.send(SignalMsg::EndSession {
                 to: Some(from),
                 from: None,
             });
             let _ = self.ui.send(UiEvent::Toast(
-                "Connection cancelled: this computer is being controlled".into(),
+                "Connection cancelled: someone connected to this computer meanwhile".into(),
             ));
             return;
         }
@@ -912,17 +1048,6 @@ impl Engine {
             .map_or(modifiers::OsFamily::Unknown, modifiers::OsFamily::from_name);
         tracing::info!("host OS: {host_os:?}");
         *self.peer_os.lock() = host_os;
-        let perm = permission
-            .as_deref()
-            .map(|p| match p {
-                "control" => Permission::Control,
-                _ => Permission::View,
-            })
-            .unwrap_or(Permission::View);
-        *self.role.lock() = Role::Viewer {
-            peer: from.clone(),
-            permission: perm,
-        };
         let _ = self.ui.send(UiEvent::RoleChanged(self.role.lock().clone()));
         tracing::info!("viewer session with {from}; awaiting the host's offer");
     }
@@ -1013,12 +1138,14 @@ impl Engine {
     }
 
     /// End the session locally and tell the peer (best-effort, contract §3.2 s5).
+    /// Also cancels a connect-request that has not been answered yet, telling
+    /// that host too, so it does not keep a session open for a viewer that left
+    /// (08a §6.5 step 1).
     pub fn end_session(&self) {
-        // Also cancels a connect-request that has not been answered yet.
-        *self.outbound.lock() = None;
+        let pending = self.outbound.lock().take().map(|o| o.host);
         let peer = match &*self.role.lock() {
             Role::Host { peer, .. } | Role::Viewer { peer, .. } => Some(peer.clone()),
-            Role::Idle => None,
+            Role::Idle => pending,
         };
         if let Some(peer) = peer {
             let _ = self.signaling.send(SignalMsg::EndSession {
@@ -1053,7 +1180,7 @@ impl Engine {
             &*self.role.lock(),
             Role::Host { peer, .. } | Role::Viewer { peer, .. } if peer == id
         );
-        in_session || self.outbound.lock().as_deref() == Some(id)
+        in_session || self.outbound.lock().as_ref().is_some_and(|o| o.host == id)
     }
 
     /// End the current session because it could not be started or kept going,
@@ -1171,5 +1298,29 @@ impl Engine {
         if let Some(s) = self.session.lock().as_ref() {
             s.inject_bwe(bps);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn an_unanswered_request_stops_counting_as_busy() {
+        let fresh = Outbound::sent_to("host".into());
+        assert!(fresh.is_busy());
+        let lost = Outbound {
+            host: "host".into(),
+            busy_until: Instant::now().checked_sub(Duration::from_secs(1)),
+        };
+        assert!(lost.busy_until.is_some());
+        assert!(!lost.is_busy());
+        // Waiting on the user's password has no limit.
+        let prompting = Outbound {
+            host: "host".into(),
+            busy_until: None,
+        };
+        assert!(prompting.is_busy());
     }
 }

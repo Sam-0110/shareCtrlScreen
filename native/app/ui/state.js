@@ -5,6 +5,8 @@
 // is a read-only binding, so modules that must WRITE shared state (the screen,
 // the loaded config, the peer awaiting an answer) do it through `S.<field>`.
 
+import * as api from './api.js';
+
 export const $ = (id) => document.getElementById(id);
 
 // §6 — one state variable; every state maps to exactly one screen/modal.
@@ -116,11 +118,17 @@ export function stopCountdown() {
   S.cancelCountdown = null;
 }
 
-/** Start the viewer's 30 s wait for the host's answer (contract §3.3). */
+/**
+ * Start the viewer's 30 s wait for the host's answer (contract §3.3). On
+ * timeout the request is ended in the engine too, so a late answer does not
+ * start a session behind the home screen and the computer stops counting as
+ * connecting.
+ */
 export function startRequestCountdown() {
   stopCountdown();
   S.cancelCountdown = countdown('requesting-count', 30, () => {
     toast('No answer — timed out', 'error');
+    api.endSession();
     setState('READY');
   });
 }

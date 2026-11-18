@@ -112,8 +112,8 @@ pub fn get_role(state: tauri::State<'_, AppState>) -> String {
 }
 
 #[tauri::command]
-pub fn connect_to(state: tauri::State<'_, AppState>, id: String) {
-    state.engine.connect_to(id);
+pub fn connect_to(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    state.engine.connect_to(id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
