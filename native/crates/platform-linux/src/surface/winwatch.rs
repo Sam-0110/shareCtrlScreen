@@ -36,7 +36,19 @@ struct Connected {
 impl Drop for Connected {
     fn drop(&mut self) {
         for id in self.handlers.drain(..) {
-            self.window.disconnect(id);
+            // A destroyed window lost its handlers already (dispose):
+            // disconnecting them again would log a GLib-CRITICAL.
+            // SAFETY: a live GObject we hold a reference to, and a handler
+            // id that was connected on it.
+            let connected = unsafe {
+                glib::gobject_ffi::g_signal_handler_is_connected(
+                    self.window.upcast_ref::<glib::Object>().as_ptr(),
+                    id.as_raw(),
+                )
+            } != 0;
+            if connected {
+                self.window.disconnect(id);
+            }
         }
     }
 }

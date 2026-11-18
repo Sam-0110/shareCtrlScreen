@@ -5,7 +5,8 @@
 //! both come from the notification center here, through one path.
 //!
 //! Everything runs on the main thread: AppKit posts these notifications on
-//! it, the observers are added there, and the token removes them there.
+//! it, the observers are added there, and they are removed there (a token
+//! dropped elsewhere hands the removal to the main queue).
 //!
 //! ## References
 //! * `NSNotificationCenter addObserverForName:object:queue:usingBlock:` (a nil
@@ -21,7 +22,8 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 use block2::RcBlock;
-use objc2::rc::Retained;
+use dispatch2::DispatchQueue;
+use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_app_kit::{
     NSView, NSWindow, NSWindowDidBecomeKeyNotification, NSWindowDidDeminiaturizeNotification,
@@ -30,30 +32,43 @@ use objc2_app_kit::{
 use objc2_foundation::{MainThreadMarker, NSNotification, NSNotificationCenter, NSObjectProtocol};
 use platform_api::{RawWindowHandle, SurfaceError, WindowActivity, WindowActivityFn, WindowWatch};
 
-pub(crate) struct ActivationWatch {
-    observers: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
+/// The observer tokens (each holding its block, and through it an `Rc`).
+struct Observers(Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>);
+
+// SAFETY: the tokens and the blocks behind them are only used on the main
+// thread: the blocks run there, and they are removed and released there
+// (`Drop` below hops to the main queue when it runs elsewhere).
+unsafe impl Send for Observers {}
+
+impl Observers {
+    /// Remove every observer. On the main thread.
+    fn remove_all(mut self) {
+        let center = NSNotificationCenter::defaultCenter();
+        for observer in self.0.drain(..) {
+            let observer: &AnyObject = (*observer).as_ref();
+            // SAFETY: an observer this watch added to the default center.
+            unsafe { center.removeObserver(observer) };
+        }
+    }
 }
 
-// SAFETY: the observers (and the blocks they hold, with their `Rc`s) are only
-// used on the main thread: the blocks run there, and `Drop` removes them
-// there — dropped anywhere else they are leaked, never released while a
-// block could be running.
-unsafe impl Send for ActivationWatch {}
+pub(crate) struct ActivationWatch {
+    observers: Option<Observers>,
+}
 
 impl WindowWatch for ActivationWatch {}
 
 impl Drop for ActivationWatch {
     fn drop(&mut self) {
-        if MainThreadMarker::new().is_none() {
-            // A contract breach: releasing here could race a delivery.
-            tracing::error!("window watch dropped off the main thread; leaked");
-            std::mem::forget(std::mem::take(&mut self.observers));
+        let Some(observers) = self.observers.take() else {
             return;
-        }
-        let center = NSNotificationCenter::defaultCenter();
-        for observer in self.observers.drain(..) {
-            // SAFETY: an observer this watch added to the default center.
-            unsafe { center.removeObserver(&observer) };
+        };
+        if MainThreadMarker::new().is_some() {
+            observers.remove_all();
+        } else {
+            // Removed on the main thread, in order with the deliveries, so
+            // a block is never released while it runs.
+            DispatchQueue::main().exec_async(move || observers.remove_all());
         }
     }
 }
@@ -105,8 +120,14 @@ pub(crate) fn watch(
     let target: &AnyObject = &win;
     let mut observers = Vec::with_capacity(names.len());
     for name in names {
-        let (report, w) = (report.clone(), win.clone());
-        let block = RcBlock::new(move |_note: NonNull<NSNotification>| report(&w));
+        // Weak: the center keeps the blocks until the watch goes, and a
+        // closed window must not live on because of them.
+        let (report, w) = (report.clone(), Weak::from_retained(&win));
+        let block = RcBlock::new(move |_note: NonNull<NSNotification>| {
+            if let Some(w) = w.load() {
+                report(&w);
+            }
+        });
         // SAFETY: the block takes exactly the one notification argument the
         // center passes; with no queue it runs on the posting (main) thread.
         observers.push(unsafe {
@@ -119,5 +140,7 @@ pub(crate) fn watch(
         });
     }
     report(&win);
-    Ok(Box::new(ActivationWatch { observers }))
+    Ok(Box::new(ActivationWatch {
+        observers: Some(Observers(observers)),
+    }))
 }

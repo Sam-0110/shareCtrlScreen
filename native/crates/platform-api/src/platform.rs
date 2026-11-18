@@ -100,8 +100,10 @@ pub struct WindowActivity {
 /// window system; hand the value on (a channel send).
 pub type WindowActivityFn = Box<dyn Fn(WindowActivity) + Send + Sync>;
 
-/// A live watch. Dropping it stops the calls; drop it **on the UI thread**,
-/// before the window is destroyed or after — both are safe.
+/// A live watch. Dropping it stops the calls, before the window is destroyed
+/// or after. Dropped on the UI thread it stops at once; dropped elsewhere the
+/// backend hands the removal to the UI thread, so a call or two may still
+/// come.
 pub trait WindowWatch: Send {}
 
 /// Everything OS-specific, constructed once by the app.
@@ -132,7 +134,8 @@ pub trait Platform: Send + Sync {
     /// behind `window` (plans/09 W3): Tauri's own focus events miss the
     /// native video on Windows (they follow WebView2's focus, 09 §7 blocker
     /// 1), and no backend reports minimise there. Calls `on_change` with the
-    /// state now, then on every change. Call on the UI thread.
+    /// state now — synchronously, inside this call, so hold no lock the
+    /// callback needs — then on every change. Call on the UI thread.
     ///
     /// Default: unavailable (the app falls back to its own events).
     fn watch_window(

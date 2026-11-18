@@ -100,18 +100,24 @@ cell**; `end()` and the reaper detach and release **every** surface the session 
 
 ```rust
 /// Window activation and minimise, from the OS (Tauri's `Focused` is synthesized from WebView2
-/// focus on Windows and misses the native video child, 09 §7 blocker 1).
-pub trait WindowWatch: Send + Sync {
-    /// Calls `f(active, minimised)` on every change for the top-level window behind `handle`.
-    fn watch(&self, handle: RawWindowHandle, f: Box<dyn Fn(bool, bool) + Send + Sync>)
-        -> Result<WatchToken, SurfaceError>;   // dropping the token stops it
+/// focus on Windows and misses the native video child, 09 §7 blocker 1). As built in W3:
+pub struct WindowActivity { pub active: bool, pub minimized: Option<bool> }  // None: never known (Wayland)
+pub type WindowActivityFn = Box<dyn Fn(WindowActivity) + Send + Sync>;
+pub trait WindowWatch: Send {}                       // dropping it stops the calls
+impl Platform {                                       // a trait method with an "unavailable" default
+    /// On the UI thread; `on_change` gets the state now (synchronously) and every change, on the
+    /// UI thread, and must only hand it on. The top-level of `window` is watched.
+    fn watch_window(&self, window: RawWindowHandle, display: RawDisplayHandle, on_change: WindowActivityFn)
+        -> Result<Box<dyn WindowWatch>, SurfaceError>;
 }
 ```
 
-Windows: subclass `WM_ACTIVATE` / `WM_SIZE (SIZE_MINIMIZED)` on the top-level. macOS:
-`NSWindowDidBecomeKey` / `DidResignKey` / `DidMiniaturize` / `DidDeminiaturize` notifications.
-Linux X11: GTK `focus-in` / `focus-out` and `window-state-event` (ICONIFIED). Wayland: focus via
-GTK; minimised never reported (09 §7.6).
+Windows: comctl32 subclass on the top-level (`GetAncestor(GA_ROOT)`): `WM_ACTIVATE` / `WM_SIZE`
+(`SIZE_MINIMIZED`); a watch dropped off the UI thread posts a registered message so that thread
+removes it. macOS: `NSWindowDidBecomeKey` / `DidResignKey` / `DidMiniaturize` / `DidDeminiaturize`
+block observers (weak window; removed on the main queue). Linux: GTK `is-active` and
+`window-state-event` (ICONIFIED) on the toplevel. Wayland: activation only; minimised never
+reported (09 §7.6).
 
 ### 3.4 Commands and events
 
