@@ -50,8 +50,26 @@ pub(crate) struct Bound {
     pub(crate) drops: Sender<FileDrop>,
     /// `control` (task D10): the new surface hides the OS cursor to match.
     pub(crate) shared: Arc<Shared>,
+}
+
+/// The session's view gate and activity, which follow a move.
+#[derive(Clone)]
+pub(crate) struct Gate {
     pub(crate) view: Arc<SessionView>,
     pub(crate) activity: Arc<Activity>,
+}
+
+/// The media thread's life, as moves see it. Only ever goes forward, so a
+/// media thread that failed before the session was bound is not mistaken
+/// for one that will carry a move out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Media {
+    /// Not started: nothing draws on the surface.
+    NotStarted,
+    /// Running: it carries out moves (it rebuilds the presenter).
+    Running,
+    /// Gone: whoever asks for a move carries it out.
+    Gone,
 }
 
 /// Who carries out a move [`SurfaceCell::request`] accepted.
@@ -73,8 +91,8 @@ struct CellState {
     /// The session ended: no more moves, nothing is bound any more.
     retired: bool,
     bound: Option<Bound>,
-    /// A media thread runs and carries out moves (it rebuilds the presenter).
-    media: bool,
+    gate: Option<Gate>,
+    media: Media,
 }
 
 pub(crate) struct SurfaceCell {
@@ -91,7 +109,8 @@ impl SurfaceCell {
                 target: None,
                 retired: false,
                 bound: None,
-                media: false,
+                gate: None,
+                media: Media::NotStarted,
             }),
             handoff: Mutex::new(()),
         })
@@ -114,17 +133,30 @@ impl SurfaceCell {
                 .is_some_and(|t| Arc::ptr_eq(&t.surface, surface))
     }
 
+    /// The session's view and activity exist: from now on a move takes
+    /// them along. Before its media thread starts.
+    pub(crate) fn set_gate(&self, gate: Gate) {
+        self.state.lock().gate = Some(gate);
+    }
+
+    /// Its media thread is about to start: it carries out moves until it
+    /// says it is gone ([`media_gone`](Self::media_gone)).
+    pub(crate) fn media_started(&self) {
+        let mut s = self.state.lock();
+        if s.media == Media::NotStarted {
+            s.media = Media::Running;
+        }
+    }
+
     /// The session went live: bind its sinks and cursor control to the
-    /// current surface. `media`: a media thread will run (and carry out
-    /// moves); it says when it is gone with [`media_gone`](Self::media_gone).
-    pub(crate) fn bind(&self, bound: Bound, media: bool) {
+    /// current surface.
+    pub(crate) fn bind(&self, bound: Bound) {
         let _order = self.handoff.lock();
         let current = {
             let mut s = self.state.lock();
             if s.retired {
                 return;
             }
-            s.media = media;
             s.bound = Some(bound.clone());
             s.current.clone()
         };
@@ -144,20 +176,21 @@ impl SurfaceCell {
         if Arc::ptr_eq(&s.current, &target.surface) {
             return Err(MoveError::SurfaceInUse);
         }
-        if s.bound.is_none() {
-            // Nothing draws on it or takes its input yet: a swap is the
-            // whole move (09 §7, blocker 4 — a tab detached while connecting
-            // goes live in its window).
-            s.window = target.window;
-            return Ok(Carrier::Swapped(std::mem::replace(
-                &mut s.current,
-                target.surface,
-            )));
-        }
-        let carrier = if s.media {
-            Carrier::Media
-        } else {
-            Carrier::Caller
+        let carrier = match s.media {
+            Media::NotStarted if s.bound.is_none() && s.gate.is_none() => {
+                // Nothing draws on it, shows it or takes its input yet: a
+                // swap is the whole move (09 §7, blocker 4 — a tab detached
+                // while connecting goes live in its window).
+                s.window = target.window;
+                return Ok(Carrier::Swapped(std::mem::replace(
+                    &mut s.current,
+                    target.surface,
+                )));
+            }
+            // Its presenter is on the current surface: only it can move.
+            Media::Running => Carrier::Media,
+            // Nothing draws; the view and sinks move at once.
+            Media::NotStarted | Media::Gone => Carrier::Caller,
         };
         s.target = Some(target);
         Ok(carrier)
@@ -181,7 +214,7 @@ impl SurfaceCell {
     /// covers both surfaces).
     pub(crate) fn complete(&self) -> Option<Arc<dyn VideoSurface>> {
         let _order = self.handoff.lock();
-        let (old, new, window, bound) = {
+        let (old, new, window, bound, gate) = {
             let mut s = self.state.lock();
             if s.retired {
                 s.target = None;
@@ -190,27 +223,42 @@ impl SurfaceCell {
             let target = s.target.take()?;
             let old = std::mem::replace(&mut s.current, target.surface.clone());
             s.window = target.window;
-            (old, target.surface, target.window, s.bound.clone())
+            (
+                old,
+                target.surface,
+                target.window,
+                s.bound.clone(),
+                s.gate.clone(),
+            )
         };
-        if let Some(b) = bound {
+        if bound.is_some() {
             detach(old.as_ref());
-            b.view.rebind(new.clone(), window);
-            attach(new.as_ref(), &b);
-            b.activity.rebind(&b.view);
+        }
+        if let Some(g) = &gate {
+            g.view.rebind(new.clone(), window);
+        }
+        if let Some(b) = &bound {
+            attach(new.as_ref(), b);
+        }
+        if let Some(g) = &gate {
+            g.activity.rebind(&g.view);
         }
         Some(old)
     }
 
     /// The accepted move could not be carried out: the session stays where
-    /// it is. Returns the target for release.
+    /// it is. Returns the target for release — not once the session ended:
+    /// its `Released` covers the target then.
     pub(crate) fn fail(&self) -> Option<Arc<dyn VideoSurface>> {
-        self.state.lock().target.take().map(|t| t.surface)
+        let mut s = self.state.lock();
+        let target = s.target.take()?;
+        (!s.retired).then_some(target.surface)
     }
 
     /// The media thread exits: later moves are the caller's, and one it had
     /// not reached is carried out now. Returns the surface to release.
     pub(crate) fn media_gone(&self) -> Option<Arc<dyn VideoSurface>> {
-        self.state.lock().media = false;
+        self.state.lock().media = Media::Gone;
         // Nothing to do without a move waiting.
         self.complete()
     }
@@ -240,6 +288,7 @@ impl SurfaceCell {
             let mut s = self.state.lock();
             s.retired = true;
             s.bound = None;
+            s.gate = None;
             s.current.clone()
         };
         detach(current.as_ref());
@@ -268,6 +317,68 @@ mod tests {
 
     fn surface() -> Arc<dyn VideoSurface> {
         MockSurface::new((10, 10))
+    }
+
+    fn target(surface: &Arc<dyn VideoSurface>, window: u32) -> Target {
+        Target {
+            surface: surface.clone(),
+            window: WindowId(window),
+        }
+    }
+
+    #[test]
+    fn one_move_at_a_time_and_the_media_thread_carries_it() {
+        let (a, b, c) = (surface(), surface(), surface());
+        let cell = SurfaceCell::new(a.clone(), WindowId::MAIN);
+        cell.media_started();
+        assert!(matches!(cell.request(target(&b, 1)), Ok(Carrier::Media)));
+        assert!(cell.holds(&b), "a pending target is taken");
+        assert!(matches!(cell.request(target(&c, 2)), Err(MoveError::Busy)));
+        assert!(cell.pending().is_some());
+        let old = cell.complete().expect("moved");
+        assert!(Arc::ptr_eq(&old, &a));
+        assert!(Arc::ptr_eq(&cell.current(), &b));
+        assert_eq!(cell.window(), WindowId(1));
+        assert!(cell.pending().is_none());
+    }
+
+    #[test]
+    fn a_media_thread_gone_before_the_bind_hands_moves_to_the_caller() {
+        let (a, b) = (surface(), surface());
+        let cell = SurfaceCell::new(a, WindowId::MAIN);
+        cell.media_started();
+        // Its presenter failed at once: gone before the session was bound.
+        assert!(cell.media_gone().is_none());
+        cell.media_started();
+        let (input, _in_rx) = std::sync::mpsc::channel();
+        let (drops, _drop_rx) = std::sync::mpsc::channel();
+        cell.bind(Bound {
+            input,
+            drops,
+            shared: Arc::default(),
+        });
+        assert!(
+            matches!(cell.request(target(&b, 1)), Ok(Carrier::Caller)),
+            "never handed to a media thread that is gone"
+        );
+        assert!(cell.complete().is_some());
+    }
+
+    #[test]
+    fn a_move_overtaken_by_the_end_releases_nothing_itself() {
+        let (a, b, c) = (surface(), surface(), surface());
+        let cell = SurfaceCell::new(a.clone(), WindowId::MAIN);
+        cell.media_started();
+        assert!(cell.request(target(&b, 1)).is_ok());
+        cell.retire();
+        assert!(cell.pending().is_none());
+        assert!(cell.complete().is_none(), "Released covers both");
+        assert!(Arc::ptr_eq(&cell.current(), &a));
+        let cell = SurfaceCell::new(a, WindowId::MAIN);
+        cell.media_started();
+        assert!(cell.request(target(&c, 1)).is_ok());
+        cell.retire();
+        assert!(cell.fail().is_none(), "Released covers the target");
     }
 
     #[test]

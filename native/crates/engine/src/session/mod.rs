@@ -800,6 +800,11 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
             host_vpause,
         )),
     );
+    // A move from now on takes the view and the activity along.
+    cell.set_gate(current::Gate {
+        view: view.clone(),
+        activity: activity.clone(),
+    });
     let clip_on = activity.clip_on.clone();
     let (clip_tx, clip_rx) = std::sync::mpsc::channel::<String>();
     {
@@ -898,6 +903,9 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
             }),
         };
         let (ctl, stop_r, ui, cell) = (ctl_tx.clone(), stop.clone(), ui.clone(), cell.clone());
+        // Before it runs: from here a move is the media thread's to carry
+        // out, even if it fails at once (then `media_gone` hands it back).
+        cell.media_started();
         spawn_or_abort!(engine, id, stop, threads, "viewer-media", move || {
             if let Err(e) = viewer_media_loop(media, video_rx, ctl, stop_r) {
                 tracing::warn!("viewer media loop ended: {e}");
@@ -949,18 +957,12 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
 
     // The sinks, and the OS cursor hidden over the video while controlling
     // (task D10; a view-only session leaves it shown, mirroring
-    // `shared.control`), on the current surface — and moved with it. The
-    // media thread was started, so it carries out moves.
-    cell.bind(
-        current::Bound {
-            input: input_tx,
-            drops: drop_tx,
-            shared: shared.clone(),
-            view: view.clone(),
-            activity: activity.clone(),
-        },
-        true,
-    );
+    // `shared.control`), on the current surface — and moved with it.
+    cell.bind(current::Bound {
+        input: input_tx,
+        drops: drop_tx,
+        shared: shared.clone(),
+    });
     let session = Session {
         peer: peer.clone(),
         stop,
@@ -1580,6 +1582,30 @@ mod tests {
         activity.set(true, &view);
         activity.overlay_changed(&view);
         assert!(!activity.hook_wanted(), "stopped for good");
+    }
+
+    /// plans/09 W2: a move brings the hook down until the shortcut thread
+    /// has seen it, then it goes up again (on the new window), even when
+    /// other changes come in between.
+    #[test]
+    fn a_move_brings_the_hook_down_once_then_back() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let view = active::SessionView::new(
+            platform_api::mock::MockSurface::new((64, 64)),
+            Arc::default(),
+            active::Overlays::default(),
+            active::applier(rt.handle()),
+        );
+        let (activity, _wake) = Activity::new(true, false);
+        activity.set(true, &view);
+        activity.set_on_screen(true, &view);
+        assert!(activity.hook_wanted());
+        activity.rebind(&view);
+        assert!(!activity.hook_wanted());
+        activity.set_on_screen(true, &view);
+        assert!(!activity.hook_wanted(), "held down until the thread saw it");
+        activity.take_rebind(&view);
+        assert!(activity.hook_wanted());
     }
 
     /// What a tab's host is told as it goes to the background and back (P6):

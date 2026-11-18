@@ -12,7 +12,7 @@ to `native/` unless they start with `server/` or `plans/`). Structure, contracts
 |---|---|---|
 | S | This plan + structure ([09a](09a-STRUCTURE-AND-FLOWS.md)), adversarial review folded in | **complete**: review folded in (§7), owner's answers recorded (§5, §7), 09a rewritten from them |
 | W1 | Engine: several sessions on screen, one with the keyboard | **complete** (this commit): `set_screen(on_screen, focused)` replaces `set_active`; overlays per window (`set_overlay(window, open)`); the shortcut claim needs the window uncovered; loopback `several_sessions_on_screen_one_focused`; review fixes (the hook needs focused + on screen + uncovered, decided under one lock; overlays keyed by `WindowId`). The app still puts one tab on screen (W3 adds windows) |
-| W2 | Engine: hand a live session to another surface | **complete** (this commit): `move_session(id, surface, window)` + `SessionEvent::SurfaceReleased`; one current-surface cell per session (`session/current.rs`) read by the slot, driver, shortcut hook and reaper; the media thread keeps its decoder and builds the presenter on its device (`create_presenter_on`, shared D3D11 device on Windows); `connect_in(…, window)`; `TabShortcut` carries the session. Loopback: 20 live moves, a failed move, a move while connecting. Device-pending: the move on real GPUs (W5 checklist) |
+| W2 | Engine: hand a live session to another surface | **complete** (this commit): `move_session(id, surface, window)` + `SessionEvent::SurfaceReleased`; one current-surface cell per session (`session/current.rs`) read by the slot, driver, shortcut hook and reaper; the media thread keeps its decoder and builds the presenter on its device (`create_presenter_on`, shared D3D11 device on Windows); `connect_in(…, window)`; `TabShortcut` carries the session. Loopback: 20 live moves, a failed move, a move while connecting. Review fixes (next commit): a media thread that failed before the bind no longer strands moves (sticky media state, view gate bound before media starts), the old D3D11 swap chain is released before `SurfaceReleased` (and its waitable handle closed), a failed move during the end reports nothing twice; more tests. Device-pending: the move on real GPUs (W5 checklist) |
 | W3 | App: detached windows (Detach / Dock / close, focus, minimise), saved on this computer | not started |
 | W4 | Sync: which tabs are detached and where, through the account | not started |
 | W5 | Per-OS finish (Wayland placement, macOS minimise/focus, Windows DPI) + device checklists | not started |
@@ -233,7 +233,8 @@ disagree, this section wins** (09a is rewritten from it before W1 starts).
    gains `create_presenter_on(device)` (each presenter makes its own D3D11 device today,
    `platform-windows/src/adapters.rs:586`; sharing one device also saves memory with several
    windows); VideoToolbox and OpenH264 frames are taken by the new presenter as they are. After
-   the swap the held frame is presented on the new surface at once. No latency promise until it
+   the swap the new surface is shown and repainted from the held frame on the next idle tick
+   (W2 review: a hidden Windows swap chain skips presents, so not before the show). No latency promise until it
    is measured on devices.
 3. **One current surface per session.** Today at least seven places hold the session's surface
    (`ViewerSlot.surface` `sessions.rs:406`; the driver `session/mod.rs:785-786` with

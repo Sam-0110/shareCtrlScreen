@@ -74,10 +74,15 @@ impl Engine {
     /// A web dialog opened / the last one closed in `window`: hides / shows that window's video.
     pub async fn set_overlay(&self, window: WindowId, open: bool);
     /// Hand session `id` (any phase before Ended) to `surface` in `window`. One move at a time
-    /// per session (`Busy` otherwise, also while it is starting). The media thread builds the
-    /// new presenter on the decoder's device, re-presents the held frame and swaps; the view,
-    /// sinks, cursor control, cursor sprite and shortcut-hook window follow (hide old before
-    /// show new). `SessionEvent::SurfaceReleased { surface }` follows for the old one.
+    /// per session (`Busy` otherwise, also while it is starting). Asynchronous (W2 review): the
+    /// refusals below are synchronous; the outcome is `SessionEvent::SurfaceReleased { surface }`
+    /// — the old surface when the move went through, the target when it failed (the session
+    /// stays; a toast says why). The media thread builds the new presenter on the decoder's
+    /// device and swaps; the view, sinks, cursor control, cursor sprite and shortcut-hook window
+    /// follow (hide old before show new); the show asks for a repaint, which re-presents the
+    /// held frame on the next idle tick. Before the session is live a move is a plain swap;
+    /// with its media thread gone, the caller carries it out. A move overtaken by the end
+    /// releases nothing itself: `Released` covers every surface.
     pub fn move_session(&self, id: SessionId, surface: Arc<dyn VideoSurface>, window: WindowId)
         -> Result<(), MoveError>;     // NotFound, Ended, Busy, SurfaceInUse
 }
@@ -131,9 +136,9 @@ one (sticky, for the clipboard). A pop-out window's activation counts as its ses
 
 ### 4.2 Session surface (engine)
 ```
- Bound(s1) ──move_session(s2)──▶ Moving(s1→s2) ──presenter on s2 (decoder's device), held frame shown──▶ Bound(s2)
-     │                               │ failure: Bound(s1), MoveError (the app rolls back)
-     │                               └─▶ SurfaceReleased(s1)
+ Bound(s1) ──move_session(s2)──▶ Moving(s1→s2) ──presenter on s2 (decoder's device), shown, repainted──▶ Bound(s2)
+     │        refused: MoveError     │ failure: Bound(s1), SurfaceReleased(s2) + toast (the app rolls back)
+     │                               └─▶ success: SurfaceReleased(s1)
      └── end() at any time: every surface detached, SurfaceReleased / Released for all
 ```
 

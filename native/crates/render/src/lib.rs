@@ -28,6 +28,12 @@
 //!   RDP do — is why the sprite can lead the video on a high-RTT link
 //!   (task D10; the engine chooses the position source in `media/viewer.rs`).
 
+//! * Deferred destruction of flip-model swap chains (unbind, `ClearState`,
+//!   `Flush` before releasing one on a device that lives on):
+//!   <https://learn.microsoft.com/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-flush#deferred-destruction-issues-with-flip-presentation-swap-chains>;
+//!   the frame-latency waitable object is closed by its caller:
+//!   <https://learn.microsoft.com/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-getframelatencywaitableobject>.
+
 #![cfg(windows)]
 
 pub mod window;
@@ -184,6 +190,33 @@ pub struct Renderer {
         (usize, u32),
         (ID3D11ShaderResourceView, ID3D11ShaderResourceView),
     >,
+}
+
+impl Drop for Renderer {
+    /// Let go of the swap chain for certain. The device can outlive this
+    /// renderer — a session moving to another window keeps its decoder and
+    /// device (plans/09 W2) — and D3D11 defers destroying a flip-model swap
+    /// chain while its back buffer is still bound to the immediate context,
+    /// so the window could be destroyed under a live swap chain. Unbinding,
+    /// clearing the state and flushing first is Microsoft's documented
+    /// remedy; the fields (swap chain included) are released after this.
+    /// The frame-latency waitable object is the caller's to close.
+    fn drop(&mut self) {
+        self.rtv = None;
+        // SAFETY: the context belongs to this renderer's device and is only
+        // used from the thread that owns the renderer (the media thread);
+        // the handle came from `GetFrameLatencyWaitableObject` and is closed
+        // once, here.
+        unsafe {
+            self.context.OMSetRenderTargets(None, None);
+            self.context.ClearState();
+            self.context.Flush();
+            if !self.waitable.is_invalid() {
+                // Nothing to do on failure: the handle is gone either way.
+                let _ = windows::Win32::Foundation::CloseHandle(self.waitable);
+            }
+        }
+    }
 }
 
 impl Renderer {

@@ -2213,6 +2213,7 @@ async fn a_live_session_moves_between_surfaces() {
             "round {round}: the current surface takes input"
         );
         let ups = key_ups(&host);
+        let focus_before = to.state().focus_requests;
         let entry = released_entry(&from);
         let before = logged(&viewer, id, &entry);
         viewer
@@ -2247,7 +2248,19 @@ async fn a_live_session_moves_between_surfaces() {
                 !old.has_input_sink,
                 "round {round}: the old surface takes no input"
             );
+            assert!(
+                !old.cursor_control,
+                "round {round}: the OS cursor is back there"
+            );
         }
+        assert!(
+            to.state().cursor_control,
+            "round {round}: control moved along"
+        );
+        eventually("the focused session's keyboard moved along", t, || {
+            to.state().focus_requests > focus_before
+        })
+        .await;
         std::mem::swap(&mut from, &mut to);
     }
     assert_eq!(viewer.engine.viewer_sessions(), vec![id]);
@@ -2261,6 +2274,59 @@ async fn a_live_session_moves_between_surfaces() {
     };
     assert_eq!(negotiations(&host), 1, "one host session: no reconnect");
     assert_eq!(negotiations(&viewer), 1);
+    viewer.engine.end_all_and_wait(Duration::from_secs(3)).await;
+}
+
+/// A session whose video never got a presenter (its media thread failed at
+/// once) still moves: its input and the surface go along at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_without_video_still_moves() {
+    let relay = start_relay().await;
+    let host = start_peer("move-novideo-host", &relay);
+    let viewer = start_peer("move-novideo-viewer", &relay);
+    let t = Duration::from_secs(20);
+    eventually("registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    let broken = platform_api::mock::MockSurface::new((640, 360));
+    broken.state().refuse_presenter = true;
+    let id = viewer
+        .engine
+        .connect(&host.uuid, broken.clone())
+        .expect("not hosting");
+    viewer.engine.set_screen(&[id], Some(id));
+    eventually("told it cannot display", t, || {
+        viewer
+            .toasts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.starts_with("Cannot display the remote screen"))
+    })
+    .await;
+    eventually("input bound", t, || broken.state().has_input_sink).await;
+    let next = platform_api::mock::MockSurface::new((640, 360));
+    viewer
+        .engine
+        .move_session(id, next.clone(), engine::WindowId(1))
+        .expect("move accepted");
+    eventually("the old surface let go", t, || {
+        logged(&viewer, id, &released_entry(&broken)) == 1
+    })
+    .await;
+    assert!(!broken.state().has_input_sink);
+    assert!(next.state().has_input_sink, "input moved along");
+    assert!(next.user_input(VideoInput::Key {
+        code: "KeyW",
+        down: true
+    }));
+    eventually("keys from the new surface reach the host", t, || {
+        injected(&host)
+            .iter()
+            .any(|m| matches!(m, InputMsg::KeyDown { code } if code == "KeyW"))
+    })
+    .await;
     viewer.engine.end_all_and_wait(Duration::from_secs(3)).await;
 }
 
