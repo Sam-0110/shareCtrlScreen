@@ -21,6 +21,7 @@
 //! a few minutes into the future ([`clock`]), on both sides.
 
 pub mod clock;
+pub mod order;
 pub mod prefs;
 pub mod tabs;
 

@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use super::{clean_remote_name, remote_name_key};
+use crate::sync::order::{between, spread};
+use crate::sync::tabs::MAX_ORDER_KEY_CHARS;
 use crate::sync::{SyncDoc, SyncEntry, SyncPref, SyncTab, SYNCED_PREFS};
 
 /// Most recents kept.
@@ -195,6 +197,122 @@ impl Workspace {
         true
     }
 
+    // ---- tabs (plans/08 P4, 08a §3) ------------------------------------------
+
+    /// The open tabs' remote IDs in strip order: by order key, ties broken by
+    /// the remote ID, so every computer shows the same order (08a §7.14).
+    pub fn open_tabs(&self) -> Vec<String> {
+        let mut open: Vec<(&str, &str)> = self
+            .tabs
+            .iter()
+            .filter(|(_, t)| t.is_open())
+            .map(|(id, t)| (t.order.as_str(), id.as_str()))
+            .collect();
+        open.sort_unstable();
+        open.into_iter().map(|(_, id)| id.to_string()).collect()
+    }
+
+    /// Open a tab for remote `id` at the end of the strip, or leave an open
+    /// one where it is. Stamped `now`. Returns the tab's key (the lower-cased
+    /// ID), or `None` when `id` is not a remote ID.
+    pub fn open_tab(&mut self, id: &str, now: u64) -> Option<String> {
+        let key = tab_key(id)?;
+        if self.tabs.get(&key).is_some_and(TabRecord::is_open) {
+            return Some(key);
+        }
+        let order = self.order_at_end(now);
+        let tab = self.tabs.entry(key.clone()).or_default();
+        // Opened after its last close, wherever that close was stamped.
+        tab.opened_at = now.max(tab.closed_at + 1);
+        tab.order = order;
+        tab.order_at = tab.order_at.max(now);
+        Some(key)
+    }
+
+    /// Close `id`'s tab (it stays as a closed record, so the close syncs).
+    /// When it was the active one, its right-hand neighbour (else the
+    /// left-hand one, else none) becomes active. `false` if it was not open.
+    pub fn close_tab(&mut self, id: &str, now: u64) -> bool {
+        let Some(key) = tab_key(id) else {
+            return false;
+        };
+        let open = self.open_tabs();
+        let Some(pos) = open.iter().position(|k| *k == key) else {
+            return false;
+        };
+        if let Some(tab) = self.tabs.get_mut(&key) {
+            tab.closed_at = now.max(tab.opened_at + 1);
+        }
+        if self.active_tab.as_deref() == Some(key.as_str()) {
+            self.active_tab = open
+                .get(pos + 1)
+                .or_else(|| pos.checked_sub(1).and_then(|p| open.get(p)))
+                .cloned();
+        }
+        true
+    }
+
+    /// Move `id`'s tab just before `before`'s (`None`: to the end). `false`
+    /// when either is not an open tab.
+    pub fn move_tab(&mut self, id: &str, before: Option<&str>, now: u64) -> bool {
+        let Some(key) = tab_key(id) else {
+            return false;
+        };
+        let mut open = self.open_tabs();
+        let Some(from) = open.iter().position(|k| *k == key) else {
+            return false;
+        };
+        open.remove(from);
+        let at = match before.map(tab_key) {
+            None => open.len(),
+            Some(Some(b)) => match open.iter().position(|k| *k == b) {
+                Some(i) => i,
+                None => return false,
+            },
+            Some(None) => return false,
+        };
+        let order_of = |ws: &Self, k: Option<&String>| k.map(|k| ws.tabs[k].order.clone());
+        let lo = order_of(self, at.checked_sub(1).and_then(|i| open.get(i)));
+        let hi = order_of(self, open.get(at));
+        let key_between = between(lo.as_deref(), hi.as_deref());
+        open.insert(at, key.clone());
+        match key_between {
+            Some(order) => {
+                if let Some(tab) = self.tabs.get_mut(&key) {
+                    tab.order = order;
+                    tab.order_at = tab.order_at.max(now);
+                }
+            }
+            // No room between the neighbours (or equal keys from two
+            // computers): every open tab gets a fresh key, in the new order.
+            None => self.respread(&open, now),
+        }
+        true
+    }
+
+    /// A key after every open tab's, re-keying the strip first if the last
+    /// key leaves no room.
+    fn order_at_end(&mut self, now: u64) -> String {
+        let open = self.open_tabs();
+        let last = open.last().map(|k| self.tabs[k].order.clone());
+        if let Some(order) = between(last.as_deref(), None) {
+            return order;
+        }
+        self.respread(&open, now);
+        let last = open.last().map(|k| self.tabs[k].order.clone());
+        // A fresh spread always leaves room at the end.
+        between(last.as_deref(), None).unwrap_or_else(|| "z".repeat(MAX_ORDER_KEY_CHARS))
+    }
+
+    /// Give the tabs `in_order` fresh, evenly spread keys in that order.
+    fn respread(&mut self, in_order: &[String], now: u64) {
+        for (key, order) in in_order.iter().zip(spread(in_order.len())) {
+            if let Some(tab) = self.tabs.get_mut(key) {
+                tab.order = order;
+                tab.order_at = tab.order_at.max(now);
+            }
+        }
+    }
     /// The name given to `id`, if any.
     pub fn remote_name(&self, id: &str) -> Option<&str> {
         let key = remote_name_key(id)?;
@@ -487,9 +605,76 @@ impl Workspace {
     }
 }
 
+/// A tab's key: the remote ID, lower-cased; `None` for anything else.
+fn tab_key(id: &str) -> Option<String> {
+    let key = id.trim().to_lowercase();
+    crate::is_valid_uuid_v4(&key).then_some(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const T1: &str = "11111111-1111-4111-8111-111111111111";
+    const T2: &str = "22222222-2222-4222-8222-222222222222";
+    const T3: &str = "33333333-3333-4333-8333-333333333333";
+
+    #[test]
+    fn tabs_open_at_the_end_once_and_only_for_remote_ids() {
+        let mut w = Workspace::default();
+        assert_eq!(w.open_tab(T2, 10).as_deref(), Some(T2));
+        assert_eq!(w.open_tab(T1, 11).as_deref(), Some(T1));
+        // Already open: stays where it is.
+        assert_eq!(w.open_tab(&T2.to_uppercase(), 12).as_deref(), Some(T2));
+        assert_eq!(w.open_tabs(), [T2, T1]);
+        assert_eq!(w.open_tab("not-an-id", 13), None);
+        assert_eq!(w.open_tab_count(), 2);
+    }
+
+    #[test]
+    fn closing_the_active_tab_activates_a_neighbour_and_reopening_wins() {
+        let mut w = Workspace::default();
+        for (i, t) in [T1, T2, T3].iter().enumerate() {
+            w.open_tab(t, 10 + i as u64);
+        }
+        w.active_tab = Some(T2.into());
+        assert!(w.close_tab(T2, 20));
+        assert_eq!(w.active_tab.as_deref(), Some(T3));
+        assert!(w.close_tab(T3, 21));
+        assert_eq!(w.active_tab.as_deref(), Some(T1));
+        assert!(!w.close_tab(T3, 22), "not open");
+        assert!(w.close_tab(T1, 23));
+        assert_eq!(w.active_tab, None);
+        // A reopen is stamped after the close even with an older clock.
+        w.open_tab(T1, 5);
+        assert!(w.tabs[T1].is_open());
+        assert_eq!(w.open_tabs(), [T1]);
+    }
+
+    #[test]
+    fn tabs_move_between_neighbours_and_respread_when_out_of_room() {
+        let mut w = Workspace::default();
+        for (i, t) in [T1, T2, T3].iter().enumerate() {
+            w.open_tab(t, 10 + i as u64);
+        }
+        assert!(w.move_tab(T3, Some(T1), 20));
+        assert_eq!(w.open_tabs(), [T3, T1, T2]);
+        assert!(w.move_tab(T3, None, 21));
+        assert_eq!(w.open_tabs(), [T1, T2, T3]);
+        assert!(!w.move_tab(T1, Some("not-an-id"), 22));
+        // Two computers gave two tabs the same key: a move between them
+        // re-keys the strip, keeping the requested order.
+        w.tabs.get_mut(T1).unwrap().order = "m".into();
+        w.tabs.get_mut(T2).unwrap().order = "m".into();
+        assert!(w.move_tab(T3, Some(T2), 23));
+        assert_eq!(w.open_tabs(), [T1, T3, T2]);
+        let keys: Vec<_> = w
+            .open_tabs()
+            .iter()
+            .map(|k| w.tabs[k].order.clone())
+            .collect();
+        assert!(keys.windows(2).all(|p| p[0] < p[1]), "{keys:?}");
+    }
     use crate::sync::{now_ms, FEATURE_PREFS};
 
     const X: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";

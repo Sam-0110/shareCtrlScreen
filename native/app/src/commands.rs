@@ -7,7 +7,12 @@ use engine::Role;
 use platform_api::{OsPermission, PermissionReport, PermissionState, Platform};
 use protocol::Permission;
 
+use std::sync::Arc;
+
+use tauri::Manager;
+
 use crate::state::AppState;
+use crate::tabs::TabManager;
 
 /// UI-shaped config (camelCase, as the ported renderer expects). Deliberately
 /// omits `passwordHash` — the webview never needs it — and exposes a
@@ -116,38 +121,105 @@ pub fn get_role(state: tauri::State<'_, AppState>) -> String {
     }
 }
 
+// ---- tabs (plans/08 P4, 08a §4.1) ----------------------------------------------
+// Each command changes the TabManager; the UI redraws from the `tabs-changed`
+// snapshot that follows, never from a command's answer (only `needsConfirm`,
+// D2, is an answer the UI acts on).
+
+type Tabs<'a> = tauri::State<'a, Arc<TabManager>>;
+
+/// Open (or show) the tab for `remote_id` and connect it.
 #[tauri::command]
-pub fn connect_to(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-    let session = state.engine.connect(&id, None).map_err(|e| e.to_string())?;
-    // The new tab is the one on screen (08a §6.1).
-    state.engine.set_active(Some(session));
-    Ok(())
+pub async fn tab_open(
+    tabs: Tabs<'_>,
+    remote_id: String,
+    confirmed: bool,
+) -> Result<serde_json::Value, String> {
+    let tabs = tabs.inner().clone();
+    tabs.open(&remote_id, confirmed).await.map(|s| s.to_json())
 }
 
 #[tauri::command]
-pub fn submit_password(
-    state: tauri::State<'_, AppState>,
-    host: String,
-    password: String,
-    remember: Option<bool>,
-) {
-    // The session waiting for this host's password.
-    let id = state
-        .engine
-        .viewer_sessions()
-        .into_iter()
-        .find(|id| state.engine.session_peer(*id).as_deref() == Some(host.as_str()));
-    if let Some(id) = id {
-        state
-            .engine
-            .submit_password(id, password, remember.unwrap_or(true));
+pub async fn tab_connect(
+    tabs: Tabs<'_>,
+    remote_id: String,
+    confirmed: bool,
+) -> Result<serde_json::Value, String> {
+    let tabs = tabs.inner().clone();
+    tabs.connect(&remote_id, confirmed)
+        .await
+        .map(|s| s.to_json())
+}
+
+#[tauri::command]
+pub fn tab_disconnect(tabs: Tabs<'_>, remote_id: String) {
+    tabs.disconnect(&remote_id);
+}
+
+#[tauri::command]
+pub fn tab_close(tabs: Tabs<'_>, remote_id: String) {
+    tabs.close(&remote_id);
+}
+
+/// Show a tab; `null`: the connect page (the "+").
+#[tauri::command]
+pub fn tab_activate(tabs: Tabs<'_>, remote_id: Option<String>) -> Result<(), String> {
+    tabs.activate(remote_id.as_deref())
+}
+
+#[tauri::command]
+pub fn tab_next(tabs: Tabs<'_>) {
+    tabs.step(engine::TabStep::Next);
+}
+
+#[tauri::command]
+pub fn tab_prev(tabs: Tabs<'_>) {
+    tabs.step(engine::TabStep::Prev);
+}
+
+/// Rename the remote (its tab, chips and connect box together); empty clears.
+#[tauri::command]
+pub fn tab_rename(tabs: Tabs<'_>, remote_id: String, name: String) {
+    tabs.rename(&remote_id, &name);
+}
+
+/// Move a tab before another (`null`: to the end).
+#[tauri::command]
+pub fn tab_move(tabs: Tabs<'_>, remote_id: String, before: Option<String>) -> Result<(), String> {
+    tabs.move_tab(&remote_id, before.as_deref())
+}
+
+#[tauri::command]
+pub fn tab_connect_all(tabs: Tabs<'_>, confirmed: bool) -> serde_json::Value {
+    tabs.inner().connect_all(confirmed).to_json()
+}
+
+/// Answer a tab's password prompt.
+#[tauri::command]
+pub fn tab_password(tabs: Tabs<'_>, remote_id: String, password: String, remember: bool) {
+    tabs.password(&remote_id, password, remember);
+}
+
+#[tauri::command]
+pub fn tab_forget_password(tabs: Tabs<'_>, remote_id: String) {
+    tabs.forget_password(&remote_id);
+}
+
+/// The current strip (UI boot or reload).
+#[tauri::command]
+pub fn get_snapshot(tabs: Tabs<'_>) -> serde_json::Value {
+    tabs.snapshot()
+}
+
+/// "Disconnect" in the session bar or menu: the tab on screen's session, or —
+/// while this computer is being viewed — that session.
+pub(crate) fn end_current(app: &tauri::AppHandle) {
+    let engine = &app.state::<AppState>().engine;
+    if matches!(engine.role(), Role::Host { .. }) {
+        engine.end_hosting();
+    } else if let Some(id) = engine.active_session() {
+        engine.disconnect(id);
     }
-}
-
-/// The viewer session the UI is showing. Until the tab UI (plans/08 P4) there
-/// is at most one.
-fn current_viewer(state: &AppState) -> Option<engine::SessionId> {
-    state.engine.viewer_sessions().into_iter().next()
 }
 
 #[tauri::command]
@@ -161,14 +233,14 @@ pub fn set_permission(state: tauri::State<'_, AppState>, value: String) {
 }
 
 #[tauri::command]
-pub fn end_session(state: tauri::State<'_, AppState>) {
-    state.engine.end_all();
+pub fn end_session(app: tauri::AppHandle) {
+    end_current(&app);
 }
 
 /// Viewer: ask the host for a fresh keyframe (clears smear after packet loss).
 #[tauri::command]
 pub fn request_refresh(state: tauri::State<'_, AppState>) {
-    if let Some(id) = current_viewer(&state) {
+    if let Some(id) = state.engine.active_session() {
         state.engine.request_refresh(id);
     }
 }
@@ -177,7 +249,7 @@ pub fn request_refresh(state: tauri::State<'_, AppState>) {
 /// host, which needs control). The result arrives as a `displays` event.
 #[tauri::command]
 pub fn select_display(state: tauri::State<'_, AppState>, id: String) {
-    match current_viewer(&state) {
+    match state.engine.active_session() {
         Some(viewer) => state.engine.select_display(viewer, id),
         None => state.engine.host_select_display(id),
     }
@@ -219,7 +291,7 @@ pub(crate) fn displays_json(
 /// needs control). The window opens when the host's `displays` lists it.
 #[tauri::command]
 pub fn popout_display(state: tauri::State<'_, AppState>, id: String) {
-    if let Some(viewer) = current_viewer(&state) {
+    if let Some(viewer) = state.engine.active_session() {
         state.engine.popout_display(viewer, id);
     }
 }

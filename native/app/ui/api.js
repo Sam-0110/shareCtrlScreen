@@ -32,10 +32,26 @@ export const accountRemove = (account) => invoke('account_remove', { account });
 export const accountSync = () => invoke('account_sync');
 export const accountWindowFocused = () => invoke('account_window_focused');
 
-// ---- connecting and answering -------------------------------------------------
-export const connectTo = (id) => invoke('connect_to', { id });
-export const submitPassword = (host, password, remember) =>
-  invoke('submit_password', { host, password, remember });
+// ---- tabs (src/tabs.rs; plans/08a §4.1) -----------------------------------------
+// The strip redraws only from `tabs-changed` snapshots; a command's answer is
+// used only for `{ needsConfirm: n }` (more than 8 connected tabs, D2).
+export const tabOpen = (remoteId, confirmed) => invoke('tab_open', { remoteId, confirmed });
+export const tabConnect = (remoteId, confirmed) =>
+  invoke('tab_connect', { remoteId, confirmed });
+export const tabDisconnect = (remoteId) => invoke('tab_disconnect', { remoteId });
+export const tabClose = (remoteId) => invoke('tab_close', { remoteId });
+export const tabActivate = (remoteId) => invoke('tab_activate', { remoteId });
+export const tabNext = () => invoke('tab_next');
+export const tabPrev = () => invoke('tab_prev');
+export const tabRename = (remoteId, name) => invoke('tab_rename', { remoteId, name });
+export const tabMove = (remoteId, before) => invoke('tab_move', { remoteId, before });
+export const tabConnectAll = (confirmed) => invoke('tab_connect_all', { confirmed });
+export const tabPassword = (remoteId, password, remember) =>
+  invoke('tab_password', { remoteId, password, remember });
+export const tabForgetPassword = (remoteId) => invoke('tab_forget_password', { remoteId });
+export const getSnapshot = () => invoke('get_snapshot');
+
+// ---- answering, and the session on screen ---------------------------------------
 export const approve = (from, decision) => invoke('approve', { from, decision });
 export const endSession = () => invoke('end_session');
 

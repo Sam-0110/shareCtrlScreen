@@ -1,6 +1,7 @@
-// The one live session, host or viewer: role changes, the viewer's session
-// menu bar, the monitor pickers and pop-outs, and the "connection lost" panel.
-// P4 (plans/08) replaces the viewer half with per-tab session views in tabs.js.
+// The session screens: this computer being viewed (the host screen, its role
+// changes and "connection lost" panel), the session bar over a tab's video,
+// and the monitor pickers and pop-outs both share. Which tab is on screen,
+// and its state, is tabs.js's (plans/08 P4).
 
 import * as api from './api.js';
 import { peerLabel, reloadConfig } from './connect.js';
@@ -60,7 +61,7 @@ function renderPopoutPicker(info) {
     : 'Show another monitor in a separate window';
 }
 
-function renderDisplays(info) {
+export function renderDisplays(info) {
   const hostShown = renderDisplayPicker($('host-display'), info);
   $('host-display-row').classList.toggle('hidden', !hostShown);
   // Host: say which monitors the viewer ALSO sees, in separate windows.
@@ -102,6 +103,7 @@ export function wireSession() {
     api.endSession();
   });
 
+  // This computer being viewed (the host session; a viewer's are tabs).
   api.on('role-changed', (e) => {
     const p = e.payload;
     stopCountdown();
@@ -112,13 +114,6 @@ export function wireSession() {
       $('host-peer').textContent = peerLabel(p.peer);
       $('host-perm').value = p.permission;
       setState('HOST_ACTIVE');
-    } else if (p.role === 'viewer') {
-      $('view-peer').textContent = peerLabel(p.peer);
-      const control = p.permission === 'control';
-      const badge = $('view-badge');
-      badge.textContent = control ? 'CONTROL' : 'VIEW ONLY';
-      badge.className = 'badge ' + (control ? 'badge-control' : 'badge-view');
-      setState('VIEW_ACTIVE');
     } else {
       // The session is over: its monitor list goes with it.
       renderDisplays(null);
@@ -140,11 +135,10 @@ export function wireSession() {
     if (id) api.popoutDisplay(id);
   });
 
-  // The peer went quiet. The engine has already hidden the native video (a frozen
-  // frame is indistinguishable from a live one), so this panel is what the user
-  // sees while the grace period runs.
+  // The viewer went quiet while this computer is viewed. (A tab's trouble is
+  // in its snapshot: tabs.js shows the same panel.)
   api.on('link-trouble', (e) => {
-    if (S.state !== 'VIEW_ACTIVE' && S.state !== 'HOST_ACTIVE') return;
+    if (S.state !== 'HOST_ACTIVE') return;
     $('link-count').textContent = String(e.payload.secsLeft ?? 0);
     $('modal-link').classList.remove('hidden');
   });

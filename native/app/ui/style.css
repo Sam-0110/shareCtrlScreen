@@ -12,6 +12,9 @@
   --green: #35c46a;
   --yellow: #e3b341;
   --red: #e0524b;
+  /* The tab strip's height: a live tab's native video starts below it
+     (src/surfaces.rs TAB_BAR_CSS_PX must match). */
+  --tab-bar-h: 36px;
 }
 
 html, body {
@@ -29,7 +32,7 @@ html, body {
 .mono { font-family: Consolas, "Cascadia Mono", monospace; }
 .small { font-size: 12px; }
 
-.screen { height: 100%; display: flex; flex-direction: column; }
+.screen { height: calc(100% - var(--tab-bar-h)); display: flex; flex-direction: column; }
 
 /* ---------- top bar ---------- */
 .topbar {
@@ -301,3 +304,65 @@ select.input option {
   color: var(--fg);
 }
 select.input:disabled { opacity: 0.55; }
+
+/* ---------- tabs (plans/08 P4) ---------- */
+.tab-strip {
+  height: var(--tab-bar-h);
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 0 6px;
+  background: #101216;
+  border-bottom: 1px solid var(--line);
+}
+.tab-list { display: flex; align-items: stretch; gap: 2px; min-width: 0; overflow-x: auto; }
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 220px;
+  min-width: 90px;
+  padding: 0 6px 0 10px;
+  margin-top: 4px;
+  border-radius: 7px 7px 0 0;
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+.tab.active { background: var(--panel-2); color: var(--fg); }
+.tab.drop-before { box-shadow: inset 2px 0 0 var(--accent); }
+.tab-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tab-name-edit { flex: 1; min-width: 0; font: inherit; color: var(--fg); background: var(--bg);
+  border: 1px solid var(--accent); border-radius: 4px; padding: 1px 4px; }
+.tab-close {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.tab-close:hover { background: var(--line); color: var(--fg); }
+.tab .dot { flex: none; width: 8px; height: 8px; }
+.dot-grey { background: #4a5163; }
+.tab-new {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 18px;
+  padding: 0 10px;
+  cursor: pointer;
+}
+.tab-new:hover { color: var(--fg); }
+.tab-strip .btn { align-self: center; font-size: 12px; }
+.tab-card {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  min-height: 0;
+}

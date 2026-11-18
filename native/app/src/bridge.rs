@@ -2,14 +2,14 @@
 //! `ipcRenderer.on`). Translation only: every decision lives in the engine or
 //! in the module it hands off to (menus, pop-outs, the tray).
 //!
-//! The engine tags every session event with its [`SessionId`]; until the tab
-//! UI arrives (plans/08 P4) the web UI shows one session at a time, so the
-//! tagged events are translated into the single-session events it already
-//! understands (`role-changed`, `password-required`, `displays`, ...).
+//! The engine tags every session event with its [`SessionId`]. A viewer
+//! session's events go to the [`TabManager`], which redraws the tab strip
+//! (plans/08 P4); the host session keeps the single-session events the host
+//! screen understands (`role-changed`, `displays`, ...).
 
 use std::sync::Arc;
 
-use engine::{Engine, PwReason, SessionEvent, SessionId, SessionPhase, UiEvent};
+use engine::{Engine, SessionEvent, SessionId, SessionPhase, UiEvent};
 use serde_json::{json, Value};
 use tauri::Emitter;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -17,6 +17,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::commands::displays_json;
 use crate::menu::update_monitor_menu;
 use crate::popout;
+use crate::tabs::TabManager;
 #[cfg(windows)]
 use crate::tray;
 
@@ -24,11 +25,12 @@ use crate::tray;
 pub(crate) fn spawn(
     handle: tauri::AppHandle,
     engine: Arc<Engine>,
+    tabs: Arc<TabManager>,
     mut ui_rx: UnboundedReceiver<UiEvent>,
 ) {
     tauri::async_runtime::spawn(async move {
         while let Some(ev) = ui_rx.recv().await {
-            for (name, payload) in translate(&handle, &engine, ev) {
+            for (name, payload) in translate(&handle, &engine, &tabs, ev) {
                 let _ = handle.emit(name, payload);
             }
         }
@@ -36,10 +38,11 @@ pub(crate) fn spawn(
 }
 
 /// The Tauri events for one engine event, after its side effects on native
-/// UI (tray, menus, pop-out windows).
+/// UI (tray, menus, pop-out windows) and on the tabs.
 fn translate(
     handle: &tauri::AppHandle,
     engine: &Arc<Engine>,
+    tabs: &Arc<TabManager>,
     ev: UiEvent,
 ) -> Vec<(&'static str, Value)> {
     match ev {
@@ -50,46 +53,70 @@ fn translate(
             vec![("approval-request", json!({ "from": from }))]
         }
         UiEvent::Toast(msg) => vec![("toast", json!({ "message": msg }))],
-        UiEvent::WorkspaceChanged => vec![("workspace-changed", json!({}))],
-        UiEvent::Session { id, peer, host, ev } => session(handle, engine, id, peer, host, ev),
+        UiEvent::WorkspaceChanged => {
+            tabs.on_workspace_changed();
+            vec![("workspace-changed", json!({}))]
+        }
+        UiEvent::TabShortcut(step) => {
+            tabs.step(step);
+            Vec::new()
+        }
+        UiEvent::Session {
+            peer,
+            host: true,
+            ev,
+            ..
+        } => host_session(handle, peer, ev),
+        UiEvent::Session {
+            id,
+            peer,
+            host: false,
+            ev,
+        } => {
+            viewer_side_effects(handle, engine, id, &ev);
+            tabs.on_session(id, &peer, ev);
+            Vec::new()
+        }
     }
 }
 
-fn session(
+/// A viewer session's effects on its pop-out windows: they follow the host's
+/// list and go when it is released. (The Monitor menu follows the tab on
+/// screen: the TabManager.)
+fn viewer_side_effects(
     handle: &tauri::AppHandle,
     engine: &Arc<Engine>,
     id: SessionId,
+    ev: &SessionEvent,
+) {
+    match ev {
+        SessionEvent::Displays { list, popouts, .. } => {
+            popout::reconcile(handle, engine, id, list, popouts);
+        }
+        // Its threads are joined: the pop-out windows' surfaces are free, so
+        // the windows can be destroyed (its main surface: the TabManager).
+        SessionEvent::Released => popout::close_session(handle, engine, id),
+        _ => {}
+    }
+}
+
+/// This computer is being viewed or controlled: the single host session's
+/// events, as the host screen understands them.
+fn host_session(
+    handle: &tauri::AppHandle,
     peer: String,
-    host: bool,
     ev: SessionEvent,
 ) -> Vec<(&'static str, Value)> {
     match ev {
-        // The UI already shows "requesting" when it asked to connect.
-        SessionEvent::Phase(SessionPhase::Requesting) => Vec::new(),
-        SessionEvent::Phase(SessionPhase::PasswordRequired { reason }) => {
-            let mut out = Vec::new();
-            if reason == PwReason::SavedRejected {
-                out.push((
-                    "toast",
-                    json!({ "message": "Saved password no longer works" }),
-                ));
-            }
-            out.push(("password-required", json!({ "from": peer })));
-            out
-        }
-        // Structured, not Debug-formatted: the UI needs the peer id and
-        // permission as real fields.
         SessionEvent::Phase(SessionPhase::Negotiating { permission }) => vec![(
             "role-changed",
             json!({
-                "role": if host { "host" } else { "viewer" },
+                "role": "host",
                 "peer": peer,
                 "permission": permission.as_str(),
             }),
         )],
         SessionEvent::Phase(SessionPhase::Ended(reason)) => {
-            // A session that ended takes its monitor list with it; its pop-out
-            // windows go when it is released (below).
             update_monitor_menu(handle, &[], "", false, &[]);
             let mut out = Vec::new();
             if let Some(message) = reason.message() {
@@ -110,21 +137,11 @@ fn session(
             popouts,
         } => {
             update_monitor_menu(handle, &list, &current, can_switch, &popouts);
-            // Viewer: open/close pop-out windows to match.
-            if !host {
-                popout::reconcile(handle, engine, id, &list, &popouts);
-            }
             vec![(
                 "displays",
                 displays_json(&list, &current, can_switch, &popouts),
             )]
         }
-        // Its threads are joined: the pop-out windows' surfaces are free, so
-        // the windows can be destroyed. (The main surface is the app's and
-        // stays.)
-        SessionEvent::Released => {
-            popout::close_session(handle, engine, id);
-            Vec::new()
-        }
+        SessionEvent::Phase(_) | SessionEvent::Released => Vec::new(),
     }
 }

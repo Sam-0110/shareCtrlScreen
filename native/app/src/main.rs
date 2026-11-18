@@ -22,6 +22,8 @@ mod commands;
 mod menu;
 mod popout;
 mod state;
+mod surfaces;
+mod tabs;
 #[cfg(windows)]
 mod tray;
 mod uiaccess;
@@ -35,7 +37,6 @@ use codec_openh264::OpenH264;
 use engine::handshake::Decider;
 use engine::Engine;
 use platform_api::{Platform, AUTOSTART_FLAG};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use tauri::Manager;
 
 // Re-exported at the crate root so the modules keep reaching them as
@@ -104,25 +105,16 @@ fn make_platform() -> (Arc<dyn Platform>, Arc<OpenH264>, H264Problem) {
     (platform, openh264, problem)
 }
 
-/// Create the native video surface under the main window and hand it to the
-/// engine. Must run on the UI thread (it does, inside `setup`). Failure is not
-/// fatal: the app still works as a host, and a viewer session explains why it
-/// cannot show the screen.
-fn attach_video_surface(engine: &Engine, win: &tauri::WebviewWindow) {
-    let handles = win
-        .window_handle()
-        .map_err(|e| e.to_string())
-        .and_then(|w| {
-            win.display_handle()
-                .map(|d| (w.as_raw(), d.as_raw()))
-                .map_err(|e| e.to_string())
-        });
-    match handles {
-        Ok((window, display)) => match engine.platform().create_surface(window, display) {
-            Ok(surface) => engine.attach_surface(surface),
-            Err(e) => tracing::warn!("no native video surface: {e}"),
-        },
-        Err(e) => tracing::warn!("no window handle for the video surface: {e}"),
+/// Whether closing the main window hides it to the tray (the Windows service
+/// host) instead of quitting.
+fn hides_to_tray() -> bool {
+    #[cfg(windows)]
+    {
+        tray::is_installed()
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -237,6 +229,19 @@ fn main() {
                 let engine = app.state::<AppState>().engine.clone();
                 if popout::on_close_requested(app, &engine, window.label()) {
                     api.prevent_close();
+                } else if window.label() == "main" && !hides_to_tray() {
+                    // Closing the app: every tab disconnects first (D6, I9) —
+                    // held keys released, Byes sent, surfaces gone — then it
+                    // exits, waiting at most 3 s (08a §6.17).
+                    api.prevent_close();
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        engine
+                            .end_all_and_wait(std::time::Duration::from_secs(3))
+                            .await;
+                        SESSIONS_ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
+                        app.exit(0);
+                    });
                 }
             }
         })
@@ -266,8 +271,19 @@ fn main() {
             accounts::account_sign_out,
             commands::get_server_status,
             commands::get_role,
-            commands::connect_to,
-            commands::submit_password,
+            commands::tab_open,
+            commands::tab_connect,
+            commands::tab_disconnect,
+            commands::tab_close,
+            commands::tab_activate,
+            commands::tab_next,
+            commands::tab_prev,
+            commands::tab_rename,
+            commands::tab_move,
+            commands::tab_connect_all,
+            commands::tab_password,
+            commands::tab_forget_password,
+            commands::get_snapshot,
             commands::set_permission,
             commands::end_session,
             commands::request_refresh,
@@ -316,7 +332,10 @@ fn main() {
             // Accounts: finish signing the selected one in, then keep it synced.
             account_manager.start(handle.clone());
 
-            bridge::spawn(handle, engine.clone(), ui_rx);
+            // The tabs (plans/08 P4): every viewer session belongs to one.
+            let tabs = tabs::TabManager::new(handle.clone(), engine.clone());
+            app.manage(tabs.clone());
+            bridge::spawn(handle, engine.clone(), tabs, ui_rx);
 
             // Drive the signaling event loop into the engine. The loop only
             // dispatches: each peer's messages run on that peer's own task, so a
@@ -330,7 +349,6 @@ fn main() {
             });
 
             if let Some(win) = app.get_webview_window("main") {
-                attach_video_surface(&engine, &win);
                 // Started at sign-in: come up minimized rather than throwing a
                 // window in the user's face on every boot. The app is useful
                 // purely by being reachable, so it does not need focus.
@@ -340,6 +358,37 @@ fn main() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running ShareCtrlScreen");
+        .build(tauri::generate_context!())
+        .expect("error while building ShareCtrlScreen")
+        .run(on_run_event);
+}
+
+/// Set once the sessions were ended for an exit, so that exit goes ahead.
+static SESSIONS_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// An exit from anywhere (macOS ⌘Q, the last window closing, the OS) ends
+/// every session first — held keys released, Byes sent — waiting at most 3 s
+/// (08a §6.17, I9), then exits.
+fn on_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
+    use std::sync::atomic::Ordering;
+    let tauri::RunEvent::ExitRequested { api, code, .. } = event else {
+        return;
+    };
+    let engine = app.state::<AppState>().engine.clone();
+    // Nothing to end (the updater and the tray's Quit end the sessions
+    // themselves first; a restart must then go ahead untouched).
+    if SESSIONS_ENDED.load(Ordering::SeqCst)
+        || (engine.viewer_sessions().is_empty() && engine.host_session().is_none())
+    {
+        return;
+    }
+    api.prevent_exit();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        engine
+            .end_all_and_wait(std::time::Duration::from_secs(3))
+            .await;
+        SESSIONS_ENDED.store(true, Ordering::SeqCst);
+        app.exit(code.unwrap_or(0));
+    });
 }

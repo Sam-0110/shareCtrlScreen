@@ -9,7 +9,8 @@
 // helpers), api.js (every command and event), connect.js (home screen,
 // recents, names, viewer prompts), accounts.js (sign-in and sync),
 // settings.js (settings, permissions, OpenH264, updates), host.js (approval
-// and host controls), session.js (the live session). Modules only define
+// and host controls), session.js (the session bar and the host screen),
+// tabs.js (the tab strip and the tab on screen). Modules only define
 // functions at load time; every listener is attached here, in one order, once
 // all modules have loaded — so the import cycles between them are harmless.
 
@@ -19,7 +20,8 @@ import { reloadConfig, syncNameField, wireConnect } from './connect.js';
 import { wireHost } from './host.js';
 import { wireSession } from './session.js';
 import { applyPlatformInfo, checkForUpdates, preflight, wireSettings } from './settings.js';
-import { S, render, setBanner, setState, setStatus, toast } from './state.js';
+import { S, overlaysReset, render, setBanner, setState, setStatus, toast } from './state.js';
+import { loadTabs, wireTabs } from './tabs.js';
 
 // The server link is up: green dot, no banner, and an offline app becomes ready.
 function serverConnected() {
@@ -33,6 +35,7 @@ wireSettings();
 wireSession();
 wireConnect();
 wireHost();
+wireTabs();
 
 api.on('server-status', (e) => {
   const s = e.payload.status;
@@ -40,7 +43,7 @@ api.on('server-status', (e) => {
     serverConnected();
   } else if (s === 'reconnecting') {
     // A live session keeps running on its own WebRTC leg — yellow, not offline.
-    if (S.state === 'HOST_ACTIVE' || S.state === 'VIEW_ACTIVE') {
+    if (S.state === 'HOST_ACTIVE' || S.tabs.connected > 0) {
       setStatus('yellow', 'server: reconnecting (session active)');
     } else {
       setStatus('red', 'server: disconnected (retrying)');
@@ -55,8 +58,10 @@ api.on('toast', (e) => toast(e.payload.message || '', 'error'));
 (async () => {
   // A fresh page has no dialog open: clear the engine's app-wide "a dialog
   // covers the video" flag in case the page reloaded with one open.
-  api.setVideoVisible(true).catch(() => {});
+  overlaysReset();
   await reloadConfig();
+  // The tab strip as the app has it (empty on launch: nothing auto-connects).
+  await loadTabs();
   syncNameField();
   // The account's state, including a bring-in question still open after a reload.
   refreshAccount();

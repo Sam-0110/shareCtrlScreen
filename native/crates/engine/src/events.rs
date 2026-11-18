@@ -32,6 +32,9 @@ pub enum UiEvent {
     /// The active workspace changed underneath the UI (a sync merged changes
     /// from another computer, or the account was switched): reload it.
     WorkspaceChanged,
+    /// The user pressed a tab-switch chord inside a session's video (D3,
+    /// 08a §6.19): it was taken out of the key stream, never forwarded.
+    TabShortcut(TabStep),
     /// Something happened in one session. `host`: this computer is the host
     /// of that session (it is being viewed or controlled).
     Session {
@@ -40,6 +43,14 @@ pub enum UiEvent {
         host: bool,
         ev: SessionEvent,
     },
+}
+
+/// Which way a tab-switch chord goes (Ctrl+Alt+PageDown / PageUp; Cmd+Option
+/// on a Mac).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabStep {
+    Next,
+    Prev,
 }
 
 /// What happened in one session.

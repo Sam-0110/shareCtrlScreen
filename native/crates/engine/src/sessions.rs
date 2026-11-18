@@ -860,6 +860,11 @@ impl Engine {
         }
     }
 
+    /// The UI event channel, for threads that report app-level events.
+    pub(crate) fn ui_sender(&self) -> tokio::sync::mpsc::UnboundedSender<UiEvent> {
+        self.ui.clone()
+    }
+
     pub(crate) fn overlay_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         Arc::clone(&self.overlay)
     }
@@ -1264,10 +1269,12 @@ impl Engine {
     }
 
     /// Remove `host`'s saved password from the active workspace and let the
-    /// OS store drop its copy.
-    fn forget_saved_login(&self, host: &str) {
+    /// OS store drop its copy (also the UI's "Forget saved password" on a
+    /// tab: it then asks again on the next connection).
+    pub fn forget_saved_login(&self, host: &str) {
+        let host = host.trim().to_lowercase();
         let removed = self
-            .with_workspace(|w, _| w.saved_logins.remove(host))
+            .with_workspace(|w, _| w.saved_logins.remove(&host))
             .flatten();
         self.forget_sealed(removed.into_iter().collect());
     }

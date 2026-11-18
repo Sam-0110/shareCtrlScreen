@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) use events::SessionUi;
-pub use events::{EndReason, PwReason, SessionEvent, SessionId, SessionPhase, UiEvent};
+pub use events::{EndReason, PwReason, SessionEvent, SessionId, SessionPhase, TabStep, UiEvent};
 pub use handshake::{ApprovalDecision, Decider};
 pub use workspace::WorkspaceSel;
 

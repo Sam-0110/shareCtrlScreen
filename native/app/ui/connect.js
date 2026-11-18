@@ -1,20 +1,11 @@
 // The home screen's connect side: the remote ID and its name, the recents, the
-// "clear recents" confirmation, the copy-my-ID button, and the viewer's
-// requesting / password-prompt modals.
+// "clear recents" confirmation and the copy-my-ID button. Connecting opens a
+// tab (tabs.js), which shows the connection's progress and password prompt.
 
 import * as api from './api.js';
 import { preflight } from './settings.js';
-import {
-  $,
-  S,
-  errorText,
-  render,
-  setState,
-  startRequestCountdown,
-  stopCountdown,
-  toast,
-  validUuid
-} from './state.js';
+import { $, S, render, toast, validUuid } from './state.js';
+import { startConnecting } from './tabs.js';
 
 // ---- config / recents ------------------------------------------------------
 export async function reloadConfig() {
@@ -147,39 +138,12 @@ async function connect() {
       'Shortcut capture is on in Settings; it needs this permission to forward shortcuts to the other computer.';
     if (await preflight(['inputMonitoring'], intro)) return;
   }
-  $('requesting-peer').textContent = peerLabel(id);
-  setState('REQUESTING');
-  // Viewer owns the 30 s timeout (contract §3.3).
-  startRequestCountdown();
-  try {
-    await api.connectTo(id);
-  } catch (err) {
-    // Refused before anything was sent (someone is connected or connecting to
-    // this computer): back to the home screen with the reason.
-    stopCountdown();
-    setState('READY');
-    toast(errorText(err), 'error');
-    return;
-  }
-}
-
-// ---- password prompt (viewer) ---------------------------------------------------
-// Cancel ends the pending request in the engine too: until then this computer
-// counts as connecting and answers incoming requests "busy" (D1).
-function cancelPassword() {
-  S.passwordFrom = null;
-  $('password-input').value = '';
-  api.endSession();
-  setState('READY');
-}
-
-function submitPassword() {
-  const pw = $('password-input').value;
-  if (!S.passwordFrom) return;
-  api.submitPassword(S.passwordFrom, pw, $('password-remember').checked);
-  $('password-input').value = '';
-  setState('REQUESTING');
-  startRequestCountdown();
+  // A tab for it (or the open one), connected: its progress, password
+  // prompt and any refusal show in the tab (tabs.js). The engine owns the
+  // wait for the host's answer (contract §3.3).
+  await startConnecting((confirmed) => api.tabOpen(id, confirmed));
+  $('remote-id').value = '';
+  $('remote-id').dispatchEvent(new Event('input'));
 }
 
 export function wireConnect() {
@@ -220,34 +184,12 @@ export function wireConnect() {
   });
 
   $('btn-connect').addEventListener('click', connect);
-
-  $('btn-cancel-request').addEventListener('click', () => {
-    stopCountdown();
-    api.endSession();
-    setState('READY');
-  });
-
-  $('btn-password-cancel').addEventListener('click', cancelPassword);
-  $('btn-password-ok').addEventListener('click', submitPassword);
-  // Enter submits, Escape cancels — no reaching for the mouse.
-  $('password-input').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
+  // Enter in the ID field connects, as the button does.
+  $('remote-id').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !$('btn-connect').disabled) {
       e.preventDefault();
-      submitPassword();
-    } else if (e.key === 'Escape') {
-      e.preventDefault();
-      cancelPassword();
+      connect();
     }
-  });
-
-  api.on('password-required', (e) => {
-    S.passwordFrom = e.payload.from;
-    stopCountdown();
-    $('password-input').value = '';
-    // Passwords are remembered by default (D7): typed once per host.
-    $('password-remember').checked = true;
-    setState('PASSWORD_PROMPT');
-    $('password-input').focus();
   });
 }
 

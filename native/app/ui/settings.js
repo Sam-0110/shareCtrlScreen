@@ -6,7 +6,7 @@
 import * as api from './api.js';
 import { renderAccount, setAccountStatus } from './accounts.js';
 import { reloadConfig } from './connect.js';
-import { $, S, errorText, sessionLive, toast } from './state.js';
+import { $, S, errorText, overlayClose, overlayOpen, sessionLive, toast } from './state.js';
 
 // ---- platform wording + displays -------------------------------------------
 // The OS facts the UI words itself around (see `get_platform_info`). The HTML
@@ -71,12 +71,13 @@ function openSettings() {
       ? ` Forget ${saved} saved password${saved === 1 ? '' : 's'}`
       : ' Forget all saved passwords';
   clear.disabled = saved === 0;
-  $('modal-settings').classList.remove('hidden');
+  // Over a live session the video goes first (it sits above this page; the
+  // dialog would otherwise paint under it).
+  overlayOpen('modal-settings');
 }
 
 function closeSettings() {
-  $('modal-settings').classList.add('hidden');
-  restoreVideo();
+  overlayClose('modal-settings');
 }
 
 async function saveSettings() {
@@ -113,17 +114,8 @@ async function saveSettings() {
   await reloadConfig();
 }
 
-// Opening Settings mid-session (viewer or host): take the native video down
-// BEFORE painting the modal — it sits above the web UI, so opening the dialog
-// first means it appears underneath the video (and, if the hover bar was open,
-// sliced to that strip). On the host there is no video surface, so the invoke
-// is a harmless no-op. closeSettings() restores it.
-async function openSettingsOverVideo() {
-  try {
-    await api.setVideoVisible(false);
-  } catch (_) {
-    /* fall through — the dialog is still better than nothing */
-  }
+// The session bar's gear: Settings over the video (openSettings hides it first).
+function openSettingsOverVideo() {
   openSettings();
 }
 
@@ -242,31 +234,23 @@ async function grantPermission(key) {
 }
 
 async function openPermissions(intro) {
-  // Same ordering rule as Settings: the native video must be down before the
-  // modal paints, or the modal appears underneath it.
-  try {
-    await api.setVideoVisible(false);
-  } catch (_) {
-    /* fall through — the dialog is still better than nothing */
-  }
   let report;
   try {
     report = await api.getPermissions();
   } catch (err) {
     toast(errorText(err), 'error');
-    restoreVideo();
     return;
   }
   $('perm-intro').textContent = intro || '';
   renderPermissions(report);
-  $('modal-permissions').classList.remove('hidden');
+  // Same rule as Settings: the video goes before the dialog paints.
+  overlayOpen('modal-permissions');
   if (PERMISSIONS.some((p) => permNeedsGrant(report[p.key]))) startPermPoll();
 }
 
 function closePermissions() {
   stopPermPoll();
-  $('modal-permissions').classList.add('hidden');
-  restoreVideo();
+  overlayClose('modal-permissions');
 }
 
 // Show the modal on its own when `keys` still need granting. Returns whether it
@@ -446,17 +430,4 @@ export function wireSettings() {
       if (el) el.scrollIntoView({ block: 'center' });
     });
   });
-}
-
-// The last dialog over the video closed: give the video back. Always, whatever
-// the session state: the engine's "a dialog is open" flag is app-wide, and a
-// session that ended (or started) while a dialog was open must not leave it set
-// — every later session would then stay hidden. Without a session it is a no-op.
-function restoreVideo() {
-  if (
-    $('modal-settings').classList.contains('hidden') &&
-    $('modal-permissions').classList.contains('hidden')
-  ) {
-    api.setVideoVisible(true).catch(() => {});
-  }
 }

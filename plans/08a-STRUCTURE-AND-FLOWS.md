@@ -165,6 +165,22 @@ src/popout.rs      keyed by (SessionId, slot)
 src/menu.rs        native menus (Session, Monitor, Tabs, key equivalents) — from main.rs
 ```
 
+As built in P4: `connect` keeps returning the `SessionId` (no separate `reserve_session`); the
+TabManager holds its lock across `Engine::connect` and the bridge takes the same lock for every
+viewer event, so the id is recorded before the session's first event is applied (I4). A
+surface is made (on the UI thread) before `connect` and destroyed on `Released`, keyed by
+session, so a reconnect never races its predecessor's teardown. A disconnect while the surface
+is still being made cancels the connection before the host is asked. The snapshot is
+`{tabs: [{remoteId, name, phase, passwordReason, permission, troubleSecs, lastEnd, autoSignIn,
+displays}], active, connected, hosting, signedOut}`; `phase` is
+`disconnected | connecting | password | live`. A wrong typed password ends the session with
+the host's reason (the engine has no `WrongPassword` prompt); the card offers Connect again.
+Web dialogs go through one registry in `state.js` (`overlayOpen` / `overlayClose`), so the
+app-wide overlay flag clears when the last one closes. Every exit ends the sessions first:
+closing the main window keeps it until they are released (≤ 3 s), and any other exit (⌘Q,
+the OS) is held in `RunEvent::ExitRequested` the same way. The feature flag of §7.10 is not
+built: it existed to ship P4 on its own, and the whole feature ships in one release.
+
 ### 2.4 `app/ui`
 
 `app.js` (≈ 1,200 lines, one global `state`) is split into ES modules loaded with

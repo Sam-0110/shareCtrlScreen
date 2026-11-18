@@ -7,24 +7,22 @@
 
 import * as api from './api.js';
 
+import * as api from './api.js';
+
 export const $ = (id) => document.getElementById(id);
 
-// §6 — one state variable; every state maps to exactly one screen/modal.
-const STATES = [
-  'OFFLINE',
-  'READY',
-  'REQUESTING',
-  'PASSWORD_PROMPT',
-  'INCOMING',
-  'HOST_ACTIVE',
-  'VIEW_ACTIVE'
-];
+// §6 — the computer's state: offline, ready, asked to be viewed, or being
+// viewed. What this computer views is the tabs' business (S.tabs, the last
+// `tabs-changed` snapshot, plans/08 P4): a tab on screen shows the session
+// screen, none the connect page.
+const STATES = ['OFFLINE', 'READY', 'INCOMING', 'HOST_ACTIVE'];
 
 export const S = {
   state: 'OFFLINE',
   config: null,
   incomingFrom: null, // peer awaiting our approve/deny
-  passwordFrom: null, // host that demanded a password
+  // The tab strip as the app last described it (src/tabs.rs snapshot).
+  tabs: { tabs: [], active: null, connected: 0, hosting: false, signedOut: false },
   cancelCountdown: null,
   // The ID the name field currently belongs to, so typing a name is not
   // overwritten until the ID itself changes.
@@ -38,7 +36,12 @@ export const S = {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export const validUuid = (s) => typeof s === 'string' && UUID_RE.test(s);
 
-export const sessionLive = () => S.state === 'HOST_ACTIVE' || S.state === 'VIEW_ACTIVE';
+/** The tab on screen, if any. */
+export const activeTab = () =>
+  (S.tabs.active && S.tabs.tabs.find((t) => t.remoteId === S.tabs.active)) || null;
+
+/** Something is connected: this computer is viewed, or views another. */
+export const sessionLive = () => S.state === 'HOST_ACTIVE' || S.tabs.connected > 0;
 
 export function setState(next) {
   if (!STATES.includes(next)) throw new Error('unknown state ' + next);
@@ -48,25 +51,22 @@ export function setState(next) {
 
 export function render() {
   const state = S.state;
-  const home =
-    state === 'READY' || state === 'OFFLINE' || state === 'REQUESTING' ||
-    state === 'PASSWORD_PROMPT' || state === 'INCOMING';
+  const hosting = state === 'HOST_ACTIVE';
+  const tab = hosting ? null : activeTab();
 
-  $('screen-home').classList.toggle('hidden', !home);
-  $('screen-host').classList.toggle('hidden', state !== 'HOST_ACTIVE');
-  $('screen-view').classList.toggle('hidden', state !== 'VIEW_ACTIVE');
-
-  $('modal-requesting').classList.toggle('hidden', state !== 'REQUESTING');
-  $('modal-password').classList.toggle('hidden', state !== 'PASSWORD_PROMPT');
+  $('screen-home').classList.toggle('hidden', hosting || !!tab);
+  $('screen-host').classList.toggle('hidden', !hosting);
+  $('screen-view').classList.toggle('hidden', !tab);
   $('modal-incoming').classList.toggle('hidden', state !== 'INCOMING');
 
-  // The "connection lost" panel only belongs to a live session — never leave it
-  // up on the home screen. (Only ever hides; showing it is the engine's call.)
-  if (state !== 'VIEW_ACTIVE' && state !== 'HOST_ACTIVE') {
+  // The "connection lost" panel belongs to a session in trouble: being
+  // viewed (shown by the host events), or the tab on screen.
+  if (!hosting && !(tab && tab.troubleSecs != null)) {
     $('modal-link').classList.add('hidden');
   }
 
-  // Connect is only possible from a fully idle, registered app.
+  // Connecting is possible from a registered app that is not being viewed
+  // (D1); other tabs may be connected.
   // Nor while the selected account is signed out (its computers are hidden).
   const locked = !!(S.config && S.config.account && S.config.account.state === 'locked');
   $('btn-connect').disabled = state !== 'READY' || locked || !validUuid($('remote-id').value.trim());
@@ -100,7 +100,7 @@ export function toast(msg, kind) {
 /** The message of a rejected command, for a toast or a status line. */
 export const errorText = (err) => String((err && err.message) || err);
 
-// ---- countdown helper (shared by REQUESTING and INCOMING) ------------------
+// ---- countdown helper (the incoming-request prompt) --------------------------
 export function countdown(elId, seconds, onDone) {
   let left = seconds;
   $(elId).textContent = String(left);
@@ -120,17 +120,35 @@ export function stopCountdown() {
   S.cancelCountdown = null;
 }
 
-/**
- * Start the viewer's 30 s wait for the host's answer (contract §3.3). On
- * timeout the request is ended in the engine too, so a late answer does not
- * start a session behind the home screen and the computer stops counting as
- * connecting.
- */
-export function startRequestCountdown() {
-  stopCountdown();
-  S.cancelCountdown = countdown('requesting-count', 30, () => {
-    toast('No answer — timed out', 'error');
-    api.endSession();
-    setState('READY');
-  });
+
+// ---- web dialogs over the native video (08a §6.18) ------------------------------
+// The native video sits above this page, so a dialog would be painted under
+// it. While any dialog opened through here is up the app hides every video;
+// when the last one closes it shows the tab on screen again. Always cleared
+// when the last closes, whatever happened to the sessions meanwhile — the
+// app-wide flag must never be left set.
+const overlays = new Set();
+
+/** Open dialog `id` over the video: the video goes first, then the dialog. */
+export async function overlayOpen(id) {
+  overlays.add(id);
+  try {
+    await api.setVideoVisible(false);
+  } catch (_) {
+    /* the dialog is still better than nothing */
+  }
+  if (overlays.has(id)) $(id).classList.remove('hidden');
+}
+
+/** Close dialog `id`; the last one closed gives the video back. */
+export function overlayClose(id) {
+  $(id).classList.add('hidden');
+  if (!overlays.delete(id) || overlays.size > 0) return;
+  api.setVideoVisible(true).catch(() => {});
+}
+
+/** A fresh page has no dialog open (it may have reloaded with one). */
+export function overlaysReset() {
+  overlays.clear();
+  api.setVideoVisible(true).catch(() => {});
 }

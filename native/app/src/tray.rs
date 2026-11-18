@@ -70,6 +70,11 @@ pub fn install(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Whether the tray icon is up (closing the window then hides it).
+pub fn is_installed() -> bool {
+    INSTALLED.load(Ordering::SeqCst)
+}
+
 /// Closing the main window: end any live session, then hide instead of exit.
 /// A session is ended rather than left running behind a hidden window, so
 /// closing the window still stops someone controlling this computer.

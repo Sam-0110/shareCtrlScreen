@@ -36,6 +36,26 @@ pub(crate) fn install_native_menu(app: &tauri::App) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let session = Submenu::with_items(app, "Session", true, &[&settings, &disconnect, &updates])?;
+    // Tabs (plans/08 P4, D3). The switch chords are also taken out of the
+    // video's key stream by the engine; these are for when the page has the
+    // keyboard (a disconnected tab's card, the connect page).
+    let next = MenuItem::with_id(
+        app,
+        "menu-tab-next",
+        "Next Tab",
+        true,
+        Some("CmdOrCtrl+Alt+PageDown"),
+    )?;
+    let prev = MenuItem::with_id(
+        app,
+        "menu-tab-prev",
+        "Previous Tab",
+        true,
+        Some("CmdOrCtrl+Alt+PageUp"),
+    )?;
+    let new_tab = MenuItem::with_id(app, "menu-tab-new", "New Tab", true, None::<&str>)?;
+    let close_tab = MenuItem::with_id(app, "menu-tab-close", "Close Tab", true, None::<&str>)?;
+    let tabs = Submenu::with_items(app, "Tabs", true, &[&new_tab, &next, &prev, &close_tab])?;
     // The host's monitors during a session, rebuilt on every `displays` event
     // (see `update_monitor_menu`); a placeholder until then.
     let monitor = Submenu::with_id(app, "menu-monitor", "Monitor", true)?;
@@ -43,12 +63,13 @@ pub(crate) fn install_native_menu(app: &tauri::App) -> tauri::Result<()> {
     {
         let menu = Menu::default(app.handle())?;
         menu.append(&session)?;
+        menu.append(&tabs)?;
         menu.append(&monitor)?;
         app.set_menu(menu)?;
     }
     #[cfg(target_os = "linux")]
     {
-        let menu = Menu::with_items(app, &[&session, &monitor])?;
+        let menu = Menu::with_items(app, &[&session, &tabs, &monitor])?;
         app.set_menu(menu)?;
     }
     app.manage(MonitorMenu(std::sync::Mutex::new(Some(monitor.clone()))));
@@ -59,6 +80,12 @@ pub(crate) fn install_native_menu(app: &tauri::App) -> tauri::Result<()> {
 /// The native "Monitor" submenu (macOS + Linux), kept so it can be rebuilt.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 struct MonitorMenu(std::sync::Mutex<Option<tauri::menu::Submenu<tauri::Wry>>>);
+
+/// The tab manager (managed from setup on).
+fn tabs_of(app: &tauri::AppHandle) -> Option<std::sync::Arc<crate::tabs::TabManager>> {
+    app.try_state::<std::sync::Arc<crate::tabs::TabManager>>()
+        .map(|t| t.inner().clone())
+}
 
 /// Menu item id prefix for a monitor; the rest is the display id.
 const MENU_DISPLAY_PREFIX: &str = "menu-display:";
@@ -168,15 +195,40 @@ pub(crate) fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::Menu
         "menu-check-updates" => {
             let _ = app.emit("menu://check-updates", ());
         }
-        "menu-end-session" => {
-            app.state::<AppState>().engine.end_all();
+        "menu-end-session" => crate::commands::end_current(app),
+        "menu-tab-next" => {
+            if let Some(tabs) = tabs_of(app) {
+                tabs.step(engine::TabStep::Next);
+            }
+        }
+        "menu-tab-prev" => {
+            if let Some(tabs) = tabs_of(app) {
+                tabs.step(engine::TabStep::Prev);
+            }
+        }
+        "menu-tab-new" => {
+            if let Some(tabs) = tabs_of(app) {
+                let _ = tabs.activate(None);
+            }
+        }
+        "menu-tab-close" => {
+            let Some(tabs) = tabs_of(app) else {
+                return;
+            };
+            if let Some(remote) = app
+                .state::<AppState>()
+                .engine
+                .workspace()
+                .and_then(|w| w.active_tab)
+            {
+                tabs.close(&remote);
+            }
         }
         other => {
-            // The Monitor menu belongs to the viewer session on screen (one
-            // until the tab UI, plans/08 P4) — or, when hosting, to this
-            // computer's own shared monitor.
+            // The Monitor menu belongs to the tab on screen — or, when
+            // hosting, to this computer's own shared monitor.
             let engine = &app.state::<AppState>().engine;
-            let viewer = engine.viewer_sessions().first().copied();
+            let viewer = engine.active_session();
             if let Some(id) = other.strip_prefix(MENU_DISPLAY_PREFIX) {
                 match viewer {
                     Some(session) => engine.select_display(session, id.to_string()),

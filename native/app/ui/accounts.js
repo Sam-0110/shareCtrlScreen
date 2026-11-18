@@ -17,9 +17,10 @@ const LOCAL = 'local';
 
 const view = () => (S.config && S.config.account) || { state: LOCAL, accounts: [] };
 
-/** Whether this computer is viewing (or connecting to) another one. */
+/** Whether this computer is viewing (or connecting to) another one: a
+ *  switch or sign-out disconnects every tab (D6). */
 function viewerBusy() {
-  return S.state === 'VIEW_ACTIVE' || S.state === 'REQUESTING' || S.state === 'PASSWORD_PROMPT';
+  return S.tabs.tabs.some((t) => t.phase !== 'disconnected');
 }
 
 function ago(ms) {

@@ -61,6 +61,8 @@ use std::sync::Arc;
 
 use protocol::InputMsg;
 
+use crate::events::TabStep;
+
 /// An operating-system family, as far as modifier keys are concerned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OsFamily {
@@ -174,6 +176,11 @@ pub(crate) struct KeyTranslator {
     enabled: Arc<AtomicBool>,
     /// A handful of keys at most are held at once; a Vec beats a map here.
     held: Vec<Held>,
+    /// Where a tab-switch chord goes (D3, 08a §6.19); `None`: not taken out.
+    tab_step: Option<Box<dyn Fn(TabStep) + Send>>,
+    /// PageUp/PageDown keys whose press was taken as a tab switch: their
+    /// release is taken too, so the host never sees half a key.
+    swallowed: Vec<String>,
 }
 
 impl KeyTranslator {
@@ -183,12 +190,59 @@ impl KeyTranslator {
             host,
             enabled,
             held: Vec::with_capacity(8),
+            tab_step: None,
+            swallowed: Vec::new(),
         }
+    }
+
+    /// Take the tab-switch chords out of the stream and report them to `f`
+    /// instead: Ctrl+Alt+PageDown / PageUp (Cmd+Option on a Mac viewer),
+    /// whether or not shortcut capture is on (08a §6.19). Their modifiers
+    /// were already forwarded and are released normally — a bare Ctrl+Alt
+    /// means nothing to the host.
+    pub(crate) fn with_tab_shortcuts(mut self, f: Box<dyn Fn(TabStep) + Send>) -> Self {
+        self.tab_step = Some(f);
+        self
+    }
+
+    /// The tab step `code` makes with the keys held now, if it completes a
+    /// tab-switch chord.
+    fn tab_chord(&self, code: &str) -> Option<TabStep> {
+        let step = match code {
+            "PageDown" => TabStep::Next,
+            "PageUp" => TabStep::Prev,
+            _ => return None,
+        };
+        let primary = if self.viewer == OsFamily::Mac {
+            "Meta"
+        } else {
+            "Control"
+        };
+        let held = |prefix: &str| self.held.iter().any(|h| h.physical.starts_with(prefix));
+        (held(primary) && held("Alt")).then_some(step)
     }
 
     /// Translate one physical key event; `emit` receives the messages to send
     /// to the host, in order (zero, one or several).
     pub(crate) fn key(&mut self, code: &str, down: bool, emit: &mut impl FnMut(InputMsg)) {
+        if self.tab_step.is_some() {
+            if down {
+                if let Some(step) = self.tab_chord(code) {
+                    if !self.swallowed.iter().any(|c| c == code) {
+                        self.swallowed.push(code.to_string());
+                    }
+                    // A held key repeats: every repeat steps again, as a
+                    // browser's tab chords do.
+                    if let Some(report) = &self.tab_step {
+                        report(step);
+                    }
+                    return;
+                }
+            } else if let Some(i) = self.swallowed.iter().position(|c| c == code) {
+                self.swallowed.remove(i);
+                return;
+            }
+        }
         if down {
             self.down(code, emit);
         } else {
@@ -294,6 +348,52 @@ mod tests {
             });
         }
         out
+    }
+
+    /// D3: the tab chords are taken out (press and release), reported, and
+    /// everything else — including PageDown alone — goes through.
+    #[test]
+    fn tab_switch_chords_are_taken_out_and_reported() {
+        for (viewer, primary) in [
+            (OsFamily::Windows, "ControlLeft"),
+            (OsFamily::Mac, "MetaLeft"),
+        ] {
+            let steps = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = steps.clone();
+            let mut t = KeyTranslator::new(viewer, viewer, Arc::new(AtomicBool::new(true)))
+                .with_tab_shortcuts(Box::new(move |s| seen.lock().unwrap().push(s)));
+            let down = format!("+{primary}");
+            let up = format!("-{primary}");
+            let sent = run(
+                &mut t,
+                &[
+                    &down,
+                    "+AltLeft",
+                    "+PageDown",
+                    "+PageDown",
+                    "-PageDown",
+                    "+PageUp",
+                    "-PageUp",
+                    "-AltLeft",
+                    &up,
+                ],
+            );
+            assert_eq!(sent, [down.as_str(), "+AltLeft", "-AltLeft", up.as_str()]);
+            assert_eq!(
+                *steps.lock().unwrap(),
+                [TabStep::Next, TabStep::Next, TabStep::Prev]
+            );
+            assert_eq!(
+                run(&mut t, &["+PageDown", "-PageDown"]),
+                ["+PageDown", "-PageDown"]
+            );
+        }
+        // Without a receiver nothing is taken out.
+        let (mut t, _) = translator(OsFamily::Windows, OsFamily::Windows);
+        assert_eq!(
+            run(&mut t, &["+ControlLeft", "+AltLeft", "+PageDown"]),
+            ["+ControlLeft", "+AltLeft", "+PageDown"]
+        );
     }
 
     fn mac_to_windows() -> KeyTranslator {
