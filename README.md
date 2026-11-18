@@ -200,6 +200,29 @@ While a session is running, the host's session panel can switch the permission
 between `view` and `control` at any time — it takes effect immediately, without
 reconnecting — and can end the session.
 
+**Accounts: sync your remote IDs** (native app, ⚙ Settings → Account). Accounts
+are optional. Connecting never needs one. Create an account on one computer and
+sign in to it on the others. The remote IDs you name, the recent IDs you connect
+to, and **Clear** on the recents then stay the same on every signed-in computer.
+The app syncs at sign-in and at startup, shortly after any change, when the
+window comes to the front, and every 5 minutes. **Sync now** forces a sync.
+When the same ID is renamed on two computers, the newer name wins. Removing a
+name also syncs. Signing out keeps the IDs already on that computer.
+
+- The account lives on the signaling server in **Server URL** (`wss://host/ws` →
+  `https://host/api/...`; see `server/src/accounts.js`). The server stores a
+  PBKDF2 hash of the password, hashes of the sign-in tokens, and the ID list
+  (IDs, names, and last-connected times).
+- The sign-in token is kept in the app's `config.json`. It can only read and
+  replace the ID list. Connecting to a machine still needs that machine's approval
+  or password. Wrong passwords lock sign-in to the account for 15 minutes after
+  10 tries. With the `AUTH_LIMITER` binding, each IP address is also limited to 20
+  sign-in or sign-up attempts per minute.
+- Deploying this server version adds the `AccountStore` Durable Object (migration
+  `v2`) and the `AUTH_LIMITER` rate limit (`server/wrangler.jsonc`). Older apps
+  keep working unchanged. To check the API against `wrangler dev`, run
+  `npm run test:accounts` in `server/`.
+
 ## Updating
 
 ShareCtrlScreen updates itself. **⚙ Settings → Updates** shows the current version

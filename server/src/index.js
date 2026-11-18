@@ -1,4 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
+import { handleApi } from "./accounts.js";
+
+// Durable Object classes must be exported from the main module.
+export { AccountStore } from "./accounts.js";
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -197,6 +201,10 @@ export class SignalingRoom extends DurableObject {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
+    // Accounts + remote-ID sync (accounts.js). Optional for clients: signaling
+    // below never depends on it.
+    if (url.pathname.startsWith("/api/")) return handleApi(request, env, url);
 
     if (url.pathname !== "/ws") {
       return new Response("sharectrl-signal ok", {

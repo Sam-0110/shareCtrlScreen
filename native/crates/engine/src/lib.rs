@@ -486,7 +486,7 @@ impl Engine {
 
     /// UI action: clear the recent-ids list. Returns the (now empty) list.
     pub fn clear_recents(&self) -> Vec<String> {
-        self.update_config(|c| c.recent_ids.clear());
+        self.update_config(|c| c.clear_recents());
         Vec::new()
     }
 

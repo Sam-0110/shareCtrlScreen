@@ -14,12 +14,14 @@ pub mod control;
 pub mod cursor;
 pub mod input;
 pub mod signaling;
+pub mod sync;
 pub mod transfer;
 
-pub use config::{Config, IceServer, Mode, Permission};
+pub use config::{Account, Config, IceServer, IdStamp, Mode, Permission};
 pub use control::ControlMsg;
 pub use input::{Button, InputMsg};
 pub use signaling::{IceCandidate, IceServers, SignalData, SignalMsg};
+pub use sync::{SyncDoc, SyncEntry};
 pub use transfer::{BulkFrame, FileMeta};
 
 /// Protocol version carried in the `register` message (`v`), always `1`.

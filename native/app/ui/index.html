@@ -203,6 +203,55 @@
           <input id="set-server" class="input mono" type="text" spellcheck="false" />
         </label>
 
+        <!-- ACCOUNT — optional; syncs remote IDs, their names and the recents
+             between this user's computers (account.rs, server/src/accounts.js).
+             Its buttons act at once; Save/Cancel do not apply to it. -->
+        <fieldset class="field" id="account-section">
+          <legend>Account</legend>
+          <div id="account-signed-out">
+            <div class="hint account-intro">
+              Sign in on each of your computers to keep your remote IDs, their names and
+              your recent connections the same on all of them. Optional &mdash; connecting
+              never needs an account.
+            </div>
+            <div class="row account-row">
+              <input
+                id="account-username"
+                class="input"
+                type="text"
+                placeholder="Username"
+                autocomplete="username"
+                spellcheck="false"
+                maxlength="32"
+              />
+              <input
+                id="account-password"
+                class="input"
+                type="password"
+                placeholder="Password"
+                autocomplete="current-password"
+                maxlength="256"
+              />
+            </div>
+            <div class="row">
+              <button id="btn-account-sign-in" type="button" class="btn btn-sm btn-primary">Sign in</button>
+              <button id="btn-account-create" type="button" class="btn btn-sm">Create account</button>
+            </div>
+          </div>
+          <div id="account-signed-in" class="hidden">
+            <div class="hint account-intro">
+              Signed in as <b id="account-name"></b>. Remote IDs you connect to or name
+              sync with your other computers. Last synced: <span id="account-last-sync"></span>.
+            </div>
+            <div class="row">
+              <button id="btn-account-sync" type="button" class="btn btn-sm">Sync now</button>
+              <button id="btn-account-sign-out" type="button" class="btn btn-sm btn-ghost">Sign out</button>
+            </div>
+            <div class="hint">Signing out keeps the IDs already on this computer.</div>
+          </div>
+          <div id="account-status" class="hint hidden"></div>
+        </fieldset>
+
         <fieldset class="field">
           <legend>Incoming connections</legend>
           <label class="radio">
