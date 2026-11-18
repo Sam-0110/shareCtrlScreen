@@ -185,16 +185,31 @@ function renderRecents() {
   clear.className = 'recent-clear';
   clear.textContent = 'Clear';
   clear.title = 'Clear recent IDs (named IDs are kept)';
-  clear.addEventListener('click', async () => {
-    try {
-      config.recentIds = await invoke('clear_recents');
-    } catch (_) {
-      config.recentIds = [];
-    }
-    renderRecents();
-    scheduleSync();
-  });
+  clear.addEventListener('click', openClearRecents);
   row.appendChild(clear);
+}
+
+// ---- clear-recents confirmation --------------------------------------------
+// Clearing can't be undone and, when signed in, syncs to the other computers,
+// so it asks first. Cancel is focused, so Enter or Escape never clears by accident.
+function openClearRecents() {
+  $('modal-clear-recents').classList.remove('hidden');
+  $('btn-clear-recents-cancel').focus();
+}
+
+function closeClearRecents() {
+  $('modal-clear-recents').classList.add('hidden');
+}
+
+async function confirmClearRecents() {
+  closeClearRecents();
+  try {
+    config.recentIds = await invoke('clear_recents');
+  } catch (_) {
+    config.recentIds = [];
+  }
+  renderRecents();
+  scheduleSync();
 }
 
 // ---- platform wording + displays -------------------------------------------
@@ -769,6 +784,14 @@ $('btn-permissions-close').addEventListener('click', closePermissions);
 $('btn-settings').addEventListener('click', openSettings);
 $('btn-settings-cancel').addEventListener('click', closeSettings);
 $('btn-settings-save').addEventListener('click', saveSettings);
+$('btn-clear-recents-cancel').addEventListener('click', closeClearRecents);
+$('btn-clear-recents-ok').addEventListener('click', confirmClearRecents);
+$('modal-clear-recents').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeClearRecents(); // backdrop click
+});
+$('modal-clear-recents').addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeClearRecents();
+});
 
 // Session menu bar (revealed by hovering the top edge of the video).
 $('btn-view-refresh').addEventListener('click', () => {
