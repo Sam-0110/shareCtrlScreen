@@ -16,6 +16,7 @@
 // On Windows release builds, don't spawn a console window.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod account;
 mod uiaccess;
 mod updater;
 
@@ -98,6 +99,8 @@ fn get_config(state: tauri::State<'_, AppState>) -> serde_json::Value {
         "shareDisplayId": c.share_display_id,
         "recentIds": c.recent_ids,
         "remoteNames": c.remote_names,
+        // Signed-in account for ID sync (username/server/lastSync; no token).
+        "account": account::account_json(&c),
         "captureShortcuts": c.capture_shortcuts,
         "autoLogin": c.auto_login,
         "clipboardSync": c.clipboard_sync,
@@ -651,6 +654,9 @@ fn main() {
             get_platform_info,
             clear_recents,
             set_remote_name,
+            account::account_sign_in,
+            account::account_sync,
+            account::account_sign_out,
             get_server_status,
             get_role,
             connect_to,

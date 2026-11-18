@@ -134,6 +134,7 @@ async function saveRemoteName(id, name) {
     return;
   }
   renderRecents();
+  scheduleSync();
 }
 
 function renderRecents() {
@@ -191,6 +192,7 @@ function renderRecents() {
       config.recentIds = [];
     }
     renderRecents();
+    scheduleSync();
   });
   row.appendChild(clear);
 }
@@ -239,6 +241,9 @@ function openSettings() {
   $('set-openh264').checked = config.useOpenH264 !== false;
   $('set-translate-modifiers').checked = config.translateModifiers !== false;
   $('openh264-license').classList.add('hidden');
+  renderAccount();
+  setAccountStatus('');
+  $('account-password').value = '';
   refreshOpenH264();
   // Updates panel: reset transient state, show what the last check found, and —
   // if we have not checked yet — fill the current version with a quiet check.
@@ -300,6 +305,160 @@ async function saveSettings() {
   toast('Settings saved');
   await reloadConfig();
 }
+
+// ---- account sync ------------------------------------------------------------
+// Optional account that keeps remote IDs, their names and the recents the same
+// on every computer signed in to it. Rust does the HTTP and the merging
+// (account.rs, protocol::sync); this only decides when to sync and shows it.
+const SYNC_EVERY_MS = 5 * 60 * 1000;
+const SYNC_ON_FOCUS_AFTER_MS = 60 * 1000;
+let syncing = null; // the sync in flight, if any
+let syncAgain = false; // something changed while it was in flight
+let syncTimer = null;
+let lastSyncAttempt = 0;
+
+const signedIn = () => !!(config && config.account);
+
+// Redraw from a sync / sign-in / sign-out answer.
+function applyAccountResult(r) {
+  config.account = r.account;
+  config.recentIds = r.recentIds;
+  config.remoteNames = r.remoteNames;
+  renderRecents();
+  // A name synced from elsewhere shows at once, unless the user is typing one.
+  if (nameFieldFor && document.activeElement !== $('remote-name')) {
+    $('remote-name').value = nameOf(nameFieldFor);
+  }
+  renderAccount();
+}
+
+async function syncNow(manual) {
+  if (!signedIn()) return;
+  if (syncing) {
+    syncAgain = true;
+    return syncing;
+  }
+  syncing = (async () => {
+    try {
+      applyAccountResult(await invoke('account_sync'));
+      if (manual) setAccountStatus('Synced.');
+    } catch (err) {
+      const msg = String((err && err.message) || err);
+      const wasSignedIn = signedIn();
+      await reloadConfig();
+      renderAccount();
+      // Background failures (offline, server down) stay quiet and retry
+      // later; being signed out, or a sync the user asked for, is reported.
+      if (manual) setAccountStatus(msg, true);
+      else if (wasSignedIn && !signedIn()) toast(msg, 'error');
+    } finally {
+      lastSyncAttempt = Date.now();
+      syncing = null;
+      if (syncAgain) {
+        syncAgain = false;
+        scheduleSync();
+      }
+    }
+  })();
+  return syncing;
+}
+
+// Sync shortly after a local change, coalescing a burst of them.
+function scheduleSync(delayMs) {
+  if (!signedIn()) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => syncNow(false), delayMs === undefined ? 1500 : delayMs);
+}
+
+function ago(ms) {
+  if (!ms) return 'not yet';
+  const s = Math.round((Date.now() - ms) / 1000);
+  if (s < 45) return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} h ago`;
+  return new Date(ms).toLocaleString();
+}
+
+function setAccountStatus(text, error) {
+  const el = $('account-status');
+  el.textContent = text || '';
+  el.classList.toggle('hidden', !text);
+  el.classList.toggle('hint-error', !!error);
+}
+
+function renderAccount() {
+  const a = config && config.account;
+  $('account-signed-out').classList.toggle('hidden', !!a);
+  $('account-signed-in').classList.toggle('hidden', !a);
+  if (a) {
+    $('account-name').textContent = a.username;
+    $('account-last-sync').textContent = ago(a.lastSync);
+  }
+}
+
+async function accountSignIn(create) {
+  const username = $('account-username').value.trim();
+  const password = $('account-password').value;
+  if (!username || !password) {
+    setAccountStatus('Enter a username and a password.', true);
+    return;
+  }
+  const buttons = [$('btn-account-sign-in'), $('btn-account-create')];
+  buttons.forEach((b) => (b.disabled = true));
+  setAccountStatus(create ? 'Creating the account…' : 'Signing in…');
+  try {
+    const r = await invoke('account_sign_in', { username, password, create });
+    $('account-password').value = '';
+    applyAccountResult(r);
+    lastSyncAttempt = Date.now();
+    if (r.syncError) {
+      setAccountStatus('Signed in, but the first sync failed: ' + r.syncError, true);
+    } else {
+      setAccountStatus(
+        create ? 'Account created. This computer\'s IDs are saved to it.' : 'Signed in and synced.'
+      );
+    }
+  } catch (err) {
+    setAccountStatus(String((err && err.message) || err), true);
+  } finally {
+    buttons.forEach((b) => (b.disabled = false));
+  }
+}
+
+async function accountSignOut() {
+  clearTimeout(syncTimer);
+  try {
+    applyAccountResult(await invoke('account_sign_out'));
+    setAccountStatus('Signed out. The IDs stay on this computer.');
+  } catch (err) {
+    setAccountStatus(String((err && err.message) || err), true);
+  }
+}
+
+$('btn-account-sign-in').addEventListener('click', () => accountSignIn(false));
+$('btn-account-create').addEventListener('click', () => accountSignIn(true));
+$('btn-account-sign-out').addEventListener('click', accountSignOut);
+$('btn-account-sync').addEventListener('click', async () => {
+  $('btn-account-sync').disabled = true;
+  setAccountStatus('Syncing…');
+  await syncNow(true);
+  $('btn-account-sync').disabled = false;
+});
+$('account-password').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    accountSignIn(false);
+  }
+});
+
+// Pick up changes made on other computers: when the window comes back to the
+// front, and every few minutes.
+window.addEventListener('focus', () => {
+  if (Date.now() - lastSyncAttempt > SYNC_ON_FOCUS_AFTER_MS) syncNow(false);
+});
+setInterval(() => syncNow(false), SYNC_EVERY_MS);
 
 // ---- permissions modal -----------------------------------------------------
 // What each OS permission is for, in words that hold on every OS. Order is the
@@ -713,6 +872,7 @@ $('btn-connect').addEventListener('click', async () => {
     setState('READY');
   });
   invoke('connect_to', { id });
+  scheduleSync(3000); // connect_to added it to the recents
 });
 
 $('btn-cancel-request').addEventListener('click', () => {
@@ -826,6 +986,7 @@ listen('role-changed', (e) => {
   // Whatever happens next (reconnected, or dropped back to the home screen),
   // the "connection lost" panel is stale.
   $('modal-link').classList.add('hidden');
+  if (p.role !== 'idle') scheduleSync(); // the peer is now a recent
   if (p.role === 'host') {
     $('host-peer').textContent = peerLabel(p.peer);
     $('host-perm').value = p.permission;
@@ -863,6 +1024,7 @@ listen('link-restored', () => {
 (async () => {
   await reloadConfig();
   syncNameField();
+  syncNow(false); // signed in: pick up what other computers changed meanwhile
   await applyPlatformInfo();
   render();
   // Back-fill the server status: the engine registers ~0.5 s after launch and
