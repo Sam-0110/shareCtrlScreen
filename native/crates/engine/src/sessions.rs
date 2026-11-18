@@ -23,7 +23,7 @@ use protocol::{Config, ControlMsg, Mode, Permission, SignalData, SignalMsg};
 
 use crate::events::{EndReason, PwReason, SessionEvent, SessionId, SessionPhase, UiEvent};
 use crate::handshake::{self, ApprovalDecision};
-use crate::session::registry::{HostSlot, PendingLogin, ViewerPhase, ViewerSlot};
+use crate::session::registry::{HostSlot, PendingLogin, ViewerPhase, ViewerSlot, REQUEST_TIMEOUT};
 use crate::{modifiers, session, ConnectError, Engine, Role, SECRET_PROMPT_TIMEOUT};
 
 /// Holds `Registry::admitting` for one peer and clears it when dropped, so an
@@ -248,7 +248,9 @@ impl Engine {
         // one-session rule (D1) should that ever change.
         let id = {
             let mut reg = self.reg.lock();
-            if reg.host.is_some() || !reg.viewers.is_empty() {
+            // The same test the admission passed (an overdue request does not
+            // count), so an admitted viewer is not refused at the last step.
+            if reg.host.is_some() || reg.busy_for(&peer) {
                 None
             } else {
                 let id = reg.reserve();
@@ -256,6 +258,8 @@ impl Engine {
                     id,
                     peer: peer.clone(),
                     permission,
+                    starting: false,
+                    end_requested: None,
                     ended: Arc::default(),
                     session: None,
                 });
@@ -375,6 +379,18 @@ impl Engine {
             if let Some(existing) = reg.viewer_by_peer(&host_uuid) {
                 return Err(ConnectError::AlreadyConnected(existing));
             }
+            // An ended session with that host, or on that surface, whose
+            // threads are still being joined: nothing new starts on top.
+            if let Some(ending) = reg.peer_in_use(&host_uuid) {
+                return Err(ConnectError::Ending(ending));
+            }
+            if let Some(s) = &surface {
+                match reg.surface_in_use(s) {
+                    Some((other, true)) => return Err(ConnectError::Ending(other)),
+                    Some((other, false)) => return Err(ConnectError::SurfaceInUse(other)),
+                    None => {}
+                }
+            }
             let id = reg.reserve();
             let started_in = ws.sel.workspace_key().map(|k| (k.to_string(), ws.epoch));
             let mut slot = ViewerSlot::requesting(host_uuid.clone(), surface);
@@ -402,7 +418,43 @@ impl Engine {
         if let Some((key, epoch)) = started_in {
             self.add_recent_in(&key, epoch, &host_uuid);
         }
+        self.time_request(id, 1);
         Ok(id)
+    }
+
+    /// End session `id` with `Timeout` if attempt `attempt` of its request is
+    /// still unanswered after [`REQUEST_TIMEOUT`] (08a §5.2), whatever the UI
+    /// does — so a request can never stay forever, holding its host (I1).
+    fn time_request(&self, id: SessionId, attempt: u64) {
+        let end_tx = self.end_tx.clone();
+        self.rt.spawn(async move {
+            tokio::time::sleep(REQUEST_TIMEOUT).await;
+            let _ = end_tx.send(crate::EndRequest {
+                id,
+                reason: EndReason::Timeout,
+                if_unanswered: Some(attempt),
+            });
+        });
+    }
+
+    /// Carry out an end sent over the ended channel (a dead link, a timer).
+    pub(crate) fn end_requested(&self, req: crate::EndRequest) {
+        if let Some(attempt) = req.if_unanswered {
+            let unanswered = self
+                .reg
+                .lock()
+                .viewers
+                .get(&req.id)
+                .is_some_and(|v| v.phase == ViewerPhase::Requesting && v.attempt == attempt);
+            if !unanswered {
+                return;
+            }
+            // Tell the host too, so an approval prompt there does not stay up
+            // for a viewer that gave up.
+            self.disconnect_with(req.id, req.reason);
+            return;
+        }
+        self.end(req.id, req.reason);
     }
 
     pub(crate) async fn on_password_required(&self, from: String, nonce: String) {
@@ -432,51 +484,71 @@ impl Engine {
 
         // Auto-login: replay a password this host has already accepted.
         if let Some(plain) = self.saved_login(&from).await {
-            if let Some(v) = self.reg.lock().viewers.get_mut(&id) {
-                v.auto_attempted = true;
-            }
             tracing::info!("auto-login: submitting saved password for {from}");
-            self.submit_password(id, plain, false);
+            self.send_password(id, plain, false, ViewerPhase::Requesting);
             return;
         }
         self.prompt_for_password(id, &from, PwReason::First);
     }
 
-    /// Ask the user for the host's password. While the prompt is up the
-    /// request waits on the user, not the network, so it keeps this computer
-    /// busy for as long as it takes; Cancel ends it through `disconnect`.
+    /// Ask the user for the host's password — only if the request is still
+    /// waiting (the saved-password lookup before it may outlast a cancel or a
+    /// timeout; an ended session is never prompted for). While the prompt is
+    /// up the request waits on the user, not the network, so it keeps this
+    /// computer busy for as long as it takes; Cancel ends it.
     fn prompt_for_password(&self, id: SessionId, host: &str, reason: PwReason) {
-        if let Some(v) = self.reg.lock().viewers.get_mut(&id) {
-            v.phase = ViewerPhase::PasswordRequired;
-            v.busy_until = None;
+        let waiting = match self.reg.lock().viewers.get_mut(&id) {
+            Some(v) if v.phase == ViewerPhase::Requesting => {
+                v.phase = ViewerPhase::PasswordRequired;
+                v.busy_until = None;
+                true
+            }
+            _ => false,
+        };
+        if waiting {
+            self.emit(
+                id,
+                host,
+                false,
+                SessionEvent::Phase(SessionPhase::PasswordRequired { reason }),
+            );
         }
-        self.emit(
-            id,
-            host,
-            false,
-            SessionEvent::Phase(SessionPhase::PasswordRequired { reason }),
-        );
     }
 
     /// UI action: answer session `id`'s password prompt. `remember` asks to
     /// save the password — but only once the host has actually accepted it
-    /// (see `on_connect_response`).
+    /// (see `on_connect_response`). Ignored unless the prompt is up.
     pub fn submit_password(&self, id: SessionId, plaintext: String, remember: bool) {
+        self.send_password(id, plaintext, remember, ViewerPhase::PasswordRequired);
+    }
+
+    /// Answer the host's challenge for session `id` — typed by the user (the
+    /// prompt is up: `PasswordRequired`) or saved (the request is still
+    /// waiting: `Requesting`). Any other phase is a stray answer, ignored.
+    fn send_password(&self, id: SessionId, plaintext: String, remember: bool, from: ViewerPhase) {
+        let auto = from == ViewerPhase::Requesting;
         let workspace = self.workspace_sel().workspace_key().map(String::from);
-        let host = {
+        let sent = {
             let mut reg = self.reg.lock();
-            let Some(v) = reg.viewers.get_mut(&id) else {
-                return;
-            };
-            v.pending_login = Some(PendingLogin {
-                plaintext: plaintext.clone(),
-                remember,
-                workspace,
-            });
-            // Waiting on the network again: the answer timeout starts over.
-            v.resent();
-            v.peer.clone()
+            match reg.viewers.get_mut(&id) {
+                Some(v) if v.phase == from => {
+                    v.pending_login = Some(PendingLogin {
+                        plaintext: plaintext.clone(),
+                        remember,
+                        workspace,
+                    });
+                    v.auto_attempted = auto;
+                    // Waiting on the network again: the answer timeout starts over.
+                    v.resent();
+                    Some((v.peer.clone(), v.attempt))
+                }
+                _ => None,
+            }
         };
+        let Some((host, attempt)) = sent else {
+            return;
+        };
+        self.time_request(id, attempt);
         let nonce = self.pending_nonce.lock().remove(&host).unwrap_or_default();
         // proof = SHA256( SHA256(plaintext) + ":" + nonce ).
         let proof = handshake::compute_proof(&plaintext, &nonce);
@@ -724,20 +796,17 @@ impl Engine {
     /// too, so it does not keep a session open for a viewer that left
     /// (08a §6.5 step 1).
     pub fn disconnect(&self, id: SessionId) {
-        let peer = {
-            let reg = self.reg.lock();
-            reg.host
-                .as_ref()
-                .filter(|h| h.id == id)
-                .map(|h| h.peer.clone())
-                .or_else(|| reg.viewers.get(&id).map(|v| v.peer.clone()))
-        };
-        if let Some(peer) = peer {
+        self.disconnect_with(id, EndReason::UserClosed);
+    }
+
+    /// End session `id` for `reason`, telling its peer.
+    fn disconnect_with(&self, id: SessionId, reason: EndReason) {
+        if let Some(peer) = self.session_peer(id) {
             let _ = self.signaling.send(SignalMsg::EndSession {
                 to: Some(peer),
                 from: None,
             });
-            self.end(id, EndReason::UserClosed);
+            self.end(id, reason);
         }
     }
 
@@ -810,46 +879,77 @@ impl Engine {
     }
 
     /// End session `id` because it could not be started or kept going, telling
-    /// its peer and the user why.
+    /// its peer and the user why. Called by a starter too (`begin_host`,
+    /// `start_viewer`): it gives up its start first, so the end happens now —
+    /// for the reason asked for meanwhile, if one was.
     pub(crate) fn fail_session(&self, id: SessionId, why: &str) {
-        let peer = {
-            let reg = self.reg.lock();
-            reg.host
-                .as_ref()
-                .filter(|h| h.id == id)
-                .map(|h| h.peer.clone())
-                .or_else(|| reg.viewers.get(&id).map(|v| v.peer.clone()))
+        let requested = {
+            let mut reg = self.reg.lock();
+            if let Some(h) = reg.host.as_mut().filter(|h| h.id == id) {
+                h.starting = false;
+                h.end_requested.take()
+            } else if let Some(v) = reg.viewers.get_mut(&id) {
+                v.starting = false;
+                v.end_requested.take()
+            } else {
+                None
+            }
         };
-        if let Some(peer) = peer {
+        if let Some(peer) = self.session_peer(id) {
             let _ = self.signaling.send(SignalMsg::EndSession {
                 to: Some(peer),
                 from: None,
             });
         }
-        self.end(id, EndReason::Failed(why.to_string()));
+        self.end(id, requested.unwrap_or(EndReason::Failed(why.to_string())));
     }
 
-    /// Take session `id` out and end it: its surface is detached and hidden
-    /// at once, `Phase(Ended(reason))` is emitted, then its threads are
-    /// stopped and joined on a reaper thread and `Released` follows. Ending a
-    /// session that is already gone does nothing (it ends exactly once).
+    /// End session `id`: `Phase(Ended(reason))` now, its surface detached and
+    /// hidden now, then its threads stopped and joined on a reaper thread and
+    /// `Released` last (08a §5.2, §6.5). Until released it stays in the
+    /// registry as ending: it still makes this computer busy, still holds its
+    /// peer and its surface, so nothing new starts on top of its threads. A
+    /// session still being built is ended by its starter once what it builds
+    /// exists (the end is recorded and carried out then). Ending a session
+    /// that is already ending or gone does nothing: it ends exactly once.
     pub(crate) fn end(&self, id: SessionId, reason: EndReason) {
         enum Taken {
             Host(HostSlot),
             Viewer(ViewerSlot),
         }
-        let taken = {
+        // Out of the live sessions and into the ending ones in one critical
+        // section, so its peer and surface are never free in between.
+        let (peer, host, ended, surface, session) = {
             let mut reg = self.reg.lock();
-            if reg.host.as_ref().is_some_and(|h| h.id == id) {
+            let taken = if let Some(h) = reg.host.as_mut().filter(|h| h.id == id) {
+                if h.starting {
+                    h.end_requested.get_or_insert(reason);
+                    return;
+                }
                 reg.host.take().map(Taken::Host)
-            } else {
+            } else if let Some(v) = reg.viewers.get_mut(&id) {
+                if v.starting {
+                    v.end_requested.get_or_insert(reason);
+                    return;
+                }
                 reg.viewers.remove(&id).map(Taken::Viewer)
-            }
-        };
-        let (peer, host, ended, surface, session) = match taken {
-            None => return,
-            Some(Taken::Host(h)) => (h.peer, true, h.ended, None, h.session),
-            Some(Taken::Viewer(v)) => (v.peer, false, v.ended, v.surface, v.session),
+            } else {
+                None
+            };
+            let (peer, host, ended, surface, session) = match taken {
+                None => return,
+                Some(Taken::Host(h)) => (h.peer, true, h.ended, None, h.session),
+                Some(Taken::Viewer(v)) => (v.peer, false, v.ended, v.surface, v.session),
+            };
+            reg.reaping.insert(
+                id,
+                session::registry::Reaping {
+                    peer: peer.clone(),
+                    host,
+                    surface: surface.clone(),
+                },
+            );
+            (peer, host, ended, surface, session)
         };
         ended.store(true, Ordering::SeqCst);
         // Stop flag first, so its media thread does not present again (or
@@ -867,52 +967,87 @@ impl Engine {
             host,
             SessionEvent::Phase(SessionPhase::Ended(reason)),
         );
-        let ui = self.session_ui(id, &peer, host);
-        let reap = move || {
+        self.reap(id, &peer, host, session, surface);
+    }
+
+    /// Join session `id`'s threads on their own thread, then hide its surface
+    /// (a media thread that was just starting may have shown it after it was
+    /// detached — and no newer session can hold it: the surface stays taken
+    /// until this release), take it out of `reaping` and emit `Released`.
+    fn reap(
+        &self,
+        id: SessionId,
+        peer: &str,
+        host: bool,
+        session: Option<session::Session>,
+        surface: Option<Arc<dyn VideoSurface>>,
+    ) {
+        let ui = self.session_ui(id, peer, host);
+        let reg = Arc::clone(&self.reg);
+        let release = move || {
             if let Some(s) = session {
                 s.stop_and_join();
             }
-            // Hidden again once its threads are gone: a media thread that was
-            // just starting may have shown the surface after it was detached.
-            // (A surface reused by the next session is shown by that session
-            // only once its own decoder is up, a full connect later than this
-            // join of stopped threads.)
             if let Some(s) = &surface {
                 s.hide();
             }
+            reg.lock().reaping.remove(&id);
             ui.send(SessionEvent::Released);
         };
         if let Err(e) = std::thread::Builder::new()
             .name(format!("sct-reap-{id}"))
-            .spawn(reap)
+            .spawn(release)
         {
-            // Out of threads: the session's own threads stop on their flag
-            // regardless; only the join and `Released` are lost.
+            // Out of threads: its own threads still stop on their flag; the
+            // session stays marked ending, so nothing reuses its peer or
+            // surface on top of threads nobody joined.
             tracing::error!("could not start the reaper for {id}: {e}");
+        }
+    }
+
+    /// End every session and wait (up to `limit`) until all are released —
+    /// their threads joined, so a host's held keys are let go and the Bye is
+    /// on the wire (I9, 08a §6.17). For app exit and updates.
+    pub async fn end_all_and_wait(&self, limit: std::time::Duration) {
+        self.end_all();
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let done = {
+                let reg = self.reg.lock();
+                reg.host.is_none() && reg.viewers.is_empty() && reg.reaping.is_empty()
+            };
+            if done || tokio::time::Instant::now() >= deadline {
+                if !done {
+                    tracing::warn!("sessions still winding down after {limit:?}; going on");
+                }
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
 
     // ---- the session module's view of the registry ----------------------------------
 
-    /// The host session's ended flag, if session `id` is still the host one.
-    pub(crate) fn host_ended_flag(
-        &self,
-        id: SessionId,
-    ) -> Option<Arc<std::sync::atomic::AtomicBool>> {
-        self.reg
-            .lock()
-            .host
-            .as_ref()
-            .filter(|h| h.id == id)
-            .map(|h| h.ended.clone())
+    /// Host session `id` is being built: its ended flag, if it still exists.
+    /// From here until it is stored (or fails), an end is deferred to it.
+    pub(crate) fn host_start(&self, id: SessionId) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        let mut reg = self.reg.lock();
+        let h = reg.host.as_mut().filter(|h| h.id == id)?;
+        h.starting = true;
+        Some(h.ended.clone())
     }
 
-    /// What viewer session `id` needs to start, if it is still waiting for its
-    /// offer.
+    /// Viewer session `id` is being built: what it needs, if it is still
+    /// waiting for its offer. From here until it is stored (or fails), an end
+    /// is deferred to it.
     pub(crate) fn viewer_start(&self, id: SessionId) -> Option<session::ViewerStart> {
-        let reg = self.reg.lock();
-        let v = reg.viewers.get(&id)?;
-        (v.phase == ViewerPhase::Negotiating).then(|| session::ViewerStart {
+        let mut reg = self.reg.lock();
+        let v = reg.viewers.get_mut(&id)?;
+        if v.phase != ViewerPhase::Negotiating || v.starting {
+            return None;
+        }
+        v.starting = true;
+        Some(session::ViewerStart {
             peer: v.peer.clone(),
             surface: v.surface.clone(),
             codec: v.codec,
@@ -922,38 +1057,67 @@ impl Engine {
         })
     }
 
-    /// Keep the started host session in its slot. `false` when the session
-    /// ended while it was starting: its threads are stopped and joined off
-    /// this thread, and nothing more may be sent for it.
+    /// Keep the started host session in its slot. `false` when an end was
+    /// asked for while it was starting: it is ended now (its threads exist, so
+    /// they are joined), and nothing more may be sent for it.
     pub(crate) fn store_host_session(&self, id: SessionId, s: session::Session) -> bool {
-        let orphan = {
+        let requested = {
             let mut reg = self.reg.lock();
             match reg.host.as_mut().filter(|h| h.id == id) {
                 Some(h) => {
                     h.session = Some(s);
-                    None
+                    h.starting = false;
+                    h.end_requested.take()
                 }
-                None => Some(s),
+                // Cannot happen (an end waits for the starter), but if it did
+                // the threads would have no owner: stop them here.
+                None => {
+                    drop(reg);
+                    reap_orphan(id, s);
+                    return false;
+                }
             }
         };
-        reap_orphan(id, orphan)
+        self.finish_start(id, requested)
     }
 
     /// Keep the started viewer session in its slot (now live). `false` as for
     /// [`Engine::store_host_session`].
     pub(crate) fn store_viewer_session(&self, id: SessionId, s: session::Session) -> bool {
-        let orphan = {
+        let requested = {
             let mut reg = self.reg.lock();
             match reg.viewers.get_mut(&id) {
                 Some(v) => {
                     v.phase = ViewerPhase::Live;
                     v.session = Some(s);
-                    None
+                    v.starting = false;
+                    v.end_requested.take()
                 }
-                None => Some(s),
+                None => {
+                    drop(reg);
+                    reap_orphan(id, s);
+                    return false;
+                }
             }
         };
-        reap_orphan(id, orphan)
+        self.finish_start(id, requested)
+    }
+
+    /// Carry out an end asked for while session `id` was starting.
+    fn finish_start(&self, id: SessionId, requested: Option<EndReason>) -> bool {
+        match requested {
+            None => true,
+            Some(reason) => {
+                if let Some(peer) = self.session_peer(id) {
+                    let _ = self.signaling.send(SignalMsg::EndSession {
+                        to: Some(peer),
+                        from: None,
+                    });
+                }
+                self.end(id, reason);
+                false
+            }
+        }
     }
 
     /// Run `f` on viewer session `id`'s live session, under the registry lock
@@ -1068,18 +1232,15 @@ impl Engine {
     }
 }
 
-/// A session that ended while it was starting: stop it and join its threads
-/// on their own thread (never on a signaling task or under a lock). Returns
-/// whether there was nothing to reap, i.e. the session was kept.
-fn reap_orphan(id: SessionId, orphan: Option<session::Session>) -> bool {
-    let Some(s) = orphan else { return true };
+/// A started session with no slot to keep it (cannot happen: an end waits for
+/// its starter). Its threads are stopped and joined on their own thread so
+/// they never run unowned.
+fn reap_orphan(id: SessionId, s: session::Session) {
     s.signal_stop();
     if let Err(e) = std::thread::Builder::new()
         .name(format!("sct-reap-{id}"))
         .spawn(move || s.stop_and_join())
     {
-        // The threads still stop on their flag; only the join is lost.
         tracing::error!("could not start the reaper for {id}: {e}");
     }
-    false
 }

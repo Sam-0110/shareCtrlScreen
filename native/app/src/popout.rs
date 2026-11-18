@@ -167,13 +167,26 @@ pub fn reconcile(
     }
 }
 
-/// Close every pop-out window (the session ended).
-pub fn close_all(app: &AppHandle, engine: &Arc<Engine>) {
+/// Close the pop-out windows of `session`, which was released: the engine
+/// has already stopped their threads and let go of their surfaces, so the
+/// windows can go (08a §6.5 step 3).
+pub fn close_session(app: &AppHandle, engine: &Arc<Engine>, session: SessionId) {
     let Some(state) = app.try_state::<PopoutWindows>() else {
         return;
     };
-    let all: Vec<(u8, Entry)> = state.lock().drain().collect();
-    for (slot, e) in all {
+    let theirs: Vec<(u8, Entry)> = {
+        let mut open = state.lock();
+        let slots: Vec<u8> = open
+            .iter()
+            .filter(|(_, e)| e.session == session)
+            .map(|(s, _)| *s)
+            .collect();
+        slots
+            .into_iter()
+            .filter_map(|s| open.remove(&s).map(|e| (s, e)))
+            .collect()
+    };
+    for (slot, e) in theirs {
         close_window(app, engine, slot, e, false);
     }
 }

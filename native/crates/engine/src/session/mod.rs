@@ -250,7 +250,7 @@ pub(crate) fn begin_host(
 ) {
     // Set when the session ends any way; the transport thread reports a dead
     // link only if nothing ended it first.
-    let Some(ended) = engine.host_ended_flag(id) else {
+    let Some(ended) = engine.host_start(id) else {
         return; // ended before it started
     };
     let ui = engine.session_ui(id, &peer, true);
@@ -482,6 +482,10 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
         permission,
         ended,
     } = start;
+    // Test hook: a slow start (a long ICE gather), so a test can end the
+    // session while it is being built.
+    #[cfg(feature = "test-hooks")]
+    std::thread::sleep(engine.test_viewer_start_delay());
     let Some(surface) = surface else {
         tracing::error!("viewer: no video surface on this platform");
         engine.fail_session(id, "this computer cannot display the remote screen yet");

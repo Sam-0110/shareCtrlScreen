@@ -95,6 +95,17 @@ once and `Released` from a reaper thread after the join. A dead link is reported
 transport thread over the engine's ended channel. `set_active`/`set_overlay` (the ActiveGate)
 arrive with P3; until then the app shows one session and `bridge.rs` translates the tagged
 events into the single-session UI events.
+After the P2 review: an ended session stays in the registry as *ending* (`reaping`) until
+its threads are joined and `Released` is sent — it still counts as busy for D1, still holds its
+peer (I1) and its surface, so nothing starts on top of threads that are winding down (a fast
+reconnect gets `ConnectError::Ending`). An end asked for while a session is still being built
+is recorded and carried out by its starter once everything it builds exists. A request the host
+never answers is ended by the engine after 35 s (`EndReason::Timeout`). Quit and updates use
+`end_all_and_wait` (≤ 3 s), so a host's held keys are released before exit. Pop-out windows are
+destroyed on `Released`. The app's pop-out map is still keyed by slot (each entry carries its
+session); P4 keys it by `(SessionId, slot)` when several tabs can have pop-outs. One visible
+change: a refused or failed connection now returns the UI to the home screen at once (it used
+to wait out its 30 s countdown).
 
 Signaling: `app/src/main.rs`'s one `while … handle_signaling(event).await` loop stays the
 **dispatcher** only. Per-message work that can wait (secret-store opens, the host approval

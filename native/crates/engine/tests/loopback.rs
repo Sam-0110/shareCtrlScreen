@@ -1679,15 +1679,28 @@ async fn popout_window_streams_a_second_monitor_with_its_own_input() {
     viewer.engine.popout_display(sid(&viewer), "mock-1".into());
     tokio::time::sleep(Duration::from_millis(1000)).await;
     assert!(host.popouts.lock().unwrap().is_empty());
-    // (The app closes the window when the list drops it.)
-    viewer.engine.detach_popout(sid(&viewer), slot, gen2);
-    assert!(!viewer.engine.popout_attached(sid(&viewer), slot));
-
+    // The window is still attached when the session ends: by the time the
+    // session is released (when the app destroys pop-out windows), the
+    // window's threads are stopped and its surface let go (P2 review M1).
+    let session = sid(&viewer);
+    assert!(viewer.engine.popout_attached(session, slot));
     viewer.engine.end_all();
     eventually("both idle", t, || {
         host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
     })
     .await;
+    eventually("the session is released", t, || {
+        viewer
+            .session_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(s, k)| *s == session && k == "released")
+    })
+    .await;
+    let s = pop2.state();
+    assert!(!s.visible, "the pop-out surface is hidden before Released");
+    assert!(!s.cursor_control, "and gives the OS cursor back");
 }
 
 /// The workspace store (plans/08 P1): each account sees only its own data, a
@@ -1822,9 +1835,10 @@ async fn switching_accounts_ends_the_viewer_session() {
 }
 
 /// plans/08 P2: one viewer engine holds sessions with two hosts at once, each
-/// on its own surface; events are tagged with the right session; a second
-/// connect to the same host is refused and never tears the first down; ending
-/// one leaves the other live; and a link death in one ends only that one.
+/// on its own surface. Starting the second does not disturb the first; a
+/// second connect to a connected host is refused and does not disturb it
+/// either; a link death in one ends only that one while the other keeps
+/// presenting; events are tagged with their own session; each ends once.
 #[cfg(feature = "test-hooks")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
@@ -1840,33 +1854,43 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
             && viewer.engine.server_connected()
     })
     .await;
-
+    let surface_a = viewer.platform.surface.clone();
     let surface_b = platform_api::mock::MockSurface::new((640, 360));
+    let presented = |s: &Arc<platform_api::mock::MockSurface>| s.state().presented.len();
+    let ended = |id: SessionId| {
+        viewer
+            .session_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(s, k)| *s == id && k.starts_with("ended:"))
+    };
+
+    // A first, and live.
     let a = viewer
         .engine
         .connect(&host_a.uuid, None)
         .expect("not hosting");
+    eventually("A presents", t, || presented(&surface_a) >= 10).await;
+
+    // B starts while A runs; A keeps presenting throughout.
+    let a_before_b = presented(&surface_a);
     let b = viewer
         .engine
         .connect(&host_b.uuid, Some(surface_b.clone()))
         .expect("not hosting");
     assert_ne!(a, b);
-    let viewer_id = viewer.uuid.clone();
-    eventually("both hosts accepted the one viewer", t, || {
-        matches!(host_a.engine.role(), Role::Host { ref peer, .. } if *peer == viewer_id)
-            && matches!(host_b.engine.role(), Role::Host { ref peer, .. } if *peer == viewer_id)
+    eventually("B presents too", t, || presented(&surface_b) >= 10).await;
+    eventually("A kept presenting while B started", t, || {
+        presented(&surface_a) > a_before_b + 10
     })
     .await;
-    eventually(
-        "both sessions present video on their own surface",
-        t,
-        || {
-            viewer.platform.surface.state().presented.len() >= 10
-                && surface_b.state().presented.len() >= 10
-        },
-    )
-    .await;
     assert_eq!(viewer.engine.viewer_sessions(), vec![a, b]);
+    let viewer_id = viewer.uuid.clone();
+    assert!(
+        matches!(host_a.engine.role(), Role::Host { ref peer, .. } if *peer == viewer_id)
+            && matches!(host_b.engine.role(), Role::Host { ref peer, .. } if *peer == viewer_id)
+    );
     {
         let log = viewer.session_log.lock().unwrap();
         for id in [a, b] {
@@ -1877,39 +1901,45 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
         }
     }
 
-    // One session per remote: a second connect is refused, the first lives on.
+    // One session per remote: a second connect is refused, and A lives on.
     assert_eq!(
         viewer.engine.connect(&host_a.uuid, None),
         Err(ConnectError::AlreadyConnected(a))
     );
-    assert_eq!(viewer.engine.viewer_sessions(), vec![a, b]);
+    let a_now = presented(&surface_a);
+    eventually("A still presents after the refused connect", t, || {
+        presented(&surface_a) > a_now + 10
+    })
+    .await;
 
-    // Ending A leaves B live.
-    viewer.engine.disconnect(a);
-    eventually("host A's session ended", t, || {
-        matches!(host_a.engine.role(), Role::Idle)
-    })
-    .await;
-    assert_eq!(viewer.engine.viewer_sessions(), vec![b]);
-    let before = surface_b.state().presented.len();
-    eventually("B keeps presenting", t, || {
-        surface_b.state().presented.len() > before + 10
-    })
-    .await;
-    assert!(matches!(host_b.engine.role(), Role::Host { .. }));
-
-    // A link death in B ends B, with its own Ended and Released.
-    eventually("A is released", t, || {
-        let log = viewer.session_log.lock().unwrap();
-        log.iter().any(|(s, k)| *s == a && k == "released")
-    })
-    .await;
+    // A link death in B, while both are live, ends only B.
     viewer.engine.test_sever(b);
-    eventually("B ended on its own link", t, || {
+    eventually("B ended on its own link and was released", t, || {
         let log = viewer.session_log.lock().unwrap();
         log.iter()
             .any(|(s, k)| *s == b && k.starts_with("ended:LinkLost"))
             && log.iter().any(|(s, k)| *s == b && k == "released")
+    })
+    .await;
+    let a_after_sever = presented(&surface_a);
+    eventually("A keeps presenting after B's link died", t, || {
+        presented(&surface_a) > a_after_sever + 10
+    })
+    .await;
+    assert!(!ended(a), "A did not end");
+    assert_eq!(viewer.engine.viewer_sessions(), vec![a]);
+    assert!(matches!(host_a.engine.role(), Role::Host { .. }));
+    assert!(!surface_b.state().visible, "B's surface is hidden");
+
+    // Ending A, by the user.
+    viewer.engine.disconnect(a);
+    eventually("A released", t, || {
+        let log = viewer.session_log.lock().unwrap();
+        log.iter().any(|(s, k)| *s == a && k == "released")
+    })
+    .await;
+    eventually("host A's session ended", t, || {
+        matches!(host_a.engine.role(), Role::Idle)
     })
     .await;
     assert!(viewer.engine.viewer_sessions().is_empty());
@@ -1922,5 +1952,77 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
     assert!(
         log.iter().any(|(s, k)| *s == a && k == "ended:UserClosed"),
         "{log:?}"
+    );
+}
+
+/// Ending a session while its start is still building it (a slow ICE gather)
+/// waits for the start to finish, then ends it for real: its threads are
+/// joined before `Released`, its surface is hidden, its sinks are gone and the
+/// OS cursor is restored — nothing it built outlives the end (P2 review M2).
+#[cfg(feature = "test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ending_a_session_during_its_start_leaves_nothing_behind() {
+    let relay = start_relay().await;
+    let host = start_peer("slow-start-host", &relay);
+    let viewer = start_peer("slow-start-viewer", &relay);
+    let t = Duration::from_secs(20);
+    eventually("both registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    viewer.engine.test_delay_viewer_start(1500);
+    let id = viewer
+        .engine
+        .connect(&host.uuid, None)
+        .expect("not hosting");
+    eventually("accepted, the start under way", t, || {
+        viewer
+            .session_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(s, k)| *s == id && k == "negotiating")
+    })
+    .await;
+    // The offer arrives within the delay; end while the start is building.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    viewer.engine.disconnect(id);
+    eventually("ended and released", t, || {
+        let log = viewer.session_log.lock().unwrap();
+        let kinds: Vec<&str> = log
+            .iter()
+            .filter(|(s, _)| *s == id)
+            .map(|(_, k)| k.as_str())
+            .collect();
+        kinds.contains(&"ended:UserClosed") && kinds.last() == Some(&"released")
+    })
+    .await;
+    {
+        let s = viewer.platform.surface.state();
+        assert!(!s.visible, "the surface is hidden");
+        assert!(!s.cursor_control, "the OS cursor is restored");
+    }
+    assert!(viewer.engine.viewer_sessions().is_empty());
+    eventually("the host's session ended too", t, || {
+        matches!(host.engine.role(), Role::Idle)
+    })
+    .await;
+
+    // Waiting for every session to be released, as Quit does, returns with
+    // nothing left running.
+    viewer.engine.test_delay_viewer_start(0);
+    viewer
+        .engine
+        .connect(&host.uuid, None)
+        .expect("released, so free again");
+    eventually("connected again", t, || {
+        matches!(viewer.engine.role(), Role::Viewer { .. })
+    })
+    .await;
+    viewer.engine.end_all_and_wait(Duration::from_secs(3)).await;
+    assert!(viewer.engine.viewer_sessions().is_empty());
+    assert!(
+        viewer.engine.connect(&host.uuid, None).is_ok(),
+        "nothing is still ending"
     );
 }

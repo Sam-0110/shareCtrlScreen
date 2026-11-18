@@ -115,7 +115,7 @@ pub(super) struct Driver {
     /// thread on a dead link, or the engine on a disconnect.
     pub(super) ended: Arc<AtomicBool>,
     /// Where a dead link is reported, for the engine to end this session.
-    pub(super) end_tx: tokio::sync::mpsc::UnboundedSender<(crate::SessionId, crate::EndReason)>,
+    pub(super) end_tx: tokio::sync::mpsc::UnboundedSender<crate::EndRequest>,
     pub(super) id: crate::SessionId,
     /// The bound UDP socket (candidates were gathered from it before the SDP was
     /// generated, so the peer receives them embedded in the offer/answer).
@@ -226,7 +226,11 @@ pub(super) fn transport_driver(d: Driver) {
                 }
                 // The engine ends it (events, teardown) — the flag is already
                 // set, so it does not run twice.
-                let _ = end_tx.send((id, crate::EndReason::LinkLost(reason.to_string())));
+                let _ = end_tx.send(crate::EndRequest {
+                    id,
+                    reason: crate::EndReason::LinkLost(reason.to_string()),
+                    if_unanswered: None,
+                });
             }
             first
         }

@@ -109,8 +109,17 @@ pub fn handle_menu_event(app: &tauri::AppHandle, id: &str) -> bool {
         OPEN_ID => crate::raise_main_window(app),
         QUIT_ID => {
             tracing::info!("Quit from the tray: ending any session and exiting");
-            app.state::<AppState>().engine.end_all();
-            app.exit(0);
+            // Exit only once every session is released (≤ 3 s): a host's
+            // transport thread then has released remotely held keys and
+            // sent its Bye (08a §6.17, I9).
+            let engine = app.state::<AppState>().engine.clone();
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                engine
+                    .end_all_and_wait(std::time::Duration::from_secs(3))
+                    .await;
+                app.exit(0);
+            });
         }
         _ => return false,
     }

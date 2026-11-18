@@ -113,6 +113,8 @@ pub enum EndReason {
     Rejected(String),
     /// Cancelled because this computer started hosting meanwhile (D1).
     Busy,
+    /// The host did not answer in time.
+    Timeout,
     /// The signaling server reports the other computer offline.
     Offline,
     /// The link died (no response, transport error).
@@ -134,6 +136,7 @@ impl EndReason {
                 Some("Connection cancelled: someone connected to this computer meanwhile".into())
             }
             EndReason::Offline => Some("Peer offline".into()),
+            EndReason::Timeout => Some("No answer — timed out".into()),
             EndReason::LinkLost(why) => Some(format!("Disconnected: {why}")),
             EndReason::Failed(why) => Some(format!("Session ended: {why}")),
         }

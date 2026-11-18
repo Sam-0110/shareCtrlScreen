@@ -88,10 +88,9 @@ fn session(
             }),
         )],
         SessionEvent::Phase(SessionPhase::Ended(reason)) => {
-            // A session that ended takes its monitor list and its pop-out
-            // windows with it.
+            // A session that ended takes its monitor list with it; its pop-out
+            // windows go when it is released (below).
             update_monitor_menu(handle, &[], "", false, &[]);
-            popout::close_all(handle, engine);
             let mut out = Vec::new();
             if let Some(message) = reason.message() {
                 out.push(("toast", json!({ "message": message })));
@@ -120,7 +119,12 @@ fn session(
                 displays_json(&list, &current, can_switch, &popouts),
             )]
         }
-        // Nothing to release yet: every session shares the one main surface.
-        SessionEvent::Released => Vec::new(),
+        // Its threads are joined: the pop-out windows' surfaces are free, so
+        // the windows can be destroyed. (The main surface is the app's and
+        // stays.)
+        SessionEvent::Released => {
+            popout::close_session(handle, engine, id);
+            Vec::new()
+        }
     }
 }

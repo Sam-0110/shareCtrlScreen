@@ -95,6 +95,11 @@ pub enum ConnectError {
     SignedOut,
     /// A session with that computer already exists (one per remote, I1).
     AlreadyConnected(SessionId),
+    /// A session with that computer, or on that surface, is still ending:
+    /// its threads are being joined (it holds both until it is released).
+    Ending(SessionId),
+    /// Another session presents on that surface.
+    SurfaceInUse(SessionId),
     /// That is this computer's own ID.
     SelfId,
     /// Not a computer ID.
@@ -110,6 +115,10 @@ impl std::fmt::Display for ConnectError {
             ConnectError::Switching => "The account is being switched: try again in a moment",
             ConnectError::SignedOut => "Sign in to the account first",
             ConnectError::AlreadyConnected(_) => "You are already connected to that computer",
+            ConnectError::Ending(_) => {
+                "Still disconnecting from that computer: try again in a moment"
+            }
+            ConnectError::SurfaceInUse(_) => "That window already shows another computer",
             ConnectError::SelfId => "That's this computer's ID",
             ConnectError::InvalidId => "That does not look like a valid ID",
         })
@@ -117,6 +126,16 @@ impl std::fmt::Display for ConnectError {
 }
 
 impl std::error::Error for ConnectError {}
+
+/// A session to end, sent to the engine by a thread that holds no engine (a
+/// transport thread whose link died) or by a timer.
+pub(crate) struct EndRequest {
+    pub(crate) id: SessionId,
+    pub(crate) reason: EndReason,
+    /// Only if the session's request is still this attempt, unanswered (the
+    /// answer timeout of one connect-request, 08a §5.2).
+    pub(crate) if_unanswered: Option<u64>,
+}
 
 /// The engine. Owns config, the signaling client and the sessions.
 pub struct Engine {
@@ -134,10 +153,14 @@ pub struct Engine {
     ws_changed: Arc<tokio::sync::Notify>,
     /// The sessions: the host one, the viewer ones, the admission in progress
     /// (session/registry.rs). Locked after `ws`; nothing is taken under it.
-    reg: Mutex<session::registry::Registry>,
+    /// Shared with the reapers, which release ended sessions (`Arc`).
+    reg: Arc<Mutex<session::registry::Registry>>,
     /// Sessions whose link died on their transport thread, for the engine to
     /// end (the thread holds no engine).
-    end_tx: tokio::sync::mpsc::UnboundedSender<(SessionId, EndReason)>,
+    end_tx: tokio::sync::mpsc::UnboundedSender<EndRequest>,
+    /// The runtime the engine was started in, for its timers (UI commands
+    /// may call in from threads outside it).
+    rt: tokio::runtime::Handle,
     signaling: SignalingClient,
     /// Whether the signaling socket is currently registered with the server. The
     /// UI queries this on boot because the one-shot `ServerStatus` event can fire
@@ -173,6 +196,11 @@ pub struct Engine {
     /// key without a reconnect. Kept equal to the workspace's preference.
     translate_modifiers: Arc<AtomicBool>,
     ice_policy: Mutex<IcePolicy>,
+    /// Test hook (`test-hooks` feature only): how long a viewer session's
+    /// start waits before building anything (ms), so a test can end a session
+    /// in the middle of its start.
+    #[cfg(feature = "test-hooks")]
+    test_start_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Engine {
@@ -208,8 +236,9 @@ impl Engine {
             writable: AtomicBool::new(loaded.writable),
             ws: Mutex::new(ws),
             ws_changed: Arc::new(tokio::sync::Notify::new()),
-            reg: Mutex::new(Default::default()),
+            reg: Arc::new(Mutex::new(Default::default())),
             end_tx,
+            rt: tokio::runtime::Handle::current(),
             signaling,
             connected: Arc::new(AtomicBool::new(false)),
             decider,
@@ -223,14 +252,16 @@ impl Engine {
             surface: Mutex::new(None),
             translate_modifiers,
             ice_policy: Mutex::new(IcePolicy::Full),
+            #[cfg(feature = "test-hooks")]
+            test_start_delay_ms: Default::default(),
         });
         // Sessions whose link died end here, one at a time. Weak: this task
         // must not keep the engine alive.
         let weak = Arc::downgrade(&engine);
         tokio::spawn(async move {
-            while let Some((id, reason)) = end_rx.recv().await {
+            while let Some(req) = end_rx.recv().await {
                 let Some(engine) = weak.upgrade() else { return };
-                engine.end(id, reason);
+                engine.end_requested(req);
             }
         });
         // Host passwords the migration did not carry over (automatic sign-in
@@ -556,9 +587,7 @@ impl Engine {
 
     /// Where a session's transport thread reports that its link died (it
     /// holds no engine): the engine ends that session (see `start`).
-    pub(crate) fn ended_sender(
-        &self,
-    ) -> tokio::sync::mpsc::UnboundedSender<(SessionId, EndReason)> {
+    pub(crate) fn ended_sender(&self) -> tokio::sync::mpsc::UnboundedSender<EndRequest> {
         self.end_tx.clone()
     }
 }
@@ -621,5 +650,16 @@ impl Engine {
         if let Some(s) = session {
             s.sever();
         }
+    }
+
+    /// Make every viewer session's start wait `ms` before building anything,
+    /// so a test can end it in the middle of its start.
+    #[doc(hidden)]
+    pub fn test_delay_viewer_start(&self, ms: u64) {
+        self.test_start_delay_ms.store(ms, Ordering::SeqCst);
+    }
+
+    pub(crate) fn test_viewer_start_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.test_start_delay_ms.load(Ordering::SeqCst))
     }
 }

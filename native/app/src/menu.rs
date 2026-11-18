@@ -173,15 +173,19 @@ pub(crate) fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::Menu
         }
         other => {
             // The Monitor menu belongs to the viewer session on screen (one
-            // until the tab UI, plans/08 P4).
+            // until the tab UI, plans/08 P4) — or, when hosting, to this
+            // computer's own shared monitor.
             let engine = &app.state::<AppState>().engine;
-            let Some(session) = engine.viewer_sessions().first().copied() else {
-                return;
-            };
+            let viewer = engine.viewer_sessions().first().copied();
             if let Some(id) = other.strip_prefix(MENU_DISPLAY_PREFIX) {
-                engine.select_display(session, id.to_string());
+                match viewer {
+                    Some(session) => engine.select_display(session, id.to_string()),
+                    None => engine.host_select_display(id.to_string()),
+                }
             } else if let Some(id) = other.strip_prefix(MENU_POPOUT_PREFIX) {
-                engine.popout_display(session, id.to_string());
+                if let Some(session) = viewer {
+                    engine.popout_display(session, id.to_string());
+                }
             }
         }
     }
