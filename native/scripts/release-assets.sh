@@ -211,6 +211,19 @@ package_windows() {
     echo "error: $service missing; run the build phase first" >&2
     return 1
   }
+  # Neither exe may import the VC++ runtime DLL: a clean Windows has no VCRUNTIME140.dll
+  # (it comes with the Visual C++ Redistributable), and an exe that imports it does not
+  # start there (STATUS_DLL_NOT_FOUND, exit -1073741515; the installer then aborts at
+  # its service step). CI runners have the redistributable, so only this check catches
+  # it. The app links it statically through tauri-build, the service through its
+  # build.rs (static_vcruntime). The DLL name sits in the PE import table as ASCII.
+  local exe
+  for exe in "$service" "$target_dir/release/sharectrl.exe"; do
+    if grep -aqi 'vcruntime140' "$exe"; then
+      echo "error: $exe imports VCRUNTIME140.dll; it would not start on a clean Windows (link the VC runtime statically: static_vcruntime)" >&2
+      return 1
+    fi
+  done
   cp "$setup" "$dist/"
   # Updater signature for the NSIS installer (task U1): present only when the build
   # was signed (createUpdaterArtifacts + TAURI_SIGNING_PRIVATE_KEY). The in-app
