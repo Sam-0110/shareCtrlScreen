@@ -267,7 +267,6 @@ fn main() {
             accounts::account_sync,
             accounts::account_sign_out,
             commands::get_server_status,
-            commands::get_role,
             commands::tab_open,
             commands::tab_connect,
             commands::tab_disconnect,

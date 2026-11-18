@@ -103,7 +103,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "codec-openh264",
  "elevation",
@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "capture"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "thiserror 2.0.19",
  "tracing",
@@ -880,7 +880,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "codec"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "thiserror 2.0.19",
  "tracing",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "codec-goldens"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "hex",
  "platform-api",
@@ -898,7 +898,7 @@ dependencies = [
 
 [[package]]
 name = "codec-openh264"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "bzip2-rs",
  "codec-goldens",
@@ -1489,7 +1489,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "elevation"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "thiserror 2.0.19",
  "tracing",
@@ -1524,7 +1524,7 @@ checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
 
 [[package]]
 name = "engine"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "futures-util",
  "hex",
@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "gen-keymap"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "thiserror 2.0.19",
 ]
@@ -2621,7 +2621,7 @@ dependencies = [
 
 [[package]]
 name = "input"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "parking_lot",
  "platform-api",
@@ -4032,7 +4032,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "platform-api"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "platform-api",
  "protocol",
@@ -4042,7 +4042,7 @@ dependencies = [
 
 [[package]]
 name = "platform-linux"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "arboard",
  "ashpd",
@@ -4084,7 +4084,7 @@ dependencies = [
 
 [[package]]
 name = "platform-macos"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "block2",
  "codec-goldens",
@@ -4119,7 +4119,7 @@ dependencies = [
 
 [[package]]
 name = "platform-windows"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "capture",
  "codec",
@@ -4303,7 +4303,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "protocol"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "hex",
  "serde",
@@ -4539,7 +4539,7 @@ dependencies = [
 
 [[package]]
 name = "render"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "input",
  "platform-api",
@@ -5071,7 +5071,7 @@ dependencies = [
 
 [[package]]
 name = "service"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "elevation",
  "platform-api",
@@ -5156,7 +5156,7 @@ dependencies = [
 
 [[package]]
 name = "signaling"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "futures-util",
  "protocol",
@@ -5225,7 +5225,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "smoketest"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "codec-openh264",
  "platform-api",
@@ -5415,7 +5415,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surface-wgpu"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "naga",
  "platform-api",
@@ -6278,7 +6278,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "2.1.15"
+version = "2.2.0"
 dependencies = [
  "bytes",
  "protocol",

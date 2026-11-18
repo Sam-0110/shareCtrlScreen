@@ -87,7 +87,11 @@ pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     api.prevent_close();
     // Every session, including tabs still connecting or waiting for a
     // password (a late accept must not go live behind a hidden window).
-    window.app_handle().state::<AppState>().engine.end_all();
+    let app = window.app_handle();
+    if let Some(tabs) = app.try_state::<std::sync::Arc<crate::tabs::TabManager>>() {
+        tabs.stop_starting();
+    }
+    app.state::<AppState>().engine.end_all();
     if let Err(e) = window.hide() {
         tracing::warn!("hiding the window to the tray failed: {e}");
     } else {

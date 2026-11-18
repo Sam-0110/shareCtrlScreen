@@ -24,8 +24,8 @@ The Cloudflare signaling server (`../server/`) and the JSON WebSocket protocol
 | `crates/input` | `SendInput` injection + adapter over the shared generated keymap (`platform_api::keymap`, Set-1 column) + `WH_KEYBOARD_LL` shortcut hook. Ported from `input.js`/`keyhook.js`. Unit-tested. |
 | `crates/render` | D3D11 flip-model present (§7): waitable swapchain, `ALLOW_TEARING`, NV12→RGB BT.709 shader. |
 | `crates/elevation` | SYSTEM service primitives (§8b): session detection, `WTSQueryUserToken`, `CreateProcessAsUser`, input-desktop follow, service install/uninstall. |
-| `crates/engine` | OS-independent orchestration: handshake state machine (approve/password, live view↔control), and the session (ICE, transport driver, media threads, clipboard/file sync) — all OS access via `platform-api`. |
-| `app/` | Tauri 2 binary: `#[tauri::command]`s, WebView2 UI host, native D3D child-HWND video, ported vanilla UI in `app/ui/`. |
+| `crates/engine` | OS-independent orchestration: handshake state machine (approve/password, live view↔control), the session registry (one host session or any number of viewer sessions, D1), the ActiveGate (the one tab on screen: video, input, clipboard, shortcut capture; background tabs pause their host), the account workspaces (config v2, sync) and each session (ICE, transport driver, media threads, clipboard/file sync) — all OS access via `platform-api`. |
+| `app/` | Tauri 2 binary: `#[tauri::command]`s, the TabManager (`src/tabs.rs`, the tab strip) and per-tab native video surfaces (`src/surfaces.rs`), accounts and sync (`src/accounts.rs`), the vanilla UI in `app/ui/` (ES modules; `tabs.js` draws the strip). Multi-session tabs: `plans/08-MULTI-SESSION-TABS.md`; device checks pending in `plans/checklists/TABS-P3.md`, `TABS-P4.md`, `TABS-P7.md`. |
 | `service/` | Thin SYSTEM service binary: SCM dispatcher + session-follow launch loop. |
 
 ## Build

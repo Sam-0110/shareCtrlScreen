@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
-use platform_api::{Platform, VideoSurface};
+use platform_api::Platform;
 use protocol::{Config, Permission, SignalMsg};
 use signaling::{Event as SigEvent, SignalingClient};
 use std::sync::Arc;
@@ -187,10 +187,6 @@ pub struct Engine {
         Mutex<std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<SignalMsg>>>,
     /// OS services.
     platform: Arc<dyn Platform>,
-    /// The app's main video surface, attached once its window exists (`None`
-    /// until then, and on platforms without one). Viewer sessions present on it
-    /// unless given their own.
-    surface: Mutex<Option<Arc<dyn VideoSurface>>>,
     /// The live "Translate modifiers for the remote OS" setting, shared with
     /// the running sessions' key translators so a change applies to the next
     /// key without a reconnect. Kept equal to the workspace's preference.
@@ -261,7 +257,6 @@ impl Engine {
             turn_servers: Arc::new(Mutex::new(Vec::new())),
             peer_queues: Mutex::new(Default::default()),
             platform,
-            surface: Mutex::new(None),
             translate_modifiers,
             ice_policy: Mutex::new(IcePolicy::Full),
             overlay: Arc::new(AtomicBool::new(false)),
@@ -578,12 +573,6 @@ impl Engine {
     /// The OS services this engine runs on.
     pub fn platform(&self) -> Arc<dyn Platform> {
         self.platform.clone()
-    }
-
-    /// Attach the app's main video surface: viewer sessions present on it
-    /// unless they are given their own ([`Engine::connect`]).
-    pub fn attach_surface(&self, surface: Arc<dyn VideoSurface>) {
-        *self.surface.lock() = Some(surface);
     }
 
     pub fn set_ice_policy(&self, policy: IcePolicy) {

@@ -346,7 +346,7 @@ impl Engine {
     // ---- viewer side (contract §3.2) ---------------------------------------------
 
     /// Connect out to `host_uuid` as a new viewer session presented on
-    /// `surface` (the app's main surface when `None`). Sends the first
+    /// `surface` (its tab's, made by the app). Sends the first
     /// connect-request and returns the new session's id.
     ///
     /// Refused mid-switch, while the selected account is signed out (I10,
@@ -360,7 +360,7 @@ impl Engine {
     pub fn connect(
         &self,
         host_uuid: &str,
-        surface: Option<Arc<dyn VideoSurface>>,
+        surface: Arc<dyn VideoSurface>,
     ) -> Result<SessionId, ConnectError> {
         let host_uuid = host_uuid.trim().to_lowercase();
         if !protocol::is_valid_uuid_v4(&host_uuid) {
@@ -369,7 +369,6 @@ impl Engine {
         if host_uuid == self.config.lock().uuid {
             return Err(ConnectError::SelfId);
         }
-        let surface = surface.or_else(|| self.surface.lock().clone());
         // Advertise only codecs this viewer can actually hardware-decode. A
         // hardcoded list (e.g. always claiming AV1) makes the host negotiate a
         // codec we cannot decode → the viewer media loop dies → black screen.
@@ -397,16 +396,14 @@ impl Engine {
             if let Some(ending) = reg.peer_in_use(&host_uuid) {
                 return Err(ConnectError::Ending(ending));
             }
-            if let Some(s) = &surface {
-                match reg.surface_in_use(s) {
-                    Some((other, true)) => return Err(ConnectError::Ending(other)),
-                    Some((other, false)) => return Err(ConnectError::SurfaceInUse(other)),
-                    None => {}
-                }
+            match reg.surface_in_use(&surface) {
+                Some((other, true)) => return Err(ConnectError::Ending(other)),
+                Some((other, false)) => return Err(ConnectError::SurfaceInUse(other)),
+                None => {}
             }
             let id = reg.reserve();
             let started_in = ws.sel.workspace_key().map(|k| (k.to_string(), ws.epoch));
-            let mut slot = ViewerSlot::requesting(host_uuid.clone(), surface);
+            let mut slot = ViewerSlot::requesting(host_uuid.clone(), Some(surface));
             slot.workspace = started_in.clone();
             reg.viewers.insert(id, slot);
             // Queued (not awaited) inside the section, so a switch's

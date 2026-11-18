@@ -387,7 +387,9 @@ impl Config {
             // accounts and workspaces it did not know. Bring them back, with
             // what the older version recorded meanwhile merged in.
             if let Some(kept) = read_v2_copy(path, &out.config.uuid, now) {
-                out.config = restore_after_downgrade(kept, out.config, now);
+                let (restored, orphaned) = restore_after_downgrade(kept, out.config, now);
+                out.config = restored;
+                out.forget_sealed.extend(orphaned);
                 out.notes.push(
                     "config: restored the accounts and workspaces kept from before a downgrade"
                         .to_string(),
@@ -523,7 +525,9 @@ fn read_v2_copy(path: &Path, uuid: &str, now: u64) -> Option<Config> {
 /// workspaces, the device settings as the older version last saved them, and
 /// what it recorded meanwhile (recents, names, saved passwords) merged into
 /// the workspace it belongs to by the sync rules — nothing is dropped.
-fn restore_after_downgrade(mut kept: Config, migrated: Config, now: u64) -> Config {
+/// Also returns the sealed passwords the older version saved for hosts that
+/// already had one here: no longer referenced, their store items go.
+fn restore_after_downgrade(mut kept: Config, migrated: Config, now: u64) -> (Config, Vec<String>) {
     kept.server_url = migrated.server_url;
     kept.mode = migrated.mode;
     kept.password_hash = migrated.password_hash;
@@ -538,17 +542,26 @@ fn restore_after_downgrade(mut kept: Config, migrated: Config, now: u64) -> Conf
             kept.accounts.push(account);
         }
     }
+    let mut orphaned = Vec::new();
     for (key, meanwhile) in migrated.workspaces {
-        // A password the older version saved for a host this workspace already
-        // has one for is left alone: its secret may be the very same item.
-        let _ = kept.workspace_mut(&key).absorb_local(meanwhile, now);
+        // The kept password wins for a host that has one. The older version's
+        // is dropped — unless it is the very same item (the older version
+        // kept the handle it was given), which must stay.
+        let workspace = kept.workspace_mut(&key);
+        let kept_handles: Vec<String> = workspace.saved_logins.values().cloned().collect();
+        orphaned.extend(
+            workspace
+                .absorb_local(meanwhile, now)
+                .into_iter()
+                .filter(|sealed| !kept_handles.contains(sealed)),
+        );
     }
     if migrated.active_account.is_some() {
         kept.active_account = migrated.active_account;
     }
     kept.config_version = CONFIG_VERSION;
     kept.normalize(now);
-    kept
+    (kept, orphaned)
 }
 
 /// Write `value` next to `path` as `config.<tag>.json`, once: an existing copy

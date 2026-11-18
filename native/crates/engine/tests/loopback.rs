@@ -169,7 +169,7 @@ impl Peer {
     fn open(&self, host: &str) -> SessionId {
         let id = self
             .engine
-            .connect(host, None)
+            .connect(host, self.platform.surface.clone())
             .expect("this computer is not hosting");
         self.engine.set_active(Some(id));
         id
@@ -232,7 +232,6 @@ fn start_peer_full(
 
     let (engine, mut ui_rx, mut sig_rx) = Engine::start(platform.clone(), decider);
     engine.set_ice_policy(IcePolicy::LoopbackOnly);
-    engine.attach_surface(platform.surface.clone());
 
     // The same dispatch path as the app: per-peer tasks.
     let e = engine.clone();
@@ -485,7 +484,10 @@ async fn a_cancelled_password_prompt_does_not_leave_this_computer_busy() {
     })
     .await;
     // And while hosting, this computer cannot connect out (D1).
-    assert!(me.engine.connect(&locked.uuid, None).is_err());
+    assert!(me
+        .engine
+        .connect(&locked.uuid, me.platform.surface.clone())
+        .is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1724,7 +1726,10 @@ async fn accounts_keep_their_own_workspaces() {
         .await;
     assert!(e.workspace().is_none());
     assert!(e.set_remote_name(X, "nope").is_empty());
-    assert_eq!(e.connect(X, None), Err(ConnectError::SignedOut));
+    assert_eq!(
+        e.connect(X, me.platform.surface.clone()),
+        Err(ConnectError::SignedOut)
+    );
     // Its settings still apply while it is signed out (a host keeps the
     // clipboard off when that was chosen).
     assert!(!e.prefs().clipboard_sync);
@@ -1848,7 +1853,7 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
     let a_before_b = presented(&surface_a);
     let b = viewer
         .engine
-        .connect(&host_b.uuid, Some(surface_b.clone()))
+        .connect(&host_b.uuid, surface_b.clone())
         .expect("not hosting");
     assert_ne!(a, b);
     let viewer_id = viewer.uuid.clone();
@@ -2005,7 +2010,9 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
 
     // One session per remote: a second connect is refused, and A lives on.
     assert_eq!(
-        viewer.engine.connect(&host_a.uuid, None),
+        viewer
+            .engine
+            .connect(&host_a.uuid, viewer.platform.surface.clone()),
         Err(ConnectError::AlreadyConnected(a))
     );
     let a_now = presented(&surface_a);
@@ -2112,7 +2119,7 @@ async fn ending_a_session_during_its_start_leaves_nothing_behind() {
     viewer.engine.test_delay_viewer_start(0);
     viewer
         .engine
-        .connect(&host.uuid, None)
+        .connect(&host.uuid, viewer.platform.surface.clone())
         .expect("released, so free again");
     eventually("connected again", t, || {
         matches!(viewer.engine.role(), Role::Viewer { .. })
@@ -2121,7 +2128,10 @@ async fn ending_a_session_during_its_start_leaves_nothing_behind() {
     viewer.engine.end_all_and_wait(Duration::from_secs(3)).await;
     assert!(viewer.engine.viewer_sessions().is_empty());
     assert!(
-        viewer.engine.connect(&host.uuid, None).is_ok(),
+        viewer
+            .engine
+            .connect(&host.uuid, viewer.platform.surface.clone())
+            .is_ok(),
         "nothing is still ending"
     );
 }

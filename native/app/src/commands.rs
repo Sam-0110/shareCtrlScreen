@@ -112,15 +112,6 @@ pub fn get_server_status(state: tauri::State<'_, AppState>) -> String {
     }
 }
 
-#[tauri::command]
-pub fn get_role(state: tauri::State<'_, AppState>) -> String {
-    match state.engine.role() {
-        Role::Idle => "idle".into(),
-        Role::Host { .. } => "host".into(),
-        Role::Viewer { .. } => "viewer".into(),
-    }
-}
-
 // ---- tabs (plans/08 P4, 08a §4.1) ----------------------------------------------
 // Each command changes the TabManager; the UI redraws from the `tabs-changed`
 // snapshot that follows, never from a command's answer (only `needsConfirm`,

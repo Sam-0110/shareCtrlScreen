@@ -21,7 +21,7 @@
 //!   thread, sends an event or awaits while holding it.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -148,6 +148,9 @@ pub(crate) struct TabManager {
     /// The app is exiting: no connection starts any more (Connect all
     /// included), so the sessions being ended stay ended (I9).
     closing: AtomicBool,
+    /// Bumped by [`stop_starting`](Self::stop_starting): a connection being
+    /// set up, and Connect all, stop when it changed since they began.
+    stops: AtomicU64,
 }
 
 impl TabManager {
@@ -158,7 +161,17 @@ impl TabManager {
             engine,
             inner: Mutex::default(),
             closing: AtomicBool::new(false),
+            stops: AtomicU64::new(0),
         })
+    }
+
+    /// Stop the connections being set up and a running Connect all (the
+    /// window went to the tray: nothing may go live behind it). Later
+    /// commands connect as usual.
+    /// (Only the Windows service host hides to a tray.)
+    #[cfg(windows)]
+    pub(crate) fn stop_starting(&self) {
+        self.stops.fetch_add(1, Ordering::SeqCst);
     }
 
     /// The app is about to exit: start nothing new. Call before ending the
@@ -232,6 +245,7 @@ impl TabManager {
         // The workspace it is connected in: a switch while the surface is
         // being made stops it (it would start in the next one, unreachable).
         let epoch = self.engine.workspace_epoch();
+        let stops = self.stops.load(Ordering::SeqCst);
         {
             let mut inner = self.lock();
             if inner.starting.contains(&remote) || connected(&inner, &remote) {
@@ -252,7 +266,7 @@ impl TabManager {
         // down (its threads joined): a quick reconnect waits for that.
         let deadline = Instant::now() + ENDING_WAIT;
         let connected = loop {
-            match self.try_connect(&remote, &made, epoch, Instant::now() < deadline) {
+            match self.try_connect(&remote, &made, (epoch, stops), Instant::now() < deadline) {
                 Attempt::Retry => tokio::time::sleep(ENDING_POLL).await,
                 Attempt::Connected => break true,
                 Attempt::Stopped => break false,
@@ -272,20 +286,21 @@ impl TabManager {
         &self,
         remote: &str,
         made: &Result<Arc<dyn VideoSurface>, String>,
-        epoch: u64,
+        (epoch, stops): (u64, u64),
         may_retry: bool,
     ) -> Attempt {
         let mut inner = self.lock();
         let stopped = inner.cancelled.remove(remote)
             || self.closing.load(Ordering::SeqCst)
             || self.engine.workspace_epoch() != epoch
+            || self.stops.load(Ordering::SeqCst) != stops
             || !self.is_open(remote);
         let refused = if stopped {
             None
         } else {
             match made {
                 Err(e) => Some(e.clone()),
-                Ok(surface) => match self.engine.connect(remote, Some(surface.clone())) {
+                Ok(surface) => match self.engine.connect(remote, surface.clone()) {
                     Ok(id) => {
                         inner.starting.remove(remote);
                         inner.surfaces.insert(id, surface.clone());
@@ -443,13 +458,15 @@ impl TabManager {
             return Started::NeedsConfirm { would_be };
         }
         let epoch = self.engine.workspace_epoch();
+        let stops = self.stops.load(Ordering::SeqCst);
         let me = self.clone();
         tauri::async_runtime::spawn(async move {
             for (i, remote) in pending.into_iter().enumerate() {
                 if i > 0 {
                     tokio::time::sleep(CONNECT_ALL_STAGGER).await;
                 }
-                if me.engine.workspace_epoch() != epoch {
+                if me.engine.workspace_epoch() != epoch || me.stops.load(Ordering::SeqCst) != stops
+                {
                     return;
                 }
                 if let Err(e) = me.connect(&remote, true).await {

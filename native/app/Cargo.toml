@@ -30,7 +30,7 @@ tauri-plugin-process = "2.4.0"
 # (already in the deny/about allow-lists). `that_detached` does not wait on the
 # browser process.
 open = "5"
-# Account sync of remote IDs (`src/account.rs`): the same reqwest + rustls
+# Account sync of remote IDs (`src/accounts.rs`): the same reqwest + rustls
 # client the updater plugin above already builds with (same versions and
 # features, so no new crates). rustls is named only to install its `ring`
 # provider, as the updater does, since reqwest is built without one.

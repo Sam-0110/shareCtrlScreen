@@ -142,7 +142,7 @@ been tested on hardware.
 | Hardware video encode | Yes (Media Foundation, H.264 and HEVC) | Yes (VideoToolbox, H.264 and HEVC) | Intel and AMD via VA-API, when libva is 2.20 or newer. NVIDIA via NVENC (optional) | Same as X11 |
 | Hardware video decode | Yes (Direct3D 11) | Yes (VideoToolbox). AV1 on M3 and later | Intel and AMD via VA-API, when libva is 2.20 or newer. NVIDIA via NVDEC (optional) | Same as X11 |
 | Software video (OpenH264) | Not yet (planned: downloaded from Cisco on first use) | Yes, downloaded from Cisco on first use | Yes, downloaded from Cisco on first use | Yes, downloaded from Cisco on first use |
-| Saved passwords | Yes (Windows DPAPI) | Yes (Keychain) | Yes with a Secret Service keyring (GNOME Keyring or KWallet). Without one, nothing is saved | Same as X11 |
+| Saved passwords (remembered by default, one per computer and account workspace) | Yes (Windows DPAPI) | Yes (Keychain) | Yes with a Secret Service keyring (GNOME Keyring or KWallet). Without one, nothing is saved | Same as X11 |
 | Start at sign-in | Yes (per-user; the installed app leaves this to the service instead, which starts the host at every sign-in) | Yes (LaunchAgent) | Yes (XDG autostart) | Yes (XDG autostart) |
 
 Software video is used whenever no hardware codec is available. Its download needs an
@@ -200,21 +200,49 @@ While a session is running, the host's session panel can switch the permission
 between `view` and `control` at any time — it takes effect immediately, without
 reconnecting — and can end the session.
 
-**Accounts: sync your remote IDs** (native app, ⚙ Settings → Account). Accounts
-are optional. Connecting never needs one. Create an account on one computer and
-sign in to it on the others. The remote IDs you name, the recent IDs you connect
-to, and **Clear** on the recents then stay the same on every signed-in computer.
-The app syncs at sign-in and at startup, shortly after any change, when the
-window comes to the front, and every 5 minutes. **Sync now** forces a sync.
-When the same ID is renamed on two computers, the newer name wins. Removing a
-name also syncs. Signing out keeps the IDs already on that computer.
+**Tabs: several computers at once** (native app). Each remote computer you connect
+to opens as a tab in the strip at the top of the window; **+** opens the connect
+page for another one. Only the tab on screen shows its picture, takes your keyboard,
+mouse and clipboard, and holds shortcut capture; the computers in background tabs
+pause their video (an older version on the other side keeps sending, and the tab
+keeps decoding it without drawing it). Switch tabs by clicking or with
+**Ctrl+Alt+PageDown / PageUp** (**Cmd+Option+PageDown / PageUp** on macOS); that chord
+always stays on this computer. Double-click a tab to rename the computer, drag it to
+reorder, **×** to close it. Each tab shows its own password prompt, connection
+progress and why it disconnected. Passwords are remembered by default (one per
+computer, per account workspace); a tab that signs in by itself says so and offers
+**Forget saved password**. **Connect all** connects every disconnected tab, one
+every half second; going past 8 connected tabs asks first. The open tabs, their
+names and order come back after a restart, disconnected — nothing connects by
+itself. Closing the app ends every session first. While another computer is viewing
+this one, no tab can connect (and the other way round).
+
+**Accounts: your tabs, names and settings on every computer** (native app, ⚙ Settings
+→ Account). Accounts are optional; connecting never needs one. Without one,
+everything is kept on this computer. An account owns a whole **workspace**: the
+open tabs and their order, the names you give computers, the recents (and
+**Clear**), the synced preferences (modifier translation, shortcut capture,
+clipboard sharing, pasting dropped files) and the saved host passwords (these stay
+on each computer, never synced). Creating an account takes this computer's
+workspace with it. Signing in to an existing one while this computer has its own
+tabs or names asks once: **Add** them to the account, or **Keep separate**. Several
+accounts can be known on one computer; switching, signing out or removing one
+disconnects every tab, and a signed-out account's workspace is hidden until it is
+signed in again (the computer's own workspace is always there). The app syncs at
+sign-in and at startup, shortly after any change, when the window comes to the
+front, and every 5 minutes; **Sync now** forces one. The newer change wins: a
+rename, a reorder, a close. A tab closed on another computer while it is connected
+here stays until it disconnects. Closed tabs are remembered for 90 days, so a
+computer offline for longer than that may bring one back.
 
 - The account lives on the signaling server in **Server URL** (`wss://host/ws` →
   `https://host/api/...`; see `server/src/accounts.js`). The server stores a
   PBKDF2 hash of the password, hashes of the sign-in tokens, and the ID list
   (IDs, names, and last-connected times).
-- The sign-in token is kept in the app's `config.json`. It can only read and
-  replace the ID list. Connecting to a machine still needs that machine's approval
+- The sign-in token is kept in the OS secret store (Windows DPAPI, the macOS
+  Keychain, a Secret Service keyring on Linux), never in `config.json`; without
+  **Keep me signed in** it is not kept at all. It can only read and replace the
+  account's workspace. Connecting to a machine still needs that machine's approval
   or password. Wrong passwords lock sign-in to the account for 15 minutes after
   10 tries. With the `AUTH_LIMITER` binding, each IP address is also limited to 20
   sign-in or sign-up attempts per minute.
@@ -243,6 +271,12 @@ On a **service install** (the Windows installer) the update runs the installer s
 which stops the service, replaces the files and restarts the service — the service then
 relaunches the host, so there is never a second instance. On a portable install the app
 restarts itself.
+
+**2.2 changes the settings file** (accounts and tabs). Updating from 2.1.x moves
+everything over and keeps a copy of the old file (`config.v1.json`) next to it.
+Going back to a 2.1.x version afterwards works, but it shows no recents or names and
+is signed out; updating to 2.2 again brings everything back, with what 2.1.x recorded
+meanwhile merged in.
 
 ## Packaging
 
