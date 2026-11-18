@@ -36,8 +36,9 @@ pub const FRACTION_ONE: u16 = 10_000;
 /// bottom). Far above any real desk; a larger one is dropped as invalid.
 pub const MAX_MONITOR: u8 = 15;
 
-/// A detached window's state.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+/// A detached window's state. Deliberately not `Ord`: equal stamps are
+/// broken by the wire name ([`as_str`](Self::as_str)), as in JS.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WinState {
     #[default]
     Normal,
@@ -143,6 +144,32 @@ impl SyncTab {
         self.opened_at > self.closed_at
     }
 
+    /// Open and in a window of its own. A detach happens while the tab is
+    /// open, so it is stamped after that opening; a later reopen (also by an
+    /// older computer that knows nothing of windows) makes it stale, and the
+    /// tab comes back in the strip (09 §7, answer 9).
+    pub fn is_detached(&self) -> bool {
+        self.is_open() && self.detached && self.detached_at > self.opened_at
+    }
+
+    /// Its window's size, state and position as saved since it was last
+    /// opened (older ones belong to a window a reopen forgot, as above).
+    pub fn window_size(&self) -> Option<Size> {
+        self.size.filter(|_| self.size_at > self.opened_at)
+    }
+
+    pub fn window_pos(&self) -> Option<Pos> {
+        self.pos.filter(|_| self.pos_at > self.opened_at)
+    }
+
+    pub fn window_state(&self) -> WinState {
+        if self.state_at > self.opened_at {
+            self.state
+        } else {
+            WinState::Normal
+        }
+    }
+
     /// Fold `other` in: for each field the later stamp wins; on equal stamps
     /// the larger value (the key itself; `true` over `false`; the state's
     /// name in code-point order; a known size or position over none, then
@@ -220,10 +247,20 @@ fn is_normal(v: &WinState) -> bool {
 
 /// A share in ten-thousandths, if `v` is one within `lo..=FRACTION_ONE`.
 fn fraction(v: Option<&serde_json::Value>, lo: u16) -> Option<u16> {
-    let n = v?.as_u64()?;
+    let n = whole(v?)?;
     u16::try_from(n)
         .ok()
         .filter(|n| (lo..=FRACTION_ONE).contains(n))
+}
+
+/// A non-negative whole number, also when written as one with a fraction
+/// (`5000.0`): JavaScript cannot tell them apart, so the server accepts both.
+fn whole(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64().or_else(|| {
+        v.as_f64()
+            .filter(|f| f.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(f))
+            .map(|f| f as u64)
+    })
 }
 
 /// Lenient: anything but `true` reads as `false`.
@@ -251,7 +288,7 @@ fn size_from(v: &serde_json::Value) -> Option<Size> {
 }
 
 fn pos_from(v: &serde_json::Value) -> Option<Pos> {
-    let monitor = u8::try_from(v.get("monitor")?.as_u64()?)
+    let monitor = u8::try_from(whole(v.get("monitor")?)?)
         .ok()
         .filter(|m| *m <= MAX_MONITOR)?;
     Some(Pos {
@@ -282,6 +319,36 @@ mod tests {
             closed_at,
             ..SyncTab::default()
         }
+    }
+
+    #[test]
+    fn a_reopen_by_an_older_computer_brings_the_tab_back_to_the_strip() {
+        let mut tab = t("m", 1, 10, 0);
+        tab.detached = true;
+        tab.detached_at = 12;
+        tab.size = Some(Size { w: 5000, h: 5000 });
+        tab.size_at = 13;
+        tab.state = WinState::Maximized;
+        tab.state_at = 13;
+        assert!(tab.is_detached());
+        assert_eq!(tab.window_state(), WinState::Maximized);
+        // Closed and reopened where windows are unknown: only the stamps move.
+        tab.merge(&t("m", 1, 0, 20));
+        assert!(!tab.is_detached(), "closed");
+        tab.merge(&t("m", 1, 30, 0));
+        assert!(tab.is_open() && !tab.is_detached(), "reopened in the strip");
+        assert_eq!(tab.window_size(), None, "its old window is forgotten");
+        assert_eq!(tab.window_state(), WinState::Normal);
+    }
+
+    #[test]
+    fn whole_numbers_written_with_a_fraction_still_read() {
+        let tab: SyncTab = serde_json::from_str(
+            r#"{"order":"m","size":{"w":5000.0,"h":1e3},"pos":{"monitor":1.0,"x":-0.0,"y":2.5}}"#,
+        )
+        .unwrap();
+        assert_eq!(tab.size, Some(Size { w: 5000, h: 1000 }));
+        assert_eq!(tab.pos, None, "2.5 is not a share");
     }
 
     #[test]

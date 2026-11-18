@@ -109,11 +109,11 @@ function mergeTab(into, other) {
     a.stateAt = b.stateAt;
   }
   if (laterOrLarger(b.sizeAt, b.size, a.sizeAt, a.size, cmpMaybe(["w", "h"]))) {
-    a.size = b.size;
+    a.size = b.size && { ...b.size };
     a.sizeAt = b.sizeAt;
   }
   if (laterOrLarger(b.posAt, b.pos, a.posAt, a.pos, cmpMaybe(["monitor", "x", "y"]))) {
-    a.pos = b.pos;
+    a.pos = b.pos && { ...b.pos };
     a.posAt = b.posAt;
   }
   for (const [k, v] of Object.entries(PLACEMENT_DEFAULTS)) {

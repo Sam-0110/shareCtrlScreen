@@ -48,8 +48,10 @@ pub const MAX_SYNC_ENTRIES: usize = 500;
 /// server never receives (and drops) them.
 pub const FEATURE_PREFS: &str = "prefs";
 pub const FEATURE_TABS: &str = "tabs";
-/// Detached windows' placement in tabs (plans/09 W4): sent only to a
-/// server that lists it, which validates and merges those fields.
+/// Detached windows' placement in tabs (plans/09): a server that lists it
+/// validates and merges those fields. Until W4 gates sending on it, the
+/// fields also reach a server without it, which drops them harmlessly (it
+/// keeps no placement; each computer keeps its own).
 pub const FEATURE_PLACEMENT: &str = "placement";
 
 /// One remote ID in a [`SyncDoc`].

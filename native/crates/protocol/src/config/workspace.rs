@@ -259,7 +259,9 @@ impl Workspace {
         if !self.tabs.get(&key).is_some_and(TabRecord::is_open) {
             return false;
         }
-        // The active tab is always a docked one: its neighbours in the strip.
+        // The active tab is meant to be a docked one (one detached on another
+        // computer is tolerated: it has no docked position, so none is
+        // picked): its neighbours in the strip.
         let docked = self.docked_tabs();
         if let Some(tab) = self.tabs.get_mut(&key) {
             tab.closed_at = now.max(tab.opened_at + 1);
@@ -344,7 +346,7 @@ impl Workspace {
     pub fn docked_tabs(&self) -> Vec<String> {
         self.open_tabs()
             .into_iter()
-            .filter(|k| !self.tabs[k].detached)
+            .filter(|k| !self.tabs[k].is_detached())
             .collect()
     }
 
@@ -352,7 +354,7 @@ impl Workspace {
     pub fn detached_tabs(&self) -> Vec<String> {
         self.open_tabs()
             .into_iter()
-            .filter(|k| self.tabs[k].detached)
+            .filter(|k| self.tabs[k].is_detached())
             .collect()
     }
 
@@ -387,16 +389,18 @@ impl Workspace {
         let Some(key) = tab_key(id) else {
             return false;
         };
-        if !self
-            .tabs
-            .get(&key)
-            .is_some_and(|t| t.is_open() && t.detached)
-        {
+        if !self.tabs.get(&key).is_some_and(SyncTab::is_detached) {
             return false;
         }
         if let Some(tab) = self.tabs.get_mut(&key) {
             tab.detached = false;
             tab.detached_at = now.max(tab.detached_at);
+            // A docked tab is not minimised; its next window opens normal
+            // (or maximised, as it was).
+            if tab.state == WinState::Minimized {
+                tab.state = WinState::Normal;
+                tab.state_at = now.max(tab.state_at);
+            }
         }
         self.move_tab(&key, None, now);
         self.active_tab = Some(key);

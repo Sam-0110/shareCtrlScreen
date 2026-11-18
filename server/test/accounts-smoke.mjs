@@ -124,7 +124,7 @@ step("a reply advertises what the server stores and its clock", async () => {
   const before = Date.now();
   const r = await call("/api/sync", {}, tokA);
   assert.equal(r.status, 200);
-  assert.deepEqual([...r.body.features].sort(), ["prefs", "tabs"]);
+  assert.deepEqual([...r.body.features].sort(), ["placement", "prefs", "tabs"]);
   assert.ok(r.body.serverTime >= before - 60_000 && r.body.serverTime <= Date.now() + 60_000);
   assert.equal(r.body.doc.v, 2);
   assert.deepEqual([typeof r.body.doc.tabs, typeof r.body.doc.prefs], ["object", "object"]);

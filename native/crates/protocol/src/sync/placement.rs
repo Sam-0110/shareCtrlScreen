@@ -58,7 +58,11 @@ impl Rect {
 /// One monitor as the OS reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Monitor {
-    /// The work area: the monitor less the taskbar, dock or panels.
+    /// The whole monitor: what numbering goes by, so moving or hiding a
+    /// taskbar never renumbers the screens.
+    pub bounds: Rect,
+    /// The work area: the monitor less the taskbar, dock or panels; what the
+    /// shares are of.
     pub work: Rect,
     pub primary: bool,
 }
@@ -77,7 +81,7 @@ pub struct Placement {
 pub fn monitor_order(monitors: &[Monitor]) -> Vec<usize> {
     let primary = monitors.iter().position(|m| m.primary).unwrap_or(0);
     let mut rest: Vec<usize> = (0..monitors.len()).filter(|&i| i != primary).collect();
-    rest.sort_by_key(|&i| (monitors[i].work.x, monitors[i].work.y, i));
+    rest.sort_by_key(|&i| (monitors[i].bounds.x, monitors[i].bounds.y, i));
     let mut order = Vec::with_capacity(monitors.len());
     if !monitors.is_empty() {
         order.push(primary);
@@ -186,11 +190,16 @@ pub fn to_rect(
             i64::from(work.y) + (i64::from(work.h) - i64::from(h)) / 2,
         ),
     };
-    // Onto the work area: `w <= work.w`, so the range is never empty, and
-    // the result lies between two i32 values.
-    let x = x.clamp(i64::from(work.x), work.right() - i64::from(w)) as i32;
-    let y = y.clamp(i64::from(work.y), work.bottom() - i64::from(h)) as i32;
+    // Onto the work area: `w <= work.w`, so the range is never empty.
+    let x = saturate(x.clamp(i64::from(work.x), work.right() - i64::from(w)));
+    let y = saturate(y.clamp(i64::from(work.y), work.bottom() - i64::from(h)));
     Some(Rect { x, y, w, h })
+}
+
+/// `v` as an i32, held at its limits (a work area reaching past the end of
+/// the i32 plane).
+fn saturate(v: i64) -> i32 {
+    i32::try_from(v).unwrap_or(if v < 0 { i32::MIN } else { i32::MAX })
 }
 
 #[cfg(test)]
@@ -198,13 +207,30 @@ mod tests {
     use super::*;
 
     fn mon(x: i32, y: i32, w: u32, h: u32, primary: bool) -> Monitor {
+        let r = Rect { x, y, w, h };
         Monitor {
-            work: Rect { x, y, w, h },
+            bounds: r,
+            work: r,
             primary,
         }
     }
 
     const HALF: Size = Size { w: 5000, h: 5000 };
+
+    #[test]
+    fn a_taskbar_does_not_renumber_the_monitors() {
+        // Two monitors stacked; the lower one has a taskbar on its left.
+        let top = mon(0, 0, 1920, 1080, true);
+        let mut lower = mon(0, 1080, 1920, 1080, false);
+        lower.work = Rect {
+            x: 48,
+            y: 1080,
+            w: 1872,
+            h: 1080,
+        };
+        let side = mon(-1920, 500, 1920, 1080, false);
+        assert_eq!(monitor_order(&[top, lower, side]), vec![0, 2, 1]);
+    }
 
     #[test]
     fn the_primary_is_zero_then_left_to_right() {
