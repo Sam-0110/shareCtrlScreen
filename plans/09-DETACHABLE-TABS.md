@@ -13,7 +13,7 @@ to `native/` unless they start with `server/` or `plans/`). Structure, contracts
 | S | This plan + structure ([09a](09a-STRUCTURE-AND-FLOWS.md)), adversarial review folded in | **complete**: review folded in (§7), owner's answers recorded (§5, §7), 09a rewritten from them |
 | W1 | Engine: several sessions on screen, one with the keyboard | **complete** (this commit): `set_screen(on_screen, focused)` replaces `set_active`; overlays per window (`set_overlay(window, open)`); the shortcut claim needs the window uncovered; loopback `several_sessions_on_screen_one_focused`; review fixes (the hook needs focused + on screen + uncovered, decided under one lock; overlays keyed by `WindowId`). The app still puts one tab on screen (W3 adds windows) |
 | W2 | Engine: hand a live session to another surface | **complete** (this commit): `move_session(id, surface, window)` + `SessionEvent::SurfaceReleased`; one current-surface cell per session (`session/current.rs`) read by the slot, driver, shortcut hook and reaper; the media thread keeps its decoder and builds the presenter on its device (`create_presenter_on`, shared D3D11 device on Windows); `connect_in(…, window)`; `TabShortcut` carries the session. Loopback: 20 live moves, a failed move, a move while connecting. Review fixes (3761a13): a media thread that failed before the bind no longer strands moves (sticky media state, view gate bound before media starts), the old D3D11 swap chain is released before `SurfaceReleased` (and its waitable handle closed), a failed move during the end reports nothing twice; more tests. Device-pending: the move on real GPUs (W5 checklist) |
-| W3 | App: detached windows (Detach / Dock / close, focus, minimise), saved on this computer | **in progress**: 1/3 synced schema + placement maths + workspace ops (b39201b, review fixes in the commit after it); 2/3 OS window activation / minimise watch (ba72da4 + review fixes in the commit after it; macOS compiled only on CI, device checks in W5); 3/3 the app (windows, Detach / Dock / Close, UI) |
+| W3 | App: detached windows (Detach / Dock / close, focus, minimise), saved on this computer | **in progress**: 1/3 synced schema + placement maths + workspace ops (b39201b, review fixes in the commit after it); 2/3 OS window activation / minimise watch (ba72da4 + review fixes in the commit after it; macOS compiled only on CI, device checks in W5); 3/3 the app: WindowManager (`app/src/windows.rs`), TabManager detach / dock / close / screen, window page (`index.html?window=`), placement saved on this computer (this commit; review pending). Device-pending: `checklists/DETACH-W3.md` |
 | W4 | Sync: which tabs are detached and where, through the account | not started |
 | W5 | Per-OS finish (Wayland placement, macOS minimise/focus, Windows DPI) + device checklists | not started |
 | Final | Whole-feature review, merge, release | not started |
@@ -178,7 +178,7 @@ released on the old one.
 ### W3 — App: detached windows (L)
 `app/src/windows.rs` (WindowManager): create / destroy detached windows on the UI thread, track
 `Focused` / `Moved` / `Resized` / minimised, feed the TabManager's on-screen / focused answer,
-Detach / Dock / Close; `ui/window.html` + `ui/window.js`; placement saved on this computer
+Detach / Dock / Close; the window's page (built as `index.html?window=<remote>`, 09a §2); placement saved on this computer
 (workspace, not synced yet) and restored at launch. Tray, exit, account switch close the windows.
 
 ### W4 — Sync (M)

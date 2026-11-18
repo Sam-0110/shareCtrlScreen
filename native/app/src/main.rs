@@ -28,6 +28,7 @@ mod tabs;
 mod tray;
 mod uiaccess;
 mod updater;
+mod windows;
 
 use std::io::Write;
 use std::path::Path;
@@ -125,6 +126,11 @@ fn raise_main_window(app: &tauri::AppHandle) {
     let Some(win) = app.get_webview_window("main") else {
         return;
     };
+    // Detached tab windows hid to the tray with it (09a §5.7).
+    #[cfg(windows)]
+    if let Some(wm) = app.try_state::<Arc<windows::WindowManager>>() {
+        wm.set_all_visible(true);
+    }
     for (what, result) in [
         ("unminimize", win.unminimize()),
         ("show", win.show()),
@@ -224,6 +230,34 @@ fn main() {
         // A pop-out window (D14) is closed only once the engine has let go of
         // its video surface; see `popout::on_close_requested`.
         .on_window_event(|window, event| {
+            // A detached tab window (plans/09): its placement is saved once it
+            // settles; its X disconnects and closes the tab, and the window
+            // goes once the session let go of it (09a §5.6).
+            let detached =
+                windows::window_of(window.label()).filter(|w| *w != engine::WindowId::MAIN);
+            if let (Some(w), tauri::WindowEvent::CloseRequested { api, .. }) = (detached, event) {
+                api.prevent_close();
+                if let Some(tabs) = window.app_handle().try_state::<Arc<tabs::TabManager>>() {
+                    tabs.close_window(w);
+                }
+                return;
+            }
+            if detached.is_some()
+                && matches!(
+                    event,
+                    tauri::WindowEvent::Moved(_)
+                        | tauri::WindowEvent::Resized(_)
+                        | tauri::WindowEvent::ScaleFactorChanged { .. }
+                )
+            {
+                if let Some(wm) = window
+                    .app_handle()
+                    .try_state::<Arc<windows::WindowManager>>()
+                {
+                    wm.moved(window.label());
+                }
+                return;
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle();
                 let engine = app.state::<AppState>().engine.clone();
@@ -279,6 +313,8 @@ fn main() {
             commands::tab_connect_all,
             commands::tab_password,
             commands::tab_forget_password,
+            commands::tab_detach,
+            commands::tab_dock,
             commands::get_snapshot,
             commands::set_permission,
             commands::end_session,
@@ -328,9 +364,26 @@ fn main() {
             // Accounts: finish signing the selected one in, then keep it synced.
             account_manager.start(handle.clone());
 
+            // Detached tab windows and what the OS says about every window
+            // (plans/09 W3); the main window is watched from here, the UI
+            // thread.
+            let (reports_tx, mut reports_rx) = tokio::sync::mpsc::unbounded_channel();
+            let windows = windows::WindowManager::new(handle.clone(), engine.clone(), reports_tx);
+            app.manage(windows.clone());
+            windows.watch_main();
+
             // The tabs (plans/08 P4): every viewer session belongs to one.
-            let tabs = tabs::TabManager::new(handle.clone(), engine.clone());
+            let tabs = tabs::TabManager::new(handle.clone(), engine.clone(), windows);
             app.manage(tabs.clone());
+            let reports_tabs = tabs.clone();
+            tauri::async_runtime::spawn(async move {
+                while let Some(report) = reports_rx.recv().await {
+                    reports_tabs.on_window_report(report);
+                }
+            });
+            // The windows of the tabs detached in this workspace (at launch;
+            // later workspaces open theirs when they are switched to).
+            tabs.seed_windows();
             bridge::spawn(handle, engine.clone(), tabs, ui_rx);
 
             // Drive the signaling event loop into the engine. The loop only

@@ -5,7 +5,7 @@
 
 import * as api from './api.js';
 import { peerLabel, reloadConfig } from './connect.js';
-import { $, S, setState, stopCountdown, toast } from './state.js';
+import { $, S, currentRemote, setState, stopCountdown, toast, windowRemote } from './state.js';
 
 // ---- monitor switching (mid-session) -----------------------------------------
 // The host announces its monitors and the one being shared; both sides get a
@@ -93,18 +93,30 @@ export function renderDisplays(info) {
 export function wireSession() {
   // Session menu bar (revealed by hovering the top edge of the video).
   $('btn-view-refresh').addEventListener('click', () => {
-    api.requestRefresh();
+    api.requestRefresh(currentRemote());
     toast('Requested a fresh frame');
   });
-  $('btn-view-end').addEventListener('click', () => api.endSession());
-  // Don't wait out the grace period — give up now.
+  $('btn-view-end').addEventListener('click', () => api.endSession(currentRemote()));
+  // Don't wait out the grace period — give up now: the tab's session, or
+  // (being viewed) this computer's.
   $('btn-link-end').addEventListener('click', () => {
     $('modal-link').classList.add('hidden');
-    api.endSession();
+    api.endSession(S.state === 'HOST_ACTIVE' && !windowRemote ? null : currentRemote());
+  });
+  // Its own window, and back into the strip (plans/09).
+  $('btn-view-detach').addEventListener('click', () => {
+    const r = currentRemote();
+    if (r) api.tabDetach(r).catch((err) => toast(String((err && err.message) || err), 'error'));
+  });
+  $('btn-view-dock').addEventListener('click', () => {
+    const r = currentRemote();
+    if (r) api.tabDock(r).catch((err) => toast(String((err && err.message) || err), 'error'));
   });
 
-  // This computer being viewed (the host session; a viewer's are tabs).
+  // This computer being viewed (the host session; a viewer's are tabs) —
+  // the main window's business only.
   api.on('role-changed', (e) => {
+    if (windowRemote) return;
     const p = e.payload;
     stopCountdown();
     // Whatever happens next (reconnected, or dropped back to the home screen),
@@ -122,28 +134,30 @@ export function wireSession() {
     reloadConfig();
   });
 
-  api.on('displays', (e) => renderDisplays(e.payload));
+  api.on('displays', (e) => {
+    if (!windowRemote) renderDisplays(e.payload);
+  });
 
-  for (const id of ['host-display', 'view-display']) {
-    $(id).addEventListener('change', (e) => {
-      api.selectDisplay(e.target.value);
-    });
-  }
+  $('host-display').addEventListener('change', (e) => api.selectDisplay(e.target.value));
+  $('view-display').addEventListener('change', (e) => {
+    api.selectDisplay(e.target.value, currentRemote());
+  });
   $('view-popout').addEventListener('change', (e) => {
     const id = e.target.value;
     e.target.value = '';
-    if (id) api.popoutDisplay(id);
+    if (id) api.popoutDisplay(id, currentRemote());
   });
 
   // The viewer went quiet while this computer is viewed. (A tab's trouble is
   // in its snapshot: tabs.js shows the same panel.)
   api.on('link-trouble', (e) => {
-    if (S.state !== 'HOST_ACTIVE') return;
+    if (S.state !== 'HOST_ACTIVE' || windowRemote) return;
     $('link-count').textContent = String(e.payload.secsLeft ?? 0);
     $('modal-link').classList.remove('hidden');
   });
 
   api.on('link-restored', () => {
+    if (windowRemote) return;
     $('modal-link').classList.add('hidden');
     toast('Connection restored');
   });

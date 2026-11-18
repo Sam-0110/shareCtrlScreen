@@ -21,7 +21,7 @@ export const S = {
   config: null,
   incomingFrom: null, // peer awaiting our approve/deny
   // The tab strip as the app last described it (src/tabs.rs snapshot).
-  tabs: { tabs: [], active: null, connected: 0, hosting: false, signedOut: false },
+  tabs: { tabs: [], detached: [], active: null, connected: 0, hosting: false, signedOut: false },
   cancelCountdown: null,
   // The ID the name field currently belongs to, so typing a name is not
   // overwritten until the ID itself changes.
@@ -35,9 +35,20 @@ export const S = {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export const validUuid = (s) => typeof s === 'string' && UUID_RE.test(s);
 
-/** The tab on screen, if any. */
-export const activeTab = () =>
-  (S.tabs.active && S.tabs.tabs.find((t) => t.remoteId === S.tabs.active)) || null;
+// A detached tab window (plans/09) loads this page as `index.html?window=<remote>`:
+// it shows that one tab, with no strip and no home page.
+export const windowRemote = new URLSearchParams(location.search).get('window');
+
+/** The tab this page shows: its window's, or the main window's tab on screen. */
+export const activeTab = () => {
+  if (windowRemote) {
+    return (S.tabs.detached || []).find((t) => t.remoteId === windowRemote) || null;
+  }
+  return (S.tabs.active && S.tabs.tabs.find((t) => t.remoteId === S.tabs.active)) || null;
+};
+
+/** The remote of the tab this page shows, if any. */
+export const currentRemote = () => (activeTab() || {}).remoteId || null;
 
 /** Something is connected: this computer is viewed, or views another. */
 export const sessionLive = () => S.state === 'HOST_ACTIVE' || S.tabs.connected > 0;
@@ -50,13 +61,16 @@ export function setState(next) {
 
 export function render() {
   const state = S.state;
-  const hosting = state === 'HOST_ACTIVE';
+  // A detached window never shows the host screen: that is the main
+  // window's.
+  const hosting = state === 'HOST_ACTIVE' && !windowRemote;
   const tab = hosting ? null : activeTab();
 
   $('screen-home').classList.toggle('hidden', hosting || !!tab);
   $('screen-host').classList.toggle('hidden', !hosting);
   $('screen-view').classList.toggle('hidden', !tab);
-  $('modal-incoming').classList.toggle('hidden', state !== 'INCOMING');
+  // Asked in the main window only.
+  $('modal-incoming').classList.toggle('hidden', state !== 'INCOMING' || !!windowRemote);
 
   // The "connection lost" panel belongs to a session in trouble: being
   // viewed (shown by the host events), or the tab on screen.

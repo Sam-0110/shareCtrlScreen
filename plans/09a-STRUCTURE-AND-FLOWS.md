@@ -32,7 +32,8 @@ crates/engine/src/sessions.rs           set_screen(), move_session(), set_overla
 app/src/windows.rs                      WindowManager
 app/src/tabs.rs                         detached set, Detach / Dock / Close, the screen decision
 app/capabilities/*.json                 detached windows' capability (labels detached-*)
-app/ui/window.html, window.js           a detached window's page
+app/ui/index.html?window=<remote>       a detached window's page (W3: the main page in window mode —
+                                        one tab, no strip, no home page; state.js windowRemote)
 ```
 
 ## 3. Types and contracts

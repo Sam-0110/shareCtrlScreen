@@ -12,7 +12,18 @@
 import * as api from './api.js';
 import { peerLabel, reloadConfig } from './connect.js';
 import { renderDisplays } from './session.js';
-import { $, S, activeTab, errorText, overlayClose, overlayOpen, render, toast } from './state.js';
+import {
+  $,
+  S,
+  activeTab,
+  currentRemote,
+  errorText,
+  overlayClose,
+  overlayOpen,
+  render,
+  toast,
+  windowRemote
+} from './state.js';
 
 const shortId = (id) => (id.length > 14 ? id.slice(0, 8) + '…' : id);
 const tabLabel = (t) => t.name || shortId(t.remoteId);
@@ -141,6 +152,19 @@ function renderStrip() {
       el.appendChild(name);
     }
 
+    // Its own window (plans/09); not for a tab closed elsewhere.
+    if (!t.closedElsewhere) {
+      const detach = document.createElement('button');
+      detach.className = 'tab-close';
+      detach.title = 'Open in its own window';
+      detach.textContent = '⧉';
+      detach.addEventListener('click', (e) => {
+        e.stopPropagation();
+        api.tabDetach(t.remoteId).catch((err) => toast(errorText(err), 'error'));
+      });
+      el.appendChild(detach);
+    }
+
     const close = document.createElement('button');
     close.className = 'tab-close';
     close.title = 'Close tab';
@@ -266,7 +290,13 @@ function renderActive() {
         name,
         t.lastEnd || 'Not connected.',
         { label: 'Connect', run: () => startConnecting((c) => api.tabConnect(t.remoteId, c)) },
-        { label: 'Close tab', run: () => api.tabClose(t.remoteId) }
+        // In its own window, closing is the window's X; this puts it back.
+        windowRemote
+          ? {
+              label: 'Back to the main window',
+              run: () => api.tabDock(t.remoteId).catch((err) => toast(errorText(err), 'error'))
+            }
+          : { label: 'Close tab', run: () => api.tabClose(t.remoteId) }
       );
       break;
     default:
@@ -284,10 +314,15 @@ function submitPassword(remote) {
 function applySnapshot(snapshot) {
   const before = S.tabs;
   const wasInTrouble = new Set(
-    before.tabs.filter((t) => t.troubleSecs != null).map((t) => t.remoteId)
+    [...before.tabs, ...(before.detached || [])]
+      .filter((t) => t.troubleSecs != null)
+      .map((t) => t.remoteId)
   );
   S.tabs = snapshot;
-  for (const t of snapshot.tabs) {
+  const mine = windowRemote
+    ? (snapshot.detached || []).filter((t) => t.remoteId === windowRemote)
+    : snapshot.tabs;
+  for (const t of mine) {
     if (wasInTrouble.has(t.remoteId) && t.phase === 'live' && t.troubleSecs == null) {
       toast(`${tabLabel(t)}: connection restored`);
     }
@@ -360,7 +395,8 @@ export function wireTabs() {
   });
 
   document.addEventListener('keydown', (e) => {
-    if (!isTabChord(e)) return;
+    // A detached window has no strip to step through (09 Decision 2).
+    if (windowRemote || !isTabChord(e)) return;
     e.preventDefault();
     if (e.key === 'PageDown') api.tabNext();
     else api.tabPrev();
@@ -369,12 +405,15 @@ export function wireTabs() {
   api.on('tabs-changed', (e) => applySnapshot(e.payload));
   api.on('tab-toast', (e) => {
     const p = e.payload;
+    // Each window shows its own tab's; the main window those of the strip.
+    const inWindow = (S.tabs.detached || []).some((x) => x.remoteId === p.remoteId);
+    if (windowRemote ? p.remoteId !== windowRemote : inWindow) return;
     const t = S.tabs.tabs.find((x) => x.remoteId === p.remoteId);
-    const prefix = t && p.remoteId !== S.tabs.active ? `${tabLabel(t)}: ` : '';
+    const prefix = t && p.remoteId !== currentRemote() ? `${tabLabel(t)}: ` : '';
     toast(prefix + p.message);
   });
   api.on('tab-displays', (e) => {
-    if (e.payload.remoteId === S.tabs.active) renderDisplays(e.payload);
+    if (e.payload.remoteId === currentRemote()) renderDisplays(e.payload);
   });
 }
 
