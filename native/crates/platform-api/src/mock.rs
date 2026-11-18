@@ -1005,6 +1005,10 @@ pub struct MockPlatform {
     /// `"macos"`, `"linux-x11"`, …) for tests of OS-dependent behaviour such
     /// as modifier translation.
     pub os_name: &'static str,
+    /// Monitors besides the primary `mock-0` (which is always listed first,
+    /// sized from [`MockPlatform::capture`]). Capturing one of these produces
+    /// frames of its size. Default: none.
+    pub extra_displays: Vec<DisplayInfo>,
     codecs: MockCodecFactory,
     secrets: Arc<MockSecretStore>,
 }
@@ -1032,6 +1036,7 @@ impl MockPlatform {
             permission_requests: Mutex::default(),
             focus_result: true,
             os_name: "mock",
+            extra_displays: Vec::new(),
             codecs: MockCodecFactory,
             secrets: Arc::new(MockSecretStore),
         }
@@ -1051,7 +1056,7 @@ impl Platform for MockPlatform {
         self.paths.clone()
     }
     fn displays(&self) -> Vec<DisplayInfo> {
-        vec![DisplayInfo {
+        let mut out = vec![DisplayInfo {
             id: "mock-0".into(),
             name: "Mock display".into(),
             x: 0,
@@ -1060,7 +1065,9 @@ impl Platform for MockPlatform {
             height: self.capture.height,
             scale: 1.0,
             primary: true,
-        }]
+        }];
+        out.extend(self.extra_displays.iter().cloned());
+        out
     }
     fn permissions(&self) -> PermissionReport {
         lock(&self.permissions).clone()
@@ -1072,13 +1079,20 @@ impl Platform for MockPlatform {
         &self,
         display: Option<&str>,
     ) -> Result<Box<dyn ScreenCapture>, CaptureError> {
-        if display.is_some_and(|d| d != "mock-0") {
-            return Err(CaptureError::NoOutput);
+        let mut cfg = self.capture.clone();
+        if let Some(id) = display.filter(|d| *d != "mock-0") {
+            let extra = self
+                .extra_displays
+                .iter()
+                .find(|d| d.id == id)
+                .ok_or(CaptureError::NoOutput)?;
+            cfg.width = extra.width;
+            cfg.height = extra.height;
         }
         if lock(&self.permissions).screen_capture == PermissionState::Denied {
             return Err(CaptureError::PermissionDenied);
         }
-        Ok(Box::new(MockCapture::new(self.capture.clone())))
+        Ok(Box::new(MockCapture::new(cfg)))
     }
     fn codecs(&self) -> &dyn CodecFactory {
         &self.codecs

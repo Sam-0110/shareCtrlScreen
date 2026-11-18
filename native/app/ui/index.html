@@ -94,6 +94,11 @@
             </select>
           </div>
 
+          <div id="host-display-row" class="row hidden">
+            <label for="host-display">Monitor</label>
+            <select id="host-display" class="input"></select>
+          </div>
+
           <div class="row">
             <button id="btn-host-end" class="btn btn-danger">End session</button>
           </div>
@@ -113,6 +118,7 @@
         <span id="view-peer" class="mono small">&hellip;</span>
         <span id="view-badge" class="badge badge-view">VIEW ONLY</span>
         <div class="spacer"></div>
+        <select id="view-display" class="input input-sm hidden" title="Monitor to show"></select>
         <button id="btn-view-refresh" class="btn btn-sm" title="Request a fresh keyframe (fixes artifacts)">Refresh</button>
         <button id="btn-view-settings" class="btn btn-ghost btn-sm" title="Settings">&#9881;</button>
         <button id="btn-view-end" class="btn btn-danger btn-sm">Disconnect</button>

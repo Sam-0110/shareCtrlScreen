@@ -123,6 +123,18 @@ struct Peer {
     roles: Arc<std::sync::Mutex<Vec<Role>>>,
     /// How many "link trouble" countdown ticks the engine reported.
     link_trouble: Arc<std::sync::atomic::AtomicU32>,
+    /// Every monitor announcement this side's UI received.
+    displays: Arc<std::sync::Mutex<Vec<Announced>>>,
+}
+
+/// One monitor announcement: `(ids, current, can_switch)`.
+type Announced = (Vec<String>, String, bool);
+
+impl Peer {
+    /// The latest monitor announcement this side's UI received.
+    fn last_displays(&self) -> Option<Announced> {
+        self.displays.lock().unwrap().last().cloned()
+    }
 }
 
 fn temp_root(name: &str) -> PathBuf {
@@ -177,7 +189,13 @@ fn start_peer_with(name: &str, relay: &str, configure: impl FnOnce(&mut MockPlat
     let toasts: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
     let roles: Arc<std::sync::Mutex<Vec<Role>>> = Arc::default();
     let link_trouble: Arc<std::sync::atomic::AtomicU32> = Arc::default();
-    let (t, r, lt) = (toasts.clone(), roles.clone(), link_trouble.clone());
+    let displays: Arc<std::sync::Mutex<Vec<Announced>>> = Arc::default();
+    let (t, r, lt, ds) = (
+        toasts.clone(),
+        roles.clone(),
+        link_trouble.clone(),
+        displays.clone(),
+    );
     tokio::spawn(async move {
         while let Some(ev) = ui_rx.recv().await {
             match ev {
@@ -186,6 +204,15 @@ fn start_peer_with(name: &str, relay: &str, configure: impl FnOnce(&mut MockPlat
                 UiEvent::LinkTrouble { .. } => {
                     lt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
+                UiEvent::Displays {
+                    list,
+                    current,
+                    can_switch,
+                } => ds.lock().unwrap().push((
+                    list.into_iter().map(|d| d.id).collect(),
+                    current,
+                    can_switch,
+                )),
                 _ => {}
             }
         }
@@ -197,6 +224,7 @@ fn start_peer_with(name: &str, relay: &str, configure: impl FnOnce(&mut MockPlat
         toasts,
         roles,
         link_trouble,
+        displays,
     }
 }
 
@@ -1083,4 +1111,139 @@ async fn same_os_and_linux_windows_pairs_are_untouched() {
         })
         .await;
     }
+}
+
+/// Monitor switching mid-session: a controlling viewer switches the host to
+/// its second monitor (the picture changes size, input follows it), a
+/// view-only viewer cannot, and the host can switch back from its own side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn monitor_switch_follows_picture_input_and_the_control_gate() {
+    let relay = start_relay().await;
+    let second = platform_api::DisplayInfo {
+        id: "mock-1".into(),
+        name: "Second".into(),
+        x: 640,
+        y: 0,
+        width: 800,
+        height: 600,
+        scale: 1.0,
+        primary: false,
+    };
+    let host = start_peer_with("monsw-host", &relay, |p| {
+        p.extra_displays.push(second.clone())
+    });
+    let viewer = start_peer("monsw-viewer", &relay);
+    let t = Duration::from_secs(15);
+    eventually("both registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    viewer.engine.connect_to(host.uuid.clone());
+
+    // Both UIs learn the host's monitors; the viewer may switch (control).
+    let both = vec!["mock-0".to_string(), "mock-1".to_string()];
+    eventually("viewer told about the host's monitors", t, || {
+        viewer.last_displays() == Some((both.clone(), "mock-0".into(), true))
+    })
+    .await;
+    assert_eq!(
+        host.last_displays(),
+        Some((both.clone(), "mock-0".into(), true))
+    );
+    eventually("first monitor presented", t, || {
+        viewer
+            .platform
+            .surface
+            .state()
+            .presented
+            .iter()
+            .any(|p| (p.width, p.height) == (640, 360))
+    })
+    .await;
+
+    // The viewer's window is 700x400: the 640x360 monitor fits 1:1, and the
+    // 800x600 one must be encoded to fit it once switched to.
+    viewer.platform.surface.set_client_size((700, 400));
+    tokio::time::sleep(Duration::from_millis(1500)).await; // size debounce + delivery
+
+    // Viewer switches. (The mock encoder emits the captured size; the encode
+    // size the host chose is read from its test hook.)
+    viewer.engine.select_display("mock-1".into());
+    eventually("viewer told the switch happened", t, || {
+        viewer.last_displays() == Some((both.clone(), "mock-1".into(), true))
+    })
+    .await;
+    eventually("second monitor presented", t, || {
+        viewer
+            .platform
+            .surface
+            .state()
+            .presented
+            .iter()
+            .any(|p| (p.width, p.height) == (800, 600))
+    })
+    .await;
+    assert_eq!(host.engine.test_encode_dims(), Some((532, 400)));
+    eventually("input mapped onto the second monitor", t, || {
+        host.platform.injector.lock().unwrap().target
+            == Some(platform_api::Rect {
+                x: 640,
+                y: 0,
+                w: 800,
+                h: 600,
+            })
+    })
+    .await;
+    assert_eq!(
+        host.last_displays().map(|d| d.1),
+        Some("mock-1".to_string())
+    );
+
+    // View-only: the picker is disabled, and a request is ignored anyway.
+    host.engine.set_permission(Permission::View);
+    eventually("viewer picker disabled", t, || {
+        viewer.last_displays() == Some((both.clone(), "mock-1".into(), false))
+    })
+    .await;
+    let announced = host.displays.lock().unwrap().len();
+    viewer.engine.select_display("mock-0".into());
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(
+        host.displays.lock().unwrap().len(),
+        announced,
+        "a view-only viewer must not switch monitors"
+    );
+
+    // The host can always switch, from its own side; input goes back to the
+    // primary path.
+    host.engine.select_display("mock-0".into());
+    eventually("viewer told the host switched back", t, || {
+        viewer.last_displays() == Some((both.clone(), "mock-0".into(), false))
+    })
+    .await;
+    eventually("input back on the primary", t, || {
+        host.platform.injector.lock().unwrap().target.is_none()
+    })
+    .await;
+
+    // An unknown id changes nothing and says why.
+    host.engine.select_display("gone".into());
+    eventually("toast for an unknown monitor", t, || {
+        host.toasts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("no longer connected"))
+    })
+    .await;
+    assert_eq!(
+        host.last_displays().map(|d| d.1),
+        Some("mock-0".to_string())
+    );
+
+    viewer.engine.end_session();
+    eventually("both idle", t, || {
+        host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
+    })
+    .await;
 }

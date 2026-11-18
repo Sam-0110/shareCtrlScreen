@@ -243,6 +243,9 @@ pub(super) fn transport_driver(d: Driver) {
     // this screen the sender aimed it.
     let mut incoming: Option<crate::transfer::Incoming> = None;
     let mut incoming_drop_at: Option<(f64, f64)> = None;
+    // Viewer: the host's last monitor announcement, re-sent to the UI when our
+    // control permission changes (switching needs control).
+    let mut remote_displays: Option<(Vec<protocol::RemoteDisplay>, String)> = None;
 
     // Liveness watchdog: if NOTHING arrives from the peer for this long, the
     // connection is dead even if ICE hasn't declared it yet. str0m's ICE consent
@@ -398,6 +401,12 @@ pub(super) fn transport_driver(d: Driver) {
                 inj.release_all();
             }
             was_control = now;
+        }
+        // Host: a monitor switch took effect on the media thread — map input
+        // onto the newly shared monitor from here on.
+        let new_rect = shared.input_rect.lock().take();
+        if let (Some(rect), Some(inj)) = (new_rect, injector.as_mut()) {
+            inj.set_target_rect(rect);
         }
 
         // 1) Accept inbound answer/ICE relayed from signaling.
@@ -723,6 +732,47 @@ pub(super) fn transport_driver(d: Driver) {
                                     shared.control.store(control, Ordering::SeqCst);
                                     if let Some(s) = &surface {
                                         s.set_cursor_control(control);
+                                    }
+                                    // The monitor picker follows control.
+                                    if let Some((list, current)) = &remote_displays {
+                                        let _ = ui.send(crate::UiEvent::Displays {
+                                            list: list.clone(),
+                                            current: current.clone(),
+                                            can_switch: control,
+                                        });
+                                    }
+                                    continue;
+                                }
+                                // Viewer: the host's monitors / the one shown now.
+                                Ok(protocol::ControlMsg::Displays { list, current }) => {
+                                    if !host_side {
+                                        let _ = ui.send(crate::UiEvent::Displays {
+                                            list: list.clone(),
+                                            current: current.clone(),
+                                            can_switch: shared.control.load(Ordering::SeqCst),
+                                        });
+                                        remote_displays = Some((list, current));
+                                    }
+                                    continue;
+                                }
+                                // Host: the viewer asks to see another monitor.
+                                // Gated on the live CONTROL permission: a
+                                // view-only peer sees only what the host chose
+                                // to share. The media thread validates the id
+                                // and always answers with a fresh `displays`.
+                                Ok(protocol::ControlMsg::SelectDisplay { id }) => {
+                                    if host_side {
+                                        let allowed = inject
+                                            .as_ref()
+                                            .is_some_and(|gate| gate.load(Ordering::SeqCst));
+                                        if allowed {
+                                            tracing::info!("viewer asked to share monitor {id:?}");
+                                            *shared.display_req.lock() = Some(id);
+                                        } else {
+                                            tracing::warn!(
+                                                "ignored a monitor switch from a view-only viewer"
+                                            );
+                                        }
                                     }
                                     continue;
                                 }

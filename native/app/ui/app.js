@@ -838,12 +838,59 @@ listen('role-changed', (e) => {
     badge.className = 'badge ' + (control ? 'badge-control' : 'badge-view');
     setState('VIEW_ACTIVE');
   } else {
+    // The session is over: its monitor list goes with it.
+    renderDisplays(null);
     setState('READY');
   }
   reloadConfig();
 });
 
 listen('toast', (e) => toast(e.payload.message || '', 'error'));
+
+// ---- monitor switching (mid-session) -----------------------------------------
+// The host announces its monitors and the one being shared; both sides get a
+// `displays` event (the host from its own capture thread, the viewer from the
+// host). The pickers show only with two or more monitors. The viewer's is
+// disabled without control — the host would ignore the request anyway. On
+// macOS/Linux the viewer's picker is the native "Monitor" menu (the drawer
+// holding this one is not shown there).
+function displayLabel(d) {
+  const name = d.name || d.id;
+  return `${name} (${d.width}\u00d7${d.height}${d.primary ? ', primary' : ''})`;
+}
+
+function renderDisplayPicker(select, info) {
+  const list = (info && info.displays) || [];
+  select.textContent = '';
+  for (const d of list) {
+    const opt = document.createElement('option');
+    opt.value = d.id;
+    opt.textContent = displayLabel(d);
+    select.appendChild(opt);
+  }
+  select.value = (info && info.current) || '';
+  return list.length >= 2;
+}
+
+function renderDisplays(info) {
+  const hostShown = renderDisplayPicker($('host-display'), info);
+  $('host-display-row').classList.toggle('hidden', !hostShown);
+  const view = $('view-display');
+  const viewShown = renderDisplayPicker(view, info);
+  view.classList.toggle('hidden', !viewShown);
+  view.disabled = !(info && info.canSwitch);
+  view.title = view.disabled
+    ? 'Switching monitors needs control'
+    : 'Monitor to show';
+}
+
+listen('displays', (e) => renderDisplays(e.payload));
+
+for (const id of ['host-display', 'view-display']) {
+  $(id).addEventListener('change', (e) => {
+    invoke('select_display', { id: e.target.value });
+  });
+}
 
 // The peer went quiet. The engine has already hidden the native video (a frozen
 // frame is indistinguishable from a live one), so this panel is what the user

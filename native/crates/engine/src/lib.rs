@@ -77,6 +77,17 @@ pub enum UiEvent {
     },
     /// The peer answered again — the session continues normally.
     LinkRestored,
+    /// The host's monitors and the one being shared, for the monitor picker.
+    /// On the host it comes from its own capture thread (at session start and
+    /// after each switch); on the viewer from the host's `displays` message,
+    /// and again whenever the viewer's control permission changes.
+    /// `can_switch`: whether this side may switch right now (always on the
+    /// host; only with control on the viewer).
+    Displays {
+        list: Vec<protocol::RemoteDisplay>,
+        current: String,
+        can_switch: bool,
+    },
 }
 
 /// How a session finds a network path to the peer.
@@ -760,6 +771,20 @@ impl Engine {
     pub fn request_refresh(&self) {
         if matches!(&*self.role.lock(), Role::Viewer { .. }) {
             session::send_ctl(self, &ControlMsg::KeyframeRequest);
+        }
+    }
+
+    /// Switch the shared monitor mid-session. On the host this takes effect
+    /// directly; on the viewer it asks the host, which honours it only while
+    /// this viewer has control. The new state comes back as
+    /// [`UiEvent::Displays`]. Not saved: the host's "Monitor to share" setting
+    /// stays the default for the next session.
+    pub fn select_display(&self, id: String) {
+        let role = self.role.lock().clone();
+        match role {
+            Role::Host { .. } => session::request_display(self, id),
+            Role::Viewer { .. } => session::send_ctl(self, &ControlMsg::SelectDisplay { id }),
+            Role::Idle => {}
         }
     }
 

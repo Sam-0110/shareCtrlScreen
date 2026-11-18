@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-use platform_api::{CaptureError, Codec, EncoderConfig, Platform, ScreenCapture};
+use platform_api::{CaptureError, Codec, DisplayInfo, EncoderConfig, Platform, ScreenCapture};
 
 use crate::session::Shared;
 use crate::tuning::{MAX_FPS, MAX_FPS_INTERVAL};
@@ -37,9 +37,58 @@ pub(crate) struct HostMedia {
     pub codec: Codec,
     pub shared: Arc<Shared>,
     /// The reliable control channel, for cursor images (D9): an image is sent
-    /// once, so it must not be lost the way a stale position may be.
+    /// once, so it must not be lost the way a stale position may be. Also
+    /// carries the monitor list to the viewer.
     pub ctl_tx: Sender<Vec<u8>>,
+    /// The host's own UI: the monitor list for its picker, and why a monitor
+    /// switch failed.
+    pub ui: tokio::sync::mpsc::UnboundedSender<crate::UiEvent>,
 }
+
+/// The id of the display a capture opened with `display` actually shows:
+/// that id when it is listed, else the primary (what `create_capture(None)`
+/// shares), else the first listed. Empty when the platform lists none.
+fn resolve_display_id(displays: &[DisplayInfo], display: Option<&str>) -> String {
+    display
+        .and_then(|id| displays.iter().find(|d| d.id == id))
+        .or_else(|| displays.iter().find(|d| d.primary))
+        .or_else(|| displays.first())
+        .map(|d| d.id.clone())
+        .unwrap_or_default()
+}
+
+/// Tell the viewer (ctl) and the host UI which monitors exist and which one is
+/// being shared now.
+fn announce_displays(
+    displays: &[DisplayInfo],
+    current: &str,
+    ctl_tx: &Sender<Vec<u8>>,
+    ui: &tokio::sync::mpsc::UnboundedSender<crate::UiEvent>,
+) {
+    let list: Vec<protocol::RemoteDisplay> = displays
+        .iter()
+        .map(|d| protocol::RemoteDisplay {
+            id: d.id.clone(),
+            name: d.name.clone(),
+            width: d.width,
+            height: d.height,
+            primary: d.primary,
+        })
+        .collect();
+    let msg = protocol::ControlMsg::Displays {
+        list: list.clone(),
+        current: current.to_string(),
+    };
+    let _ = ctl_tx.send(serde_json::to_vec(&msg).unwrap_or_default());
+    let _ = ui.send(crate::UiEvent::Displays {
+        list,
+        current: current.to_string(),
+        can_switch: true,
+    });
+}
+
+/// A capture session and the display it shows (`None` = the primary).
+type OpenedCapture = (Box<dyn ScreenCapture>, Option<String>);
 
 /// Open the capture session, retrying the recoverable case instead of ending the
 /// session before it starts. A service-launched host can be briefly off the active
@@ -48,11 +97,13 @@ pub(crate) struct HostMedia {
 /// we retry with backoff until it returns or the session stops, so the loop
 /// self-recovers exactly as it does for a mid-session desktop switch. A missing
 /// saved display falls back to the primary; any other (terminal) error is returned.
+/// Also returns the display actually opened (`None` = the primary, including
+/// after that fallback).
 fn open_capture(
     platform: &dyn Platform,
     display: Option<&str>,
     stop: &std::sync::atomic::AtomicBool,
-) -> Result<Box<dyn ScreenCapture>, Box<dyn std::error::Error>> {
+) -> Result<OpenedCapture, Box<dyn std::error::Error>> {
     let mut backoff = std::time::Duration::from_millis(100);
     let mut waited = false;
     loop {
@@ -67,9 +118,9 @@ fn open_capture(
                 // parsed as its `display(...)` value formatter, not this variable.
                 let wanted = display.unwrap_or_default();
                 tracing::warn!("display {wanted:?} not found — sharing the primary display");
-                platform.create_capture(None)
+                platform.create_capture(None).map(|c| (c, None))
             }
-            other => other,
+            other => other.map(|c| (c, display.map(str::to_string))),
         };
         match attempt {
             Ok(c) => {
@@ -113,13 +164,22 @@ pub(crate) fn host_media_loop(
         codec,
         shared,
         ctl_tx,
+        ui,
     } = media;
     // The host's cursor images (D9). Per session: a new session (including a
     // reconnect) starts empty, so the first shape the new capture reports is
     // sent again even if an earlier session had sent it.
     let mut cursor_images = super::cursor::HostCursor::default();
     let codecs = platform.codecs();
-    let mut cap = open_capture(platform.as_ref(), display.as_deref(), &stop)?;
+    let (mut cap, opened) = open_capture(platform.as_ref(), display.as_deref(), &stop)?;
+    // The monitor being shared, as an id from `platform.displays()`, announced
+    // to both sides so either can offer a switch.
+    let mut current_display = {
+        let displays = platform.displays();
+        let current = resolve_display_id(&displays, opened.as_deref());
+        announce_displays(&displays, &current, &ctl_tx, &ui);
+        current
+    };
     // Encode at the screen's REAL size. Assuming 1920x1080 made the GPU
     // converter rescale every frame on any other monitor (soft picture, wrong
     // aspect) — the viewer adapts to whatever size actually arrives.
@@ -181,6 +241,93 @@ pub(crate) fn host_media_loop(
             std::thread::sleep(MAX_FPS_INTERVAL - since);
         }
         last_frame_at = std::time::Instant::now();
+
+        // A monitor switch (host UI, or a controlling viewer). The new capture
+        // is opened next to the old one and only replaces it once it AND an
+        // encoder on its device both exist, so a failed switch keeps sharing
+        // the current monitor. The encoder is always rebuilt: it lives on the
+        // capture's GPU device (§5c zero-copy), and each capture has its own.
+        let switch_to = shared.display_req.lock().take();
+        if let Some(want_id) = switch_to {
+            let displays = platform.displays();
+            match displays.iter().find(|d| d.id == want_id) {
+                None => {
+                    tracing::warn!("host: monitor switch to {want_id:?}: no such display");
+                    let _ = ui.send(crate::UiEvent::Toast(
+                        "That monitor is no longer connected".into(),
+                    ));
+                }
+                Some(d) if d.id == current_display => {}
+                Some(d) => {
+                    cap.release();
+                    match platform.create_capture(Some(&d.id)) {
+                        Ok(new_cap) => {
+                            let (w, h) = new_cap.dimensions();
+                            let want = match shared.view_size.load(Ordering::SeqCst) {
+                                0 => fit_within((w, h), (w, h)),
+                                v => fit_within(((v >> 32) as u32, v as u32), (w, h)),
+                            };
+                            let mut new_cfg = cfg;
+                            new_cfg.width = want.0;
+                            new_cfg.height = want.1;
+                            match codecs.new_encoder(new_cap.device(), new_cfg) {
+                                Ok(e) => {
+                                    tracing::info!(
+                                        "host: switched to monitor {:?} ({w}x{h}, encoding {}x{})",
+                                        d.id,
+                                        want.0,
+                                        want.1
+                                    );
+                                    // Encoder first: it may hold a reference into
+                                    // the old capture's device.
+                                    encoder = e;
+                                    cap = new_cap;
+                                    cfg = new_cfg;
+                                    (cap_w, cap_h) = (w, h);
+                                    encoder_size = want;
+                                    applied_bitrate = cfg.bitrate_bps;
+                                    rejected_size = None;
+                                    capture_down_since = None;
+                                    #[cfg(feature = "test-hooks")]
+                                    shared.encode_dims.store(
+                                        (u64::from(encoder_size.0) << 32)
+                                            | u64::from(encoder_size.1),
+                                        Ordering::SeqCst,
+                                    );
+                                    // A new picture: the viewer's decoder restarts
+                                    // here (new SPS/PPS, maybe a new size).
+                                    encoder.force_keyframe();
+                                    force_key.store(false, Ordering::SeqCst);
+                                    last_keyframe_at = std::time::Instant::now();
+                                    current_display = d.id.clone();
+                                    // Input follows the picture.
+                                    *shared.input_rect.lock() =
+                                        Some(crate::session::input_rect_for(d));
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "host: monitor switch to {:?}: no encoder ({e})",
+                                        d.id
+                                    );
+                                    let _ = ui.send(crate::UiEvent::Toast(format!(
+                                        "Could not switch monitors: {e}"
+                                    )));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("host: monitor switch to {:?}: {e}", d.id);
+                            let _ = ui.send(crate::UiEvent::Toast(format!(
+                                "Could not switch monitors: {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+            // Always answer, so a picker that optimistically showed the new
+            // choice snaps back when the switch did not happen.
+            announce_displays(&displays, &current_display, &ctl_tx, &ui);
+        }
 
         // §6 adaptive bitrate: feed the current BWE target to the encoder.
         let target = bitrate.load(Ordering::SeqCst);

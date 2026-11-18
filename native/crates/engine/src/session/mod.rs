@@ -57,6 +57,15 @@ pub(crate) struct Shared {
     /// held frame once and clears it (or, with nothing decoded yet, asks for a
     /// keyframe so a fresh frame arrives to show).
     pub repaint_requested: AtomicBool,
+    /// Host: a monitor switch (a `DisplayInfo::id`) waiting for the media
+    /// thread, which owns the capture. Set by the host UI or by a controlling
+    /// viewer's `seldisp`; the newest request wins.
+    pub display_req: Mutex<Option<String>>,
+    /// Host: the injector's new target rectangle once a switch has taken
+    /// effect (`Some(None)` = the primary display). Set by the media thread
+    /// right after the new capture is live, taken by the transport thread
+    /// (which owns the injector), so input follows the picture.
+    pub input_rect: Mutex<Option<Option<Rect>>>,
     /// Test hook (`test-hooks` feature only): the host's current encode size,
     /// `w << 32 | h`, so the loopback can assert it stays full resolution as the
     /// link varies (V2 has no resolution ladder).
@@ -98,10 +107,10 @@ pub(crate) struct Session {
     clip_on: Arc<AtomicBool>,
     /// The user's clipboard-sync setting at session start.
     clipboard_setting: bool,
-    /// Viewer: the per-session shared state, so [`request_repaint`] can set the
-    /// repaint flag when the surface is re-shown (task D12). `None` on a host
-    /// session (no viewer present loop to repaint).
-    shared: Option<Arc<Shared>>,
+    /// The per-session shared state: on the viewer so [`request_repaint`] can
+    /// set the repaint flag when the surface is re-shown (task D12); on the host
+    /// so [`request_display`] can hand a monitor switch to the media thread.
+    shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
     /// Test hooks (`test-hooks` feature only): the host's rate state, so the
     /// loopback can observe the encoder target / raw link and inject estimates.
@@ -156,6 +165,13 @@ fn target_rect_for(engine: &Engine, display: Option<&str>) -> Option<Rect> {
         .displays()
         .into_iter()
         .find(|d| d.id == id)?;
+    input_rect_for(&d)
+}
+
+/// Where `[0,1]` input maps for display `d`: `None` (the injector's simple
+/// primary-display path) for the primary, its virtual-desktop rectangle
+/// otherwise.
+pub(crate) fn input_rect_for(d: &platform_api::DisplayInfo) -> Option<Rect> {
     (!d.primary).then_some(Rect {
         x: d.x,
         y: d.y,
@@ -288,6 +304,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
     // into the media loop (no-op without the `test-hooks` feature).
     #[cfg(feature = "test-hooks")]
     let (hooks_bitrate, hooks_link, hooks_shared) = (bitrate.clone(), link.clone(), shared.clone());
+    let host_shared = shared.clone();
 
     {
         let media = HostMedia {
@@ -296,6 +313,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
             codec,
             shared,
             ctl_tx: ctl_tx.clone(),
+            ui: engine.ui_sender(),
         };
         let stop_m = stop.clone();
         let ui = engine.ui_sender();
@@ -322,7 +340,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
         control,
         clip_on,
         clipboard_setting: cfg.clipboard_sync,
-        shared: None,
+        shared: host_shared,
         threads,
         #[cfg(feature = "test-hooks")]
         hooks: Some(TestHooks {
@@ -557,7 +575,7 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
         control: Arc::new(AtomicBool::new(false)),
         clip_on,
         clipboard_setting: cfg.clipboard_sync,
-        shared: Some(shared),
+        shared,
         threads,
         #[cfg(feature = "test-hooks")]
         hooks: None,
@@ -724,9 +742,16 @@ pub(crate) fn set_control(engine: &Engine, allow: bool) {
 /// on a host session (no viewer `shared`).
 pub(crate) fn request_repaint(engine: &Engine) {
     if let Some(s) = engine.session.lock().as_ref() {
-        if let Some(shared) = &s.shared {
-            shared.repaint_requested.store(true, Ordering::SeqCst);
-        }
+        s.shared.repaint_requested.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Host: switch the shared monitor to `id`. The media thread picks it up on its
+/// next pass, swaps the capture, re-targets input and announces the result to
+/// both UIs. A no-op without a session.
+pub(crate) fn request_display(engine: &Engine, id: String) {
+    if let Some(s) = engine.session.lock().as_ref() {
+        *s.shared.display_req.lock() = Some(id);
     }
 }
 
