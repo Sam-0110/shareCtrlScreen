@@ -216,6 +216,18 @@ impl SyncTab {
         .unwrap_or(0)
     }
 
+    /// Leave out its window (plans/09 W4): what goes to a server that does
+    /// not store placement. The rest of the tab is unchanged.
+    pub fn without_placement(&self) -> SyncTab {
+        SyncTab {
+            order: self.order.clone(),
+            order_at: self.order_at,
+            opened_at: self.opened_at,
+            closed_at: self.closed_at,
+            ..SyncTab::default()
+        }
+    }
+
     /// Clamp every stamp to at most `max` (08a §7.3: a computer whose clock
     /// runs ahead must not win every future edit).
     pub fn clamp_stamps(&mut self, max: u64) {

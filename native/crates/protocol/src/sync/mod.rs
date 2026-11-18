@@ -49,9 +49,9 @@ pub const MAX_SYNC_ENTRIES: usize = 500;
 pub const FEATURE_PREFS: &str = "prefs";
 pub const FEATURE_TABS: &str = "tabs";
 /// Detached windows' placement in tabs (plans/09): a server that lists it
-/// validates and merges those fields. Until W4 gates sending on it, the
-/// fields also reach a server without it, which drops them harmlessly (it
-/// keeps no placement; each computer keeps its own).
+/// validates and merges those fields; a computer sends them only to such a
+/// server ([`SyncDoc::strip_placement`]). A server without it would drop
+/// them anyway; each computer keeps its own.
 pub const FEATURE_PLACEMENT: &str = "placement";
 
 /// One remote ID in a [`SyncDoc`].
@@ -111,6 +111,14 @@ impl Default for SyncDoc {
 
 impl SyncDoc {
     /// Fold `other` into `self` (see the module docs for the rules).
+    /// Leave every tab's window out (plans/09 W4): a computer sends
+    /// placement only to a server that lists [`FEATURE_PLACEMENT`].
+    pub fn strip_placement(&mut self) {
+        for tab in self.tabs.values_mut() {
+            *tab = tab.without_placement();
+        }
+    }
+
     pub fn merge(&mut self, other: &SyncDoc) {
         for (id, theirs) in &other.entries {
             self.entries.entry(id.clone()).or_default().merge(theirs);
@@ -454,6 +462,37 @@ mod tests {
             );
             assert_eq!(ab, ba, "{}: the order of merging matters", c.name);
         }
+    }
+
+    /// plans/09 W4: what a server without placement receives — the tab,
+    /// none of its window — and that merging its answer back loses nothing
+    /// here.
+    #[test]
+    fn placement_is_left_out_for_a_server_that_does_not_store_it() {
+        let mut mine = SyncDoc::default();
+        let mut tab = SyncTab {
+            order: "m".into(),
+            order_at: 1,
+            opened_at: 2,
+            detached: true,
+            detached_at: 3,
+            size: Some(Size { w: 5000, h: 5000 }),
+            size_at: 3,
+            ..SyncTab::default()
+        };
+        mine.tabs.insert(X.into(), tab.clone());
+        let mut sent = mine.clone();
+        sent.strip_placement();
+        assert_eq!(
+            serde_json::to_value(&sent.tabs[X]).unwrap(),
+            serde_json::json!({"order":"m","orderAt":1,"openedAt":2,"closedAt":0})
+        );
+        // The old server answers with what it stored; merged here, the
+        // window survives.
+        mine.merge(&sent);
+        tab.merge(&sent.tabs[X]);
+        assert_eq!(mine.tabs[X], tab);
+        assert!(mine.tabs[X].is_detached());
     }
 
     #[test]

@@ -172,6 +172,59 @@ step("tabs: validated, the last open or close wins", async () => {
   assert.ok(r.body.doc.tabs[X].closedAt > r.body.doc.tabs[X].openedAt);
 });
 
+step("placement: stored per field, validated, a position kept from a computer without one", async () => {
+  const t = Date.now() - 5_000;
+  let r = await call(
+    "/api/sync",
+    {
+      doc: {
+        tabs: {
+          [Y]: {
+            order: "p",
+            orderAt: t,
+            openedAt: t,
+            detached: true,
+            detachedAt: t + 1,
+            state: "maximized",
+            stateAt: t + 1,
+            size: { w: 5000, h: 6000 },
+            sizeAt: t + 1,
+            pos: { monitor: 1, x: 2500, y: 0 },
+            posAt: t + 1,
+          },
+        },
+      },
+    },
+    tokA
+  );
+  assert.deepEqual(r.body.doc.tabs[Y].pos, { monitor: 1, x: 2500, y: 0 });
+  // Another computer (Wayland): a newer size, no position; nonsense dropped.
+  r = await call(
+    "/api/sync",
+    {
+      doc: {
+        tabs: {
+          [Y]: {
+            order: "p",
+            orderAt: t,
+            openedAt: t,
+            size: { w: 7000, h: 7000 },
+            sizeAt: t + 2,
+            state: "sideways",
+            stateAt: t + 2,
+          },
+        },
+      },
+    },
+    tokB
+  );
+  const tab = r.body.doc.tabs[Y];
+  assert.deepEqual(tab.size, { w: 7000, h: 7000 });
+  assert.deepEqual(tab.pos, { monitor: 1, x: 2500, y: 0 }, "the position stays");
+  assert.equal(tab.state, undefined, "an unknown state reads as normal (left out)");
+  assert.equal(tab.detached, true);
+});
+
 step("a document with more tabs than the cap is refused", async () => {
   const tabs = {};
   const hex = (n) => n.toString(16).padStart(12, "0");

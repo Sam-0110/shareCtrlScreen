@@ -196,6 +196,8 @@ async fn post<T: for<'de> Deserialize<'de>>(
 struct Features {
     tabs: bool,
     prefs: bool,
+    /// Detached windows' placement (plans/09 W4).
+    placement: bool,
 }
 
 impl Features {
@@ -203,6 +205,7 @@ impl Features {
         Features {
             tabs: list.iter().any(|f| f == protocol::sync::FEATURE_TABS),
             prefs: list.iter().any(|f| f == protocol::sync::FEATURE_PREFS),
+            placement: list.iter().any(|f| f == protocol::sync::FEATURE_PLACEMENT),
         }
     }
 }
@@ -344,9 +347,14 @@ impl AccountManager {
             return Err("Not signed in.".into());
         };
         let sent = self.inner().features.get(&key).copied().unwrap_or_default();
-        let Some(doc) = self.engine.sync_doc(&key, sent.tabs, sent.prefs) else {
+        let Some(mut doc) = self.engine.sync_doc(&key, sent.tabs, sent.prefs) else {
             return Err("Not signed in.".into());
         };
+        // Detached windows go only to a server that stores them (plans/09
+        // W4); until its first reply says so, none is assumed.
+        if !sent.placement {
+            doc.strip_placement();
+        }
         let result: Result<SyncBody, Failure> = post(
             &format!("{server}/api/sync"),
             Some(&token),
@@ -844,10 +852,16 @@ mod tests {
             Features::from_reply(&b.features),
             Features {
                 tabs: true,
-                prefs: true
-            }
+                prefs: true,
+                placement: false
+            },
+            "a server from before plans/09 stores no placement"
         );
         assert_eq!(b.server_time, 1_800_000_000_000);
+        let b: SyncBody =
+            serde_json::from_str(r#"{"doc":{"v":2},"features":["placement","prefs","tabs"]}"#)
+                .unwrap();
+        assert!(Features::from_reply(&b.features).placement);
     }
 
     /// Two computers, one account, through a real server (`server/`):
