@@ -3,22 +3,33 @@ name: Deploy Server
 # Idempotent, version-driven deploy of the signaling server to Cloudflare.
 #
 # Source of truth is the "version" field in server/package.json.
-# Clicking "Run workflow" (Actions -> Deploy Server -> Run workflow):
+# Runs automatically on every push to main that touches server/ (or this file),
+# and can still be started by hand (Actions -> Deploy Server -> Run workflow):
 #   1. reads that version, e.g. 1.0.0 -> gate tag "server-v1.0.0"
 #   2. if that gate tag already exists -> skips (already deployed, no-op)
 #   3. otherwise runs `wrangler deploy` to push the Worker + Durable Object to
 #      Cloudflare, then creates the gate tag to record the deploy.
 #
-# To redeploy after changing the server: bump "version" in server/package.json,
-# commit, push, run.
+# To redeploy after changing the server: bump "version" in server/package.json
+# and merge to main. A server change WITHOUT a version bump is not deployed.
 #
 # Requires a repo secret named APP_TOKEN = a Cloudflare API token (see README /
 # the "Edit Cloudflare Workers" token template).
 on:
+  push:
+    branches: [main]
+    paths:
+      - "server/**"
+      - ".github/workflows/deploy-server.yml"
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# One deploy at a time; a queued run waits instead of racing the gate tag.
+concurrency:
+  group: deploy-server
+  cancel-in-progress: false
 
 jobs:
   # Cheap job: read version, decide whether this version was already deployed.
