@@ -165,6 +165,20 @@ define_class!(
             true
         }
 
+        /// Never the band at the window's visual top that the top inset
+        /// keeps for the web page (the tab strip): clicks there go to the
+        /// page, whatever this view's frame and its layer's flips say. The
+        /// 2.3.0 Mac report had the strip visible but not clickable while
+        /// the video showed nothing (M14).
+        #[unsafe(method(hitTest:))]
+        fn hit_test(&self, point: NSPoint) -> Option<Retained<NSView>> {
+            if self.in_page_band(point) {
+                return None;
+            }
+            // SAFETY: forwarding the same selector to NSView.
+            unsafe { msg_send![super(self), hitTest: point] }
+        }
+
         #[unsafe(method(becomeFirstResponder))]
         fn become_first_responder(&self) -> bool {
             // SAFETY: forwarding the same selector to NSResponder.
@@ -925,6 +939,27 @@ impl VideoView {
             layer.setContentsGravity(gravity);
         });
         self.publish_metrics();
+    }
+
+    /// Whether `point` (in the superview's coordinates, as `hitTest:` gets
+    /// it) lies in the band at the top of the window's content that the top
+    /// inset leaves to the web page. Measured in window coordinates, whose
+    /// origin is always the bottom-left corner, so no view's flip matters.
+    fn in_page_band(&self, point: NSPoint) -> bool {
+        let inset = f64::from(self.ivars().state.top_inset());
+        if inset <= 0.0 {
+            return false;
+        }
+        // SAFETY: reading the superview has no preconditions.
+        let Some(parent) = (unsafe { self.superview() }) else {
+            return false;
+        };
+        let Some(content) = self.window().and_then(|w| w.contentView()) else {
+            return false;
+        };
+        let in_window = parent.convertPoint_toView(point, None);
+        let top = content.frame().size.height;
+        top - in_window.y < inset
     }
 
     /// The top inset in points, never the whole of `height`.

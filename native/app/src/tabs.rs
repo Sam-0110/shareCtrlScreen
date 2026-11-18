@@ -906,6 +906,12 @@ impl TabManager {
         }
     }
 
+    /// The strip's tab on screen in the main window, if any.
+    pub(crate) fn shown_remote(&self) -> Option<String> {
+        let ws = self.engine.workspace()?;
+        shown_tab(&ws, &self.lock())
+    }
+
     /// The tab in detached window `window`.
     fn remote_in(&self, window: WindowId) -> Option<String> {
         let inner = self.lock();

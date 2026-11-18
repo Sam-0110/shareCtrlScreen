@@ -192,6 +192,26 @@ Wayland: size and state only, documented. macOS: minimise / restore and focus ev
 `Resized`), key window vs first responder for the focused session. Windows: placement across
 mixed-DPI monitors (`ScaleFactorChanged`). Device checklists `checklists/DETACH-W*.md`.
 
+### Device findings (2.3.1)
+
+The owner's first Mac → Windows run on 2.3.0 (Mac and Windows app.logs, 2026-11-18):
+
+* **Black screen** — every AV1 frame from the Windows host's hardware encoder reached the Mac
+  malformed
+  ("forbidden bit set in an OBU header", sequence headers that "end early", 2×9 / 1×1
+  pictures): an OBU header with its forbidden bit set can only come from the encoder's output
+  being read as something it is not — most likely Annex B (length-prefixed), which the payloader
+  does not expect; unconfirmed until the host logs it. Not a plan-09 regression: AV1 between
+  machines had never run on devices. Fix:
+  the host puts every AV1 temporal unit in the sized low-overhead form, converting Annex B and
+  unsized OBUs (`engine/src/media/av1.rs`) and logging which form the encoder gave; viewers log
+  the first bytes of an access unit no decoder takes. Device-pending: the next Mac → Windows run.
+* **Strip and session bar not clickable on the Mac** while no picture was ever drawn — the
+  video view sat over the page (M14). Fix: the view never takes clicks in the band the top
+  inset leaves to the page; the native Tabs menu gains Move Tab to New Window / to Main Window
+  (the session bar sits under the video on macOS). Mac → Linux worked, so the band is the
+  suspect, not the layout. Device-pending.
+
 ## 5. Decisions (owner, 2026-11-18)
 
 Everything in §1, and:

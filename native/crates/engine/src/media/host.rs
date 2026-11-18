@@ -20,6 +20,7 @@
 //! * `crate::tuning`: the pure [`encoder_target`](crate::tuning::encoder_target)
 //!   bitrate policy.
 
+use super::av1 as media_av1;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -419,6 +420,9 @@ pub(crate) fn host_media_loop(
     };
     // Encoder shares the capture device (§5c zero-copy).
     let mut encoder = codecs.new_encoder(cap.device(), cfg)?;
+    // AV1: what form the encoder's temporal units come in, logged once (and
+    // again if it changes), as they are put in the form RTP expects.
+    let mut av1_form: Option<media_av1::Form> = None;
     tracing::info!(
         "host: capture+encoder ready ({}x{} @{}fps, {}, {} kbps)",
         cfg.width,
@@ -759,7 +763,26 @@ pub(crate) fn host_media_loop(
                                     applied_bitrate / 1000
                                 );
                             }
-                            let _ = frame_tx.send((slot, u.data, u.keyframe));
+                            let data = if codec == Codec::Av1 {
+                                let (data, form) = media_av1::normalize(u.data);
+                                if av1_form != Some(form) {
+                                    av1_form = Some(form);
+                                    match form {
+                                        media_av1::Form::Unknown => tracing::warn!(
+                                            "host: AV1 encoder output is neither low-overhead \
+                                             nor Annex B; sent as is (first bytes: {})",
+                                            media_av1::hex_prefix(&data)
+                                        ),
+                                        other => {
+                                            tracing::info!("host: AV1 encoder output: {other:?}")
+                                        }
+                                    }
+                                }
+                                data
+                            } else {
+                                u.data
+                            };
+                            let _ = frame_tx.send((slot, data, u.keyframe));
                         }
                     }
                     Err(e) => tracing::warn!("encode error: {e}"),
