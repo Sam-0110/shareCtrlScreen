@@ -256,7 +256,14 @@ pub async fn updater_install(
         return Ok(());
     }
 
-    state.engine.end_session();
+    // Every session released (threads joined, held keys let go) before the
+    // installer replaces this process.
+    // (Not `end_sessions_for_exit`: an install that fails leaves the app
+    // running, and its tabs must still be able to connect.)
+    state
+        .engine
+        .end_all_and_wait(std::time::Duration::from_secs(3))
+        .await;
 
     let updater = app.updater().map_err(|e| e.to_string())?;
     let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {

@@ -793,6 +793,14 @@ impl VideoView {
         }
     }
 
+    /// Take the keyboard (the tab was shown): first responder in its window,
+    /// as a click on it does.
+    pub(crate) fn take_focus(&self) {
+        if let Some(window) = self.window() {
+            window.makeFirstResponder(Some(self));
+        }
+    }
+
     /// Give keyboard focus back to the page (the view below us) when hiding,
     /// so the Settings dialog's fields can be typed into straight away.
     pub(crate) fn yield_focus(&self) {
@@ -804,8 +812,12 @@ impl VideoView {
         }
         // SAFETY: reading the superview has no preconditions.
         let below = unsafe { self.superview() }.and_then(|parent| {
+            // B10: never another video view (a hidden tab's): the keys would
+            // go to a session that is not on screen.
             parent.subviews().to_vec().into_iter().rev().find(|v| {
-                !std::ptr::eq(Retained::as_ptr(v), self.as_view()) && v.acceptsFirstResponder()
+                !std::ptr::eq(Retained::as_ptr(v), self.as_view())
+                    && !v.isKindOfClass(VideoView::class())
+                    && v.acceptsFirstResponder()
             })
         });
         match below {
@@ -832,7 +844,11 @@ impl VideoView {
         };
         let bounds = parent.bounds();
         let scale = self.backing_scale();
-        let inset = (self.ivars().reveal.get().inset_px(scale) / scale).min(bounds.size.height);
+        // The persistent top inset (the tab bar, plans/08 P3, CSS px = points)
+        // plus the reveal; both come off the visual top.
+        let base = self.base_inset(bounds.size.height);
+        let inset =
+            (base + self.ivars().reveal.get().inset_px(scale) / scale).min(bounds.size.height);
         // The strip is always removed from the VISUAL top (where the web
         // toolbar is). How a frame expresses that depends on the coordinate
         // system it is measured in: in a top-left (flipped) space the origin
@@ -911,14 +927,21 @@ impl VideoView {
         self.publish_metrics();
     }
 
-    /// Publish the full surface size and scale for `client_size` and the
-    /// presenter. Derived from the parent, not our (possibly shrunk) frame.
+    /// The top inset in points, never the whole of `height`.
+    fn base_inset(&self, height: f64) -> f64 {
+        f64::from(self.ivars().state.top_inset()).min((height - 1.0).max(0.0))
+    }
+
+    /// Publish the surface size and scale for `client_size` and the
+    /// presenter: the parent below the top inset, not our frame (which the
+    /// reveal may shrink).
     fn publish_metrics(&self) {
         // SAFETY: reading the superview has no preconditions.
         let Some(parent) = (unsafe { self.superview() }) else {
             return;
         };
-        let size = parent.bounds().size;
+        let mut size = parent.bounds().size;
+        size.height -= self.base_inset(size.height);
         let scale = self.backing_scale();
         let px = |pt: f64| (pt * scale).round().clamp(0.0, f64::from(u32::MAX)) as u32;
         let state = &self.ivars().state;

@@ -32,12 +32,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use engine::Engine;
+use engine::{Engine, SessionId};
 use protocol::{PopoutStream, RemoteDisplay};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
-/// Window label prefix; then `<slot>-<serial>`.
+/// Window label prefix; then `<session>-<slot>-<serial>`.
 const LABEL_PREFIX: &str = "popout-";
 
 /// Most pop-out windows the viewer opens, whatever a host announces (the
@@ -50,6 +49,8 @@ const ATTACH_WAIT: Duration = Duration::from_secs(3);
 
 /// One pop-out window.
 struct Entry {
+    /// The viewer session it belongs to.
+    session: SessionId,
     /// The monitor id it shows.
     id: String,
     label: String,
@@ -57,15 +58,20 @@ struct Entry {
     gen: Option<u64>,
 }
 
-/// The wanted pop-out windows, by stream slot.
+/// A pop-out window's key: its viewer session and stream slot. Every tab
+/// has its own slots 1..=3 (B13: keyed by slot alone, two tabs' pop-outs
+/// replaced each other).
+type Key = (SessionId, u8);
+
+/// The wanted pop-out windows, by session and stream slot.
 #[derive(Default)]
 pub struct PopoutWindows {
-    open: Mutex<HashMap<u8, Entry>>,
+    open: Mutex<HashMap<Key, Entry>>,
     serial: AtomicU64,
 }
 
 impl PopoutWindows {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u8, Entry>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Key, Entry>> {
         self.open.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -104,10 +110,11 @@ fn wanted(popouts: &[PopoutStream]) -> Vec<PopoutStream> {
 }
 
 /// Make the open pop-out windows match the host's latest announcement
-/// (viewer only; the caller checks the role).
+/// for viewer session `session` (the caller checks it is a viewer session).
 pub fn reconcile(
     app: &AppHandle,
     engine: &Arc<Engine>,
+    session: SessionId,
     list: &[RemoteDisplay],
     popouts: &[PopoutStream],
 ) {
@@ -119,25 +126,27 @@ pub fn reconcile(
     // waits on the UI thread, which may itself want this lock.
     let (stale, new) = {
         let mut open = state.lock();
-        let stale_slots: Vec<u8> = open
+        // Only this session's windows: other tabs' pop-outs are theirs.
+        let stale_keys: Vec<Key> = open
             .iter()
-            .filter(|(s, e)| !wanted.iter().any(|p| p.s == **s && p.id == e.id))
-            .map(|(s, _)| *s)
+            .filter(|(k, e)| k.0 == session && !wanted.iter().any(|p| p.s == k.1 && p.id == e.id))
+            .map(|(k, _)| *k)
             .collect();
-        let stale: Vec<(u8, Entry)> = stale_slots
+        let stale: Vec<(u8, Entry)> = stale_keys
             .into_iter()
-            .filter_map(|s| open.remove(&s).map(|e| (s, e)))
+            .filter_map(|k| open.remove(&k).map(|e| (k.1, e)))
             .collect();
         let mut new = Vec::new();
         for p in &wanted {
-            if open.contains_key(&p.s) {
+            if open.contains_key(&(session, p.s)) {
                 continue;
             }
             let serial = state.serial.fetch_add(1, Ordering::Relaxed);
-            let label = format!("{LABEL_PREFIX}{}-{serial}", p.s);
+            let label = format!("{LABEL_PREFIX}{}-{}-{serial}", session.0, p.s);
             open.insert(
-                p.s,
+                (session, p.s),
                 Entry {
+                    session,
                     id: p.id.clone(),
                     label: label.clone(),
                     gen: None,
@@ -152,17 +161,32 @@ pub fn reconcile(
         close_window(app, engine, slot, e, false);
     }
     for (p, label) in new {
-        open_window(app, engine, &p, label, list.iter().find(|d| d.id == p.id));
+        open_window(
+            app,
+            engine,
+            session,
+            &p,
+            label,
+            list.iter().find(|d| d.id == p.id),
+        );
     }
 }
 
-/// Close every pop-out window (the session ended).
-pub fn close_all(app: &AppHandle, engine: &Arc<Engine>) {
+/// Close the pop-out windows of `session`, which was released: the engine
+/// has already stopped their threads and let go of their surfaces, so the
+/// windows can go (08a §6.5 step 3).
+pub fn close_session(app: &AppHandle, engine: &Arc<Engine>, session: SessionId) {
     let Some(state) = app.try_state::<PopoutWindows>() else {
         return;
     };
-    let all: Vec<(u8, Entry)> = state.lock().drain().collect();
-    for (slot, e) in all {
+    let theirs: Vec<(u8, Entry)> = {
+        let mut open = state.lock();
+        let keys: Vec<Key> = open.keys().filter(|k| k.0 == session).copied().collect();
+        keys.into_iter()
+            .filter_map(|k| open.remove(&k).map(|e| (k.1, e)))
+            .collect()
+    };
+    for (slot, e) in theirs {
         close_window(app, engine, slot, e, false);
     }
 }
@@ -176,11 +200,11 @@ pub fn on_close_requested(app: &AppHandle, engine: &Arc<Engine>, label: &str) ->
     }
     let found = app.try_state::<PopoutWindows>().and_then(|state| {
         let mut open = state.lock();
-        let slot = open
+        let key = open
             .iter()
             .find(|(_, e)| e.label == label)
-            .map(|(s, _)| *s)?;
-        open.remove(&slot).map(|e| (slot, e))
+            .map(|(k, _)| *k)?;
+        open.remove(&key).map(|e| (key.1, e))
     });
     // Not found: it is already closing; its pending close destroys it.
     if let Some((slot, e)) = found {
@@ -192,6 +216,7 @@ pub fn on_close_requested(app: &AppHandle, engine: &Arc<Engine>, label: &str) ->
 fn open_window(
     app: &AppHandle,
     engine: &Arc<Engine>,
+    session: SessionId,
     p: &PopoutStream,
     label: String,
     display: Option<&RemoteDisplay>,
@@ -212,13 +237,13 @@ fn open_window(
             tracing::warn!("pop-out window {slot}: {e}");
             if let Some(state) = app.try_state::<PopoutWindows>() {
                 let mut open = state.lock();
-                if open.get(&slot).is_some_and(|e| e.label == label) {
-                    open.remove(&slot);
+                if open.get(&(session, slot)).is_some_and(|e| e.label == label) {
+                    open.remove(&(session, slot));
                 }
             }
             // Stop the stream nobody can see.
             let engine = engine.clone();
-            std::thread::spawn(move || engine.close_popout(slot, None));
+            std::thread::spawn(move || engine.close_popout(session, slot, None));
             return;
         }
     };
@@ -227,11 +252,12 @@ fn open_window(
     let (engine, app) = (engine.clone(), app.clone());
     std::thread::spawn(move || {
         let deadline = Instant::now() + ATTACH_WAIT;
-        while engine.popout_attached(slot) && Instant::now() < deadline {
+        while engine.popout_attached(session, slot) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         let app2 = app.clone();
-        let queued = app.run_on_main_thread(move || attach(&app2, &engine, &win, slot, &label));
+        let queued =
+            app.run_on_main_thread(move || attach(&app2, &engine, &win, session, slot, &label));
         if let Err(e) = queued {
             tracing::warn!("pop-out window {slot}: {e}");
         }
@@ -245,6 +271,7 @@ fn attach(
     app: &AppHandle,
     engine: &Arc<Engine>,
     win: &tauri::WebviewWindow,
+    session: SessionId,
     slot: u8,
     label: &str,
 ) {
@@ -255,52 +282,27 @@ fn attach(
     // lock) then sees either "not attached yet, so not attached at all" or
     // the generation to detach.
     let mut open = state.lock();
-    let Some(entry) = open.get_mut(&slot).filter(|e| e.label == label) else {
+    let Some(entry) = open.get_mut(&(session, slot)).filter(|e| e.label == label) else {
         // Closed (or replaced) before it could attach; its close destroys it.
         let _ = win.destroy();
         return;
     };
-    match make_surface(engine, win, slot).and_then(|s| engine.attach_popout(slot, s)) {
+    let surface = crate::surfaces::create_in(engine, win)
+        .map_err(|e| tracing::warn!("pop-out window {slot}: {e}"))
+        .ok();
+    match surface.and_then(|s| engine.attach_popout(session, slot, s)) {
         Some(gen) => {
             entry.gen = Some(gen);
             tracing::info!("pop-out window {slot} attached");
         }
         None => {
             tracing::warn!("pop-out window {slot}: could not attach; closing it");
-            open.remove(&slot);
+            open.remove(&(session, slot));
             let (engine, win) = (engine.clone(), win.clone());
             std::thread::spawn(move || {
-                engine.close_popout(slot, None);
+                engine.close_popout(session, slot, None);
                 let _ = win.destroy();
             });
-        }
-    }
-}
-
-fn make_surface(
-    engine: &Engine,
-    win: &tauri::WebviewWindow,
-    slot: u8,
-) -> Option<Arc<dyn platform_api::VideoSurface>> {
-    let handles = win
-        .window_handle()
-        .map_err(|e| e.to_string())
-        .and_then(|w| {
-            win.display_handle()
-                .map(|d| (w.as_raw(), d.as_raw()))
-                .map_err(|e| e.to_string())
-        });
-    match handles {
-        Ok((window, display)) => match engine.platform().create_surface(window, display) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!("pop-out window {slot}: no native video surface: {e}");
-                None
-            }
-        },
-        Err(e) => {
-            tracing::warn!("pop-out window {slot}: no window handle: {e}");
-            None
         }
     }
 }
@@ -313,9 +315,9 @@ fn close_window(app: &AppHandle, engine: &Arc<Engine>, slot: u8, e: Entry, tell_
     let engine = engine.clone();
     std::thread::spawn(move || {
         if tell_host {
-            engine.close_popout(slot, e.gen);
+            engine.close_popout(e.session, slot, e.gen);
         } else {
-            engine.detach_popout(slot, e.gen);
+            engine.detach_popout(e.session, slot, e.gen);
         }
         if let Some(win) = win {
             let _ = win.destroy();
@@ -329,7 +331,7 @@ mod tests {
 
     #[test]
     fn only_popout_windows_are_popouts() {
-        assert!(is_popout_label("popout-1-0"));
+        assert!(is_popout_label("popout-7-1-0"));
         assert!(!is_popout_label("main"));
     }
 

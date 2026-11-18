@@ -1,0 +1,77 @@
+name: Server tests
+
+# The signaling/accounts server's own tests. Runs on every pull request that changes
+# server/; on main, deploy-server.yml calls it before deploying (so it runs once per
+# push there, not twice), and nothing reaches Cloudflare untested.
+#
+# The accounts smoke test (server/test/accounts-smoke.mjs) drives the real Worker
+# through `wrangler dev`, which runs it locally in workerd with local Durable Object
+# storage — no Cloudflare account and no secrets are needed.
+on:
+  pull_request:
+    paths:
+      - "server/**"
+      - "native/crates/protocol/testdata/sync-vectors.json"
+      - ".github/workflows/server-tests.yml"
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    env:
+      # No telemetry prompt or upload from CI.
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Wrangler requires Node >= 22.
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The merge cases shared with the app (native/crates/protocol/testdata/
+      # sync-vectors.json): the server's merge must agree with the Rust one.
+      - name: Shared sync merge cases
+        run: npm run test:vectors
+
+      - name: Start the Worker locally (wrangler dev)
+        shell: bash
+        run: |
+          npx wrangler dev --port 8787 --ip 127.0.0.1 > wrangler-dev.log 2>&1 &
+          echo $! > wrangler-dev.pid
+          # Ready when the port answers at all (any HTTP status); give up after 90 s.
+          for _ in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/ || true)
+            if [ "$code" != "000" ]; then
+              echo "wrangler dev is up (HTTP $code)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::wrangler dev did not start within 90 s"
+          cat wrangler-dev.log
+          exit 1
+
+      - name: Accounts + sync smoke test
+        run: npm run test:accounts
+
+      - name: Worker log (on failure)
+        if: failure()
+        run: cat wrangler-dev.log || true
+
+      - name: Stop wrangler dev
+        if: always()
+        shell: bash
+        run: kill "$(cat wrangler-dev.pid)" 2>/dev/null || true

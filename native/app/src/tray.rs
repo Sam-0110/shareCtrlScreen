@@ -25,7 +25,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use engine::Role;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
@@ -70,6 +69,11 @@ pub fn install(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Whether the tray icon is up (closing the window then hides it).
+pub fn is_installed() -> bool {
+    INSTALLED.load(Ordering::SeqCst)
+}
+
 /// Closing the main window: end any live session, then hide instead of exit.
 /// A session is ended rather than left running behind a hidden window, so
 /// closing the window still stops someone controlling this computer.
@@ -81,10 +85,13 @@ pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
         return;
     }
     api.prevent_close();
-    let engine = &window.app_handle().state::<AppState>().engine;
-    if !matches!(engine.role(), Role::Idle) {
-        engine.end_session();
+    // Every session, including tabs still connecting or waiting for a
+    // password (a late accept must not go live behind a hidden window).
+    let app = window.app_handle();
+    if let Some(tabs) = app.try_state::<std::sync::Arc<crate::tabs::TabManager>>() {
+        tabs.stop_starting();
     }
+    app.state::<AppState>().engine.end_all();
     if let Err(e) = window.hide() {
         tracing::warn!("hiding the window to the tray failed: {e}");
     } else {
@@ -109,8 +116,14 @@ pub fn handle_menu_event(app: &tauri::AppHandle, id: &str) -> bool {
         OPEN_ID => crate::raise_main_window(app),
         QUIT_ID => {
             tracing::info!("Quit from the tray: ending any session and exiting");
-            app.state::<AppState>().engine.end_session();
-            app.exit(0);
+            // Exit only once every session is released (≤ 3 s): a host's
+            // transport thread then has released remotely held keys and
+            // sent its Bye (08a §6.17, I9).
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::end_sessions_for_exit(&app).await;
+                app.exit(0);
+            });
         }
         _ => return false,
     }

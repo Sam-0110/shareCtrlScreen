@@ -77,6 +77,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: native
+      # The web UI is plain ES modules that no build step parses: a syntax
+      # error would only show as a blank window. Runner images ship Node.
+      - name: Web UI modules parse
+        shell: bash
+        run: |
+          tmp="$(mktemp -d)"
+          for f in app/ui/*.js; do cp "$f" "$tmp/$(basename "${f%.js}").mjs"; done
+          for f in "$tmp"/*.mjs; do node --check "$f"; done
       - name: Format check
         run: cargo fmt --all --check
       - name: Clippy

@@ -13,6 +13,17 @@
          are gone and the <video> element is replaced by the native D3D11 child
          surface parented into #video-wrap (§7 Option A). -->
 
+    <!-- ===================== TAB STRIP (plans/08 P4) =====================
+         One tab per remote computer. Always on top: a live tab's native video
+         is laid out BELOW it (the surface's top inset, src/surfaces.rs
+         TAB_BAR_CSS_PX = --tab-bar-h), so the strip stays clickable. -->
+    <nav id="tab-strip" class="tab-strip" aria-label="Remote computers">
+      <div id="tab-list" class="tab-list" role="tablist"></div>
+      <button id="btn-tab-new" class="tab-new" title="New tab">+</button>
+      <div class="spacer"></div>
+      <button id="btn-tab-connect-all" class="btn btn-ghost btn-sm hidden">Connect all</button>
+    </nav>
+
     <!-- ===================== HOME (OFFLINE / READY) ===================== -->
     <section id="screen-home" class="screen">
       <header class="topbar">
@@ -66,6 +77,11 @@
           </div>
           <div class="hint" id="connect-hint"></div>
           <div class="recents" id="recents-row"></div>
+          <!-- The selected account is signed out: nothing of it is shown (I13). -->
+          <div class="hint hidden" id="account-locked-note">
+            <b id="account-locked-note-name"></b> is signed out on this computer.
+            <button id="btn-locked-sign-in" type="button" class="btn btn-sm">Sign in</button>
+          </div>
         </div>
       </main>
     </section>
@@ -110,12 +126,12 @@
       </main>
     </section>
 
-    <!-- ===================== VIEW_ACTIVE ===================== -->
+    <!-- ===================== THE TAB ON SCREEN ===================== -->
     <section id="screen-view" class="screen hidden">
       <!-- Session menu bar: the native video covers the client area, so this bar
            is revealed by pushing the cursor to the TOP EDGE of the video (the
            video slides down); moving back into the video hides it again. -->
-      <div class="view-bar">
+      <div id="view-bar" class="view-bar">
         <span id="view-peer" class="mono small">&hellip;</span>
         <span id="view-badge" class="badge badge-view">VIEW ONLY</span>
         <div class="spacer"></div>
@@ -125,47 +141,51 @@
         <button id="btn-view-settings" class="btn btn-ghost btn-sm" title="Settings">&#9881;</button>
         <button id="btn-view-end" class="btn btn-danger btn-sm">Disconnect</button>
       </div>
+      <!-- The tab's body while it has no picture: connecting, its password
+           prompt (one per tab, D7), or why it is disconnected. -->
+      <div id="tab-card" class="tab-card hidden">
+        <div class="modal-box">
+          <h3 id="tab-card-title"></h3>
+          <p id="tab-card-text" class="hint"></p>
+          <div id="tab-card-password" class="hidden">
+            <label class="field">
+              <input
+                id="tab-password-input"
+                class="input"
+                type="password"
+                placeholder="Password"
+                autocomplete="current-password"
+              />
+            </label>
+            <label class="radio">
+              <input type="checkbox" id="tab-password-remember" checked />
+              Remember this password
+            </label>
+          </div>
+          <p id="tab-card-auto" class="hint hidden">
+            Signs in automatically with its saved password.
+            <button id="btn-tab-forget" class="btn btn-ghost btn-sm">Forget saved password</button>
+          </p>
+          <div class="modal-actions">
+            <button id="btn-tab-secondary" class="btn"></button>
+            <button id="btn-tab-primary" class="btn btn-primary"></button>
+          </div>
+        </div>
+      </div>
       <!-- The native D3D11 swapchain window is parented here (§7). -->
       <div id="video-wrap" class="video-wrap"></div>
     </section>
 
     <!-- ===================== MODALS ===================== -->
 
-    <!-- REQUESTING -->
-    <div id="modal-requesting" class="modal hidden">
+    <!-- MORE THAN 8 CONNECTED TABS (D2): asked, never refused. -->
+    <div id="modal-tab-confirm" class="modal hidden">
       <div class="modal-box">
-        <h3>Connecting&hellip;</h3>
-        <p class="mono small" id="requesting-peer"></p>
-        <p class="hint">
-          Waiting for the remote machine to answer &mdash; <b id="requesting-count">30</b> s
-        </p>
+        <h3>Many connections</h3>
+        <p class="hint" id="tab-confirm-text"></p>
         <div class="modal-actions">
-          <button id="btn-cancel-request" class="btn">Cancel</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- PASSWORD_PROMPT -->
-    <div id="modal-password" class="modal hidden">
-      <div class="modal-box">
-        <h3>Password required</h3>
-        <p class="hint">This machine is protected by a password.</p>
-        <label class="field">
-          <input
-            id="password-input"
-            class="input"
-            type="password"
-            placeholder="Password"
-            autocomplete="current-password"
-          />
-        </label>
-        <label class="radio">
-          <input type="checkbox" id="password-remember" />
-          Log in automatically next time
-        </label>
-        <div class="modal-actions">
-          <button id="btn-password-cancel" class="btn">Cancel</button>
-          <button id="btn-password-ok" class="btn btn-primary">OK</button>
+          <button id="btn-tab-confirm-cancel" class="btn">Cancel</button>
+          <button id="btn-tab-confirm-ok" class="btn btn-primary">Continue</button>
         </div>
       </div>
     </div>
@@ -201,6 +221,39 @@
       </div>
     </div>
 
+    <!-- BRING LOCAL DATA INTO THE ACCOUNT (plans/08a §6.10). Asked once, on
+         signing in to an existing account while this computer has its own
+         names, recents or tabs. Closing it counts as "Keep separate". -->
+    <div id="modal-bring-in" class="modal hidden">
+      <div class="modal-box">
+        <h3>Bring this computer's tabs and names into <span id="bring-in-account"></span>?</h3>
+        <p class="hint" id="bring-in-detail"></p>
+        <p class="hint">
+          Add: they join the account and appear on your other computers too.
+          Keep separate: they stay on this computer, for use without an account.
+        </p>
+        <div class="modal-actions">
+          <button id="btn-bring-in-separate" class="btn">Keep separate</button>
+          <button id="btn-bring-in-add" class="btn btn-primary">Add</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- CONFIRM AN ACCOUNT CHANGE THAT ENDS THE SESSION (D6) -->
+    <div id="modal-account-confirm" class="modal hidden">
+      <div class="modal-box">
+        <h3 id="account-confirm-title"></h3>
+        <p class="hint hidden" id="account-confirm-detail"></p>
+        <p class="hint hidden" id="account-confirm-session">
+          This disconnects <span id="account-confirm-peer"></span>.
+        </p>
+        <div class="modal-actions">
+          <button id="btn-account-confirm-cancel" class="btn">Cancel</button>
+          <button id="btn-account-confirm-ok" class="btn btn-primary">Continue</button>
+        </div>
+      </div>
+    </div>
+
     <!-- CONFIRM CLEAR RECENTS -->
     <div id="modal-clear-recents" class="modal hidden">
       <div class="modal-box">
@@ -226,16 +279,29 @@
           <input id="set-server" class="input mono" type="text" spellcheck="false" />
         </label>
 
-        <!-- ACCOUNT — optional; syncs remote IDs, their names and the recents
-             between this user's computers (account.rs, server/src/accounts.js).
-             Its buttons act at once; Save/Cancel do not apply to it. -->
+        <!-- ACCOUNT — optional. An account owns everything that is the person's
+             rather than this computer's: remote IDs and their names, recents,
+             the settings marked "follows your account", saved host passwords
+             (plans/08 D4). Several accounts can be used on one computer; each
+             keeps its own. accounts.rs / server/src/accounts.js. Its buttons act
+             at once; Save/Cancel do not apply to it. -->
         <fieldset class="field" id="account-section">
           <legend>Account</legend>
+          <label class="field" id="account-switch-row">
+            <span>Use</span>
+            <select id="account-switch" class="input"></select>
+          </label>
+
+          <!-- No account: sign in or create one. -->
           <div id="account-signed-out">
-            <div class="hint account-intro">
-              Sign in on each of your computers to keep your remote IDs, their names and
-              your recent connections the same on all of them. Optional &mdash; connecting
-              never needs an account.
+            <div class="hint account-intro" id="account-intro-local">
+              Sign in on each of your computers to keep your remote IDs, their names,
+              your recent connections and the settings that follow your account the
+              same on all of them. Optional &mdash; connecting never needs an account.
+            </div>
+            <div class="hint account-intro hidden" id="account-intro-locked">
+              <b id="account-locked-name"></b> is signed out on this computer. Enter its
+              password to use its computers and settings again.
             </div>
             <div class="row account-row">
               <input
@@ -256,21 +322,41 @@
                 maxlength="256"
               />
             </div>
+            <label class="radio">
+              <input type="checkbox" id="account-keep" checked />
+              Keep me signed in on this computer
+            </label>
             <div class="row">
               <button id="btn-account-sign-in" type="button" class="btn btn-sm btn-primary">Sign in</button>
               <button id="btn-account-create" type="button" class="btn btn-sm">Create account</button>
+              <button id="btn-account-remove-locked" type="button" class="btn btn-sm btn-ghost hidden">
+                Remove from this computer
+              </button>
+              <button id="btn-account-use-local" type="button" class="btn btn-sm btn-ghost hidden">
+                Use without an account
+              </button>
             </div>
           </div>
+
+          <!-- Signed in. -->
           <div id="account-signed-in" class="hidden">
             <div class="hint account-intro">
-              Signed in as <b id="account-name"></b>. Remote IDs you connect to or name
-              sync with your other computers. Last synced: <span id="account-last-sync"></span>.
+              Signed in as <b id="account-name"></b>. Your remote IDs, their names, recent
+              connections and the settings that follow your account sync with your other
+              computers. Last synced: <span id="account-last-sync"></span>.
             </div>
             <div class="row">
               <button id="btn-account-sync" type="button" class="btn btn-sm">Sync now</button>
               <button id="btn-account-sign-out" type="button" class="btn btn-sm btn-ghost">Sign out</button>
+              <button id="btn-account-remove" type="button" class="btn btn-sm btn-ghost">
+                Remove from this computer
+              </button>
             </div>
-            <div class="hint">Signing out keeps the IDs already on this computer.</div>
+            <div class="hint">
+              Signing out keeps this account's data on this computer, locked until you sign in
+              again. Removing it deletes that data and its saved passwords from this computer
+              (the account itself stays on the server).
+            </div>
           </div>
           <div id="account-status" class="hint hidden"></div>
         </fieldset>
@@ -327,6 +413,8 @@
 
         <fieldset class="field">
           <legend>During a session</legend>
+          <div class="hint">These two follow your account: change them on one computer and
+            they change on your others.</div>
           <label class="radio">
             <input type="checkbox" id="set-clipboard-sync" />
             Share clipboard text between the two machines
@@ -354,20 +442,17 @@
 
         <fieldset class="field">
           <legend>Connecting out</legend>
-          <label class="radio">
-            <input type="checkbox" id="set-auto-login" />
-            Log in automatically with a saved password
-          </label>
           <div class="hint">
-            Saved passwords are encrypted for your user account on this computer. A saved
-            password is only kept after it has actually worked.
+            A host's password is asked once and remembered (unless you untick
+            "Remember" when asked), so connecting again needs no typing. Saved passwords
+            belong to the account in use, are encrypted for your user account on this
+            computer, and are only kept after they have actually worked.
           </div>
           <label class="radio">
             <input type="checkbox" id="set-clear-logins" />
             Forget all saved passwords
           </label>
         </fieldset>
-
         <div id="shortcut-capture-hint" class="hint"></div>
 
         <label class="field">
@@ -421,7 +506,7 @@
             keep their meaning: from a Mac, Cmd+C copies and Cmd+Tab switches
             apps on Windows or Linux (sent as Ctrl+C and Alt+Tab); on a Mac,
             Ctrl+C from Windows or Linux is Cmd+C. Turn it off to send every key
-            exactly as pressed.
+            exactly as pressed. Follows your account.
           </div>
           <label class="radio">
             <input type="checkbox" id="set-openh264" />
@@ -450,7 +535,7 @@
     </div>
 
     <!-- PERMISSIONS — OS grants the app needs (screen recording, remote control,
-         shortcut capture). Rows are filled in by app.js from get_permissions;
+         shortcut capture). Rows are filled in by settings.js from get_permissions;
          a permission this OS does not have is simply not listed. -->
     <div id="modal-permissions" class="modal hidden">
       <div class="modal-box modal-wide">
@@ -467,6 +552,6 @@
 
     <div id="toasts" class="toasts"></div>
 
-    <script src="app.js"></script>
+    <script type="module" src="main.js"></script>
   </body>
 </html>

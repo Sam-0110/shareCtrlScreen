@@ -267,6 +267,11 @@ impl Presenter for MetalPresenter {
         cursor: Option<(f64, f64)>,
     ) -> Result<(), SurfaceError> {
         self.wait_previous()?;
+        if !self.state.is_shown() {
+            // B5: a hidden view is not drawn to (the engine skips it too; this
+            // also covers a present racing a hide). The frame stays decoded.
+            return Ok(());
+        }
         let size = self.state.size();
         if size.0 == 0 || size.1 == 0 {
             // Not laid out yet: nothing to draw on.

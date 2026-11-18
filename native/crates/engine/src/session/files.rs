@@ -14,7 +14,7 @@ use protocol::InputMsg;
 pub(super) fn file_send_loop(
     drops: Receiver<FileDrop>,
     out: Sender<Vec<u8>>,
-    ui: tokio::sync::mpsc::UnboundedSender<crate::UiEvent>,
+    ui: crate::SessionUi,
     stop: Arc<AtomicBool>,
 ) {
     use protocol::transfer::{BulkFrame, FileMeta, CHUNK_BYTES, MAX_FILE_BYTES};
@@ -38,28 +38,28 @@ pub(super) fn file_send_loop(
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let Ok(meta) = std::fs::metadata(&path) else {
-                let _ = ui.send(crate::UiEvent::Toast(format!("Cannot read {name}")));
+                ui.send(crate::SessionEvent::Toast(format!("Cannot read {name}")));
                 continue;
             };
             if meta.is_dir() {
                 // Folders would need a manifest and per-entry paths — exactly the
                 // shape that invites traversal bugs. Files only, for now.
-                let _ = ui.send(crate::UiEvent::Toast(format!(
+                ui.send(crate::SessionEvent::Toast(format!(
                     "{name} is a folder — send files instead"
                 )));
                 continue;
             }
             let size = meta.len();
             if size > MAX_FILE_BYTES {
-                let _ = ui.send(crate::UiEvent::Toast(format!("{name} is too large")));
+                ui.send(crate::SessionEvent::Toast(format!("{name} is too large")));
                 continue;
             }
             let Ok(mut file) = std::fs::File::open(&path) else {
-                let _ = ui.send(crate::UiEvent::Toast(format!("Cannot open {name}")));
+                ui.send(crate::SessionEvent::Toast(format!("Cannot open {name}")));
                 continue;
             };
 
-            let _ = ui.send(crate::UiEvent::Toast(format!("Sending {name}…")));
+            ui.send(crate::SessionEvent::Toast(format!("Sending {name}…")));
             let _ = out.send(
                 BulkFrame::Begin(FileMeta {
                     name: name.clone(),
@@ -89,7 +89,7 @@ pub(super) fn file_send_loop(
                     }
                     Err(e) => {
                         let _ = out.send(BulkFrame::Abort(format!("read error: {e}")).encode());
-                        let _ = ui.send(crate::UiEvent::Toast(format!("Failed sending {name}")));
+                        ui.send(crate::SessionEvent::Toast(format!("Failed sending {name}")));
                         failed = true;
                         break;
                     }
@@ -105,7 +105,7 @@ pub(super) fn file_send_loop(
                 // The file changed while we read it — tell the peer rather than
                 // let it write a file that doesn't match what was announced.
                 let _ = out.send(BulkFrame::Abort("file changed while sending".into()).encode());
-                let _ = ui.send(crate::UiEvent::Toast(format!(
+                ui.send(crate::SessionEvent::Toast(format!(
                     "{name} changed while sending"
                 )));
                 continue;

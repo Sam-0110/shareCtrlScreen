@@ -1,13 +1,15 @@
 {
   "name": "sharectrl-signal-server",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "scripts": {
     "dev": "wrangler dev --port 8787",
     "deploy": "wrangler deploy",
-    "test:accounts": "node test/accounts-smoke.mjs"
+    "test:accounts": "node test/accounts-smoke.mjs",
+    "test:vectors": "node test/sync-vectors.mjs"
   },
   "devDependencies": {
     "wrangler": "^4"
-  }
+  },
+  "type": "module"
 }

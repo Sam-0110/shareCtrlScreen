@@ -1,0 +1,55 @@
+{
+  "uuid": "5b1c0d2e-7f3a-4c8b-9d6e-1a2b3c4d5e6f",
+  "serverUrl": "wss://sharectrl-signal.netameta.workers.dev/ws",
+  "mode": "password",
+  "passwordHash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "passwordPermission": "control",
+  "iceServers": [
+    {
+      "urls": "stun:stun.l.google.com:19302"
+    }
+  ],
+  "shareAudio": true,
+  "shareDisplayId": null,
+  "recentIds": [
+    "0f8fad5b-d9cb-469f-a165-70867728950e",
+    "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "16fd2706-8baf-433b-82eb-8c7fada847da"
+  ],
+  "remoteNames": {
+    "0f8fad5b-d9cb-469f-a165-70867728950e": "Office PC",
+    "886313e1-3b8a-4372-9b90-0c9aee199e5d": "Laptop"
+  },
+  "idStamps": {
+    "0f8fad5b-d9cb-469f-a165-70867728950e": {
+      "nameAt": 1762000000000,
+      "usedAt": 1763000000000
+    },
+    "7c9e6679-7425-40de-944b-e07fc1f90ae7": {
+      "nameAt": 0,
+      "usedAt": 1762900000000
+    },
+    "886313e1-3b8a-4372-9b90-0c9aee199e5d": {
+      "nameAt": 1761000000000,
+      "usedAt": 0
+    }
+  },
+  "recentsClearedAt": 0,
+  "account": {
+    "server": "https://sharectrl-signal.netameta.workers.dev",
+    "username": "sam",
+    "token": "sct1.sam.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "lastSync": 1763000000000
+  },
+  "captureShortcuts": false,
+  "clipboardSync": false,
+  "pasteDroppedFiles": true,
+  "startWithWindows": true,
+  "useOpenH264": true,
+  "translateModifiers": true,
+  "autoLogin": true,
+  "savedLogins": {
+    "0f8fad5b-d9cb-469f-a165-70867728950e": "AQAAANCMnd8BFdERjHoAwE_fake_dpapi_blob_1",
+    "7c9e6679-7425-40de-944b-e07fc1f90ae7": "AQAAANCMnd8BFdERjHoAwE_fake_dpapi_blob_2"
+  }
+}

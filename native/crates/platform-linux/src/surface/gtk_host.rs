@@ -124,18 +124,38 @@ pub(crate) fn find_toplevel(
     ))
 }
 
-/// Read the content widget's layout and hand it to the backend. `None` from
-/// `translate_coordinates` = not realized yet: the next `size-allocate` brings
-/// the real position, and guessing (0,0) would cover the header bar.
-fn relayout(events: &dyn HostEvents, top: &Toplevel) {
+/// Read the content widget's layout and hand it to the backend, minus the
+/// top inset kept for the web UI (`SurfaceState::top_inset`, the tab bar) —
+/// except in a window of our own (`owned`), which has no web UI to make room
+/// for. `None` from `translate_coordinates` = not realized yet: the next
+/// `size-allocate` brings the real position, and guessing (0,0) would cover
+/// the header bar.
+fn relayout(events: &dyn HostEvents, top: &Toplevel, owned: bool) {
     let Some(origin) = top.content.translate_coordinates(&top.window, 0, 0) else {
         return;
     };
-    let size = (
-        top.content.allocated_width().max(1).unsigned_abs(),
-        top.content.allocated_height().max(1).unsigned_abs(),
+    let inset = if owned { 0 } else { events.state().top_inset() };
+    let (origin, size) = below_inset(
+        origin,
+        (
+            top.content.allocated_width(),
+            top.content.allocated_height(),
+        ),
+        inset,
     );
     events.relayout(&top.window, origin, size, top.window.scale_factor());
+}
+
+/// The area of a widget at `origin` sized `size` (GTK logical px) below its
+/// top `inset` px: never empty (at least 1×1, an X11/Wayland size of 0 is an
+/// error), and the inset never takes the last row.
+fn below_inset(origin: (i32, i32), size: (i32, i32), inset: u32) -> ((i32, i32), (u32, u32)) {
+    let (w, h) = (size.0.max(1), size.1.max(1));
+    let inset = i32::try_from(inset).unwrap_or(i32::MAX).min(h - 1);
+    (
+        (origin.0, origin.1 + inset),
+        (w.unsigned_abs(), (h - inset).unsigned_abs()),
+    )
 }
 
 /// A main-thread-only value that may be owned, shared and dropped anywhere:
@@ -204,6 +224,8 @@ impl<T> Drop for Leaky<T> {
 struct Connected {
     handlers: Vec<(glib::Object, SignalHandlerId)>,
     owned: Option<gtk::Window>,
+    /// What [`HostLink::relayout_now`] lays out again.
+    layout: (Toplevel, Arc<dyn HostEvents>, bool),
 }
 
 impl Drop for Connected {
@@ -226,6 +248,17 @@ pub(crate) struct HostLink {
 }
 
 impl HostLink {
+    /// Lay the surface out again now (the top inset changed), from any
+    /// thread, waiting for the main thread with a bound.
+    pub(crate) fn relayout_now(&self) {
+        let connected = self.connected.clone();
+        on_main("relayout", move || {
+            if let Some((top, events, owned)) = connected.get().map(|c| &c.layout) {
+                relayout(&**events, top, *owned);
+            }
+        });
+    }
+
     /// Show or hide the window this link owns (the Wayland fallback window),
     /// from any thread, waiting for the main thread with a bound.
     pub(crate) fn set_owned_visible(&self, visible: bool) {
@@ -262,6 +295,7 @@ pub(crate) fn connect(top: &Toplevel, events: Arc<dyn HostEvents>, owned: bool) 
                     window: window.clone(),
                     content: content.clone(),
                 },
+                owned,
             );
         })
     };
@@ -276,6 +310,7 @@ pub(crate) fn connect(top: &Toplevel, events: Arc<dyn HostEvents>, owned: bool) 
                     window: window.clone(),
                     content: content.clone(),
                 },
+                owned,
             );
         })
     };
@@ -336,11 +371,38 @@ pub(crate) fn connect(top: &Toplevel, events: Arc<dyn HostEvents>, owned: bool) 
         handlers.push((window_obj, close));
     }
 
-    relayout(&*events, top);
+    relayout(&*events, top, owned);
     HostLink {
         connected: Arc::new(MainBound::new(Connected {
             handlers,
             owned: owned.then(|| top.window.clone()),
+            layout: (
+                Toplevel {
+                    window: top.window.clone(),
+                    content: top.content.clone(),
+                },
+                events,
+                owned,
+            ),
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::below_inset;
+
+    #[test]
+    fn the_inset_comes_off_the_top_and_never_empties_the_area() {
+        assert_eq!(below_inset((0, 46), (1280, 674), 0), ((0, 46), (1280, 674)));
+        assert_eq!(
+            below_inset((0, 46), (1280, 674), 36),
+            ((0, 82), (1280, 638))
+        );
+        // Taller than the widget: one row is left.
+        assert_eq!(below_inset((5, 5), (100, 30), 500), ((5, 34), (100, 1)));
+        // Not allocated yet (0 or negative): 1×1, no inset room.
+        assert_eq!(below_inset((0, 0), (0, -3), 36), ((0, 0), (1, 1)));
+        assert_eq!(below_inset((0, 0), (10, 10), u32::MAX), ((0, 9), (10, 1)));
     }
 }

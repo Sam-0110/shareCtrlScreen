@@ -1,0 +1,25 @@
+{
+  "uuid": "a3e1c6f0-2b4d-4e8f-9a1b-3c5d7e9f0b2d",
+  "serverUrl": "wss://sharectrl-signal.netameta.workers.dev/ws",
+  "mode": "approve",
+  "passwordHash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "passwordPermission": "view",
+  "iceServers": [
+    {
+      "urls": "stun:stun.l.google.com:19302"
+    }
+  ],
+  "shareAudio": true,
+  "shareDisplayId": null,
+  "recentIds": [
+    "0f8fad5b-d9cb-469f-a165-70867728950e"
+  ],
+  "captureShortcuts": true,
+  "clipboardSync": true,
+  "pasteDroppedFiles": true,
+  "startWithWindows": false,
+  "useOpenH264": true,
+  "translateModifiers": true,
+  "autoLogin": false,
+  "savedLogins": {}
+}

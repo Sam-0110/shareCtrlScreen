@@ -29,6 +29,10 @@ use platform_api::{CaptureError, Codec, DisplayInfo, EncoderConfig, Platform, Sc
 use crate::session::Shared;
 use crate::tuning::{MAX_FPS, MAX_FPS_INTERVAL};
 
+/// How often a paused main stream (a background tab, P6) checks for its
+/// resume.
+const PAUSED_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// What every host media thread of a session shares: the main stream's and
 /// each pop-out stream's (D14). The transport thread holds one too, to start
 /// pop-out streams.
@@ -43,7 +47,7 @@ pub(crate) struct HostCtx {
     pub ctl_tx: Sender<Vec<u8>>,
     /// The host's own UI: the monitor list for its picker, and why a monitor
     /// switch failed.
-    pub ui: tokio::sync::mpsc::UnboundedSender<crate::UiEvent>,
+    pub ui: crate::SessionUi,
     /// Encoded AUs to the transport, tagged with their video stream slot.
     pub frame_tx: Sender<(u8, Vec<u8>, bool)>,
     /// Cursor positions to the transport (unreliable-latest channel).
@@ -170,7 +174,7 @@ fn announce_displays(
     current: &str,
     popouts: &[protocol::PopoutStream],
     ctl_tx: &Sender<Vec<u8>>,
-    ui: &tokio::sync::mpsc::UnboundedSender<crate::UiEvent>,
+    ui: &crate::SessionUi,
 ) {
     let list: Vec<protocol::RemoteDisplay> = displays
         .iter()
@@ -188,7 +192,7 @@ fn announce_displays(
         popouts: popouts.to_vec(),
     };
     let _ = ctl_tx.send(serde_json::to_vec(&msg).unwrap_or_default());
-    let _ = ui.send(crate::UiEvent::Displays {
+    ui.send(crate::SessionEvent::Displays {
         list,
         current: current.to_string(),
         can_switch: true,
@@ -243,7 +247,7 @@ pub(crate) fn start_popout(ctx: &HostCtx, id: &str) -> bool {
             let stream_stop = spec.stream_stop.clone();
             if let Err(e) = host_media_loop(thread_ctx.clone(), spec) {
                 tracing::warn!("host pop-out stream {slot} ended: {e}");
-                let _ = thread_ctx.ui.send(crate::UiEvent::Toast(format!(
+                thread_ctx.ui.send(crate::SessionEvent::Toast(format!(
                     "Could not show that monitor in a separate window: {e}"
                 )));
             }
@@ -371,9 +375,15 @@ pub(crate) fn host_media_loop(
                 .is_some_and(|s| s.load(Ordering::SeqCst))
     };
     // The bitrate this stream may use: the session's target, split evenly
-    // across the live streams (main + pop-outs).
+    // across the live streams (main + pop-outs) — a paused main stream (P6)
+    // sends nothing, so it takes no share.
     let my_bitrate = || {
-        let n = shared.live_streams.load(Ordering::SeqCst).max(1);
+        let paused = u32::from(shared.video_paused.load(Ordering::SeqCst));
+        let n = shared
+            .live_streams
+            .load(Ordering::SeqCst)
+            .saturating_sub(paused)
+            .max(1);
         (bitrate.load(Ordering::SeqCst) / n).max(crate::tuning::MIN_BITRATE)
     };
     // The host's cursor images (D9). Per session: a new session (including a
@@ -473,7 +483,7 @@ pub(crate) fn host_media_loop(
             match displays.iter().find(|d| d.id == want_id) {
                 None => {
                     tracing::warn!("host: monitor switch to {want_id:?}: no such display");
-                    let _ = ui.send(crate::UiEvent::Toast(
+                    ui.send(crate::SessionEvent::Toast(
                         "That monitor is no longer connected".into(),
                     ));
                 }
@@ -536,7 +546,7 @@ pub(crate) fn host_media_loop(
                                         "host: monitor switch to {:?}: no encoder ({e})",
                                         d.id
                                     );
-                                    let _ = ui.send(crate::UiEvent::Toast(format!(
+                                    ui.send(crate::SessionEvent::Toast(format!(
                                         "Could not switch monitors: {e}"
                                     )));
                                 }
@@ -544,7 +554,7 @@ pub(crate) fn host_media_loop(
                         }
                         Err(e) => {
                             tracing::warn!("host: monitor switch to {:?}: {e}", d.id);
-                            let _ = ui.send(crate::UiEvent::Toast(format!(
+                            ui.send(crate::SessionEvent::Toast(format!(
                                 "Could not switch monitors: {e}"
                             )));
                         }
@@ -631,6 +641,18 @@ pub(crate) fn host_media_loop(
             deferred_keys = 0;
         }
 
+        // Paused by the viewer (its tab is in the background, P6): no capture,
+        // no encode, nothing on the wire for the main stream; monitor switches
+        // and size changes above are still applied (and announced). Pop-out
+        // streams go on. Nothing is lost by not capturing: the backends keep
+        // what changed meanwhile (DXGI accumulates it, SCK and PipeWire keep
+        // the newest frame, X11 accumulates damage), so the first capture after
+        // the resume carries every change since the pause, and the viewer —
+        // which decoded everything up to the pause — follows on from there.
+        if main && shared.video_paused.load(Ordering::SeqCst) {
+            std::thread::sleep(PAUSED_POLL);
+            continue;
+        }
         let acquired = cap.acquire(std::time::Duration::from_millis(16));
         match acquired {
             Ok(Some(frame)) => {
@@ -713,6 +735,10 @@ pub(crate) fn host_media_loop(
                     Ok(units) => {
                         for u in units {
                             sent += 1;
+                            #[cfg(feature = "test-hooks")]
+                            if main {
+                                shared.main_units.fetch_add(1, Ordering::SeqCst);
+                            }
                             // Attribute every IDR. An IDR we did NOT ask for is
                             // the encoder's own doing (Media Foundation runs its
                             // own scene-change detection and honours GOPSize), and

@@ -111,13 +111,75 @@ step("a removed name beats the older name; clears are kept", async () => {
   assert.equal(r.body.doc.recentsClearedAt, t);
 });
 
-step("future times are clamped to the server's clock", async () => {
+step("future times are clamped to a few minutes past the server's clock", async () => {
   const r = await call(
     "/api/sync",
     { doc: { entries: { [Y]: { name: "Future", nameAt: Date.now() + 1e9 } } } },
     tokA
   );
-  assert.ok(r.body.doc.entries[Y].nameAt <= Date.now());
+  assert.ok(r.body.doc.entries[Y].nameAt <= Date.now() + 5 * 60 * 1000);
+});
+
+step("a reply advertises what the server stores and its clock", async () => {
+  const before = Date.now();
+  const r = await call("/api/sync", {}, tokA);
+  assert.equal(r.status, 200);
+  assert.deepEqual([...r.body.features].sort(), ["prefs", "tabs"]);
+  assert.ok(r.body.serverTime >= before - 60_000 && r.body.serverTime <= Date.now() + 60_000);
+  assert.equal(r.body.doc.v, 2);
+  assert.deepEqual([typeof r.body.doc.tabs, typeof r.body.doc.prefs], ["object", "object"]);
+});
+
+step("preferences: only whitelisted booleans, the later change wins", async () => {
+  const t = Date.now() - 10_000;
+  let r = await call(
+    "/api/sync",
+    {
+      doc: {
+        prefs: {
+          clipboardSync: { value: false, at: t },
+          serverUrl: { value: true, at: t },
+          captureShortcuts: { value: "yes", at: t },
+        },
+      },
+    },
+    tokA
+  );
+  assert.deepEqual(r.body.doc.prefs, { clipboardSync: { value: false, at: t } });
+  r = await call("/api/sync", { doc: { prefs: { clipboardSync: { value: true, at: t - 1 } } } }, tokB);
+  assert.deepEqual(r.body.doc.prefs.clipboardSync, { value: false, at: t });
+  r = await call("/api/sync", { doc: { prefs: { clipboardSync: { value: true, at: t + 1 } } } }, tokB);
+  assert.deepEqual(r.body.doc.prefs.clipboardSync, { value: true, at: t + 1 });
+});
+
+step("tabs: validated, the last open or close wins", async () => {
+  const t = Date.now() - 10_000;
+  let r = await call(
+    "/api/sync",
+    {
+      doc: {
+        tabs: {
+          [X.toUpperCase()]: { order: "m", orderAt: t, openedAt: t, closedAt: 0 },
+          [Y]: { order: "Bad-Key", orderAt: t, openedAt: t },
+          "not-a-uuid": { order: "a", openedAt: t },
+        },
+      },
+    },
+    tokA
+  );
+  assert.deepEqual(Object.keys(r.body.doc.tabs), [X]);
+  r = await call("/api/sync", { doc: { tabs: { [X]: { order: "m", orderAt: t, openedAt: 0, closedAt: t + 5 } } } }, tokB);
+  assert.ok(r.body.doc.tabs[X].closedAt > r.body.doc.tabs[X].openedAt);
+});
+
+step("a document with more tabs than the cap is refused", async () => {
+  const tabs = {};
+  const hex = (n) => n.toString(16).padStart(12, "0");
+  for (let i = 0; i < 1001; i++) {
+    tabs[`0f8fad5b-d9cb-469f-a165-${hex(i)}`] = { order: "a", orderAt: 1, openedAt: Date.now() - 1000 };
+  }
+  const r = await call("/api/sync", { doc: { tabs } }, tokA);
+  assert.deepEqual([r.status, r.body.error], [413, "too-large"]);
 });
 
 step("sync without a doc just reads", async () => {

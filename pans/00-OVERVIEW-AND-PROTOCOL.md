@@ -148,6 +148,11 @@ falls back to a safe default (H.264 first). The server relays the field opaquely
 `reason` present only when `accepted` is `false`; one of
 `"denied" | "busy" | "bad-password" | "timeout"`.
 
+Optional native-app additions (relayed opaquely; older peers ignore them): an accepting
+response may carry `codec`, `os` and `caps`. `caps.vpause: true` means the host pauses its
+main video on `{"t":"vpause"}` and resumes it on `{"t":"vresume"}` (§4.2); the viewer sends those for a tab in the background
+(`plans/08-MULTI-SESSION-TABS.md` §3.7).
+
 **Step 4 — WebRTC negotiation.** The **host is the offerer** (it owns the media). Host
 captures the screen, then exchanges SDP/ICE via:
 
@@ -223,6 +228,10 @@ Both sides must tolerate the `mm` channel delivering nothing (e.g. before it ope
 | `{"t":"bye"}` | Host is ending the session. Viewer closes the peer connection and returns to the home screen. |
 
 Viewer → Host may also send `{"t":"bye"}` on `ctl` when the viewer disconnects gracefully.
+
+Viewer → Host `{"t":"vpause"}` / `{"t":"vresume"}` (native app, only to a host whose
+connect-response had `caps.vpause`): stop / restart the main video stream; `ctl`, cursor and
+liveness stay up.
 
 ---
 

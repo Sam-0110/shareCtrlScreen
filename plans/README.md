@@ -14,8 +14,10 @@ executed **in one go**, in parallel lanes — see [05-TASKS.md](05-TASKS.md).
 | [05-TASKS.md](05-TASKS.md) | 50 tasks in 7 lanes with dependencies, sizes, machines and acceptance tests |
 | [06-CRATES-AND-LICENSES.md](06-CRATES-AND-LICENSES.md) | Every crate with version and licence as verified on crates.io |
 | [07-CODEBASE-SEAMS.md](07-CODEBASE-SEAMS.md) | File-by-file: what is Windows-bound, what is portable, known bugs to fix in the split |
+| [08-MULTI-SESSION-TABS.md](08-MULTI-SESSION-TABS.md) | Viewer tabs (several remotes at once), nameable tabs saved and synced per account, synced preferences: design, step S + phases P0–P8, decisions |
+| [08a-STRUCTURE-AND-FLOWS.md](08a-STRUCTURE-AND-FLOWS.md) | How tabs are built: layering, file layout, types, commands/events, state machines, every flow, invariants |
 | [appendix-codemap/](appendix-codemap/) | The raw per-subsystem maps from the 20-reader code sweep (line-level) |
-| [../.claude/skills/port-orchestrate/SKILL.md](../.claude/skills/port-orchestrate/SKILL.md) | **How the parallel phase is run** (`/port-orchestrate`): task selection, agent briefs, model routing, verification gate, merging, hardware hand-off |
+| [../.claude/skills/orchestrate/SKILL.md](../.claude/skills/orchestrate/SKILL.md) | **How planned work is run** (`/orchestrate`): design review, builder and reviewer briefs, the build lane, the merge gate, releasing, hardware hand-off |
 | [checklists/](checklists/) | Tester checklists for hardware-verified tasks |
 
 ## TL;DR

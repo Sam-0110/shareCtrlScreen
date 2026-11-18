@@ -564,6 +564,12 @@ pub struct Presented {
 #[derive(Debug, Default)]
 pub struct SurfaceState {
     pub visible: bool,
+    /// The last [`VideoSurface::set_top_inset`], in CSS px.
+    pub top_inset: u32,
+    /// [`VideoSurface::destroy`] ran: the surface is inert from then on.
+    pub destroyed: bool,
+    /// How many times [`VideoSurface::focus`] was called.
+    pub focus_requests: u32,
     pub client_size: (u32, u32),
     pub fits: u64,
     pub presented: Vec<Presented>,
@@ -658,7 +664,8 @@ impl MockSurface {
 
 impl VideoSurface for MockSurface {
     fn show(&self) {
-        lock(&self.state).visible = true;
+        let mut s = lock(&self.state);
+        s.visible = !s.destroyed;
     }
     fn hide(&self) {
         let mut s = lock(&self.state);
@@ -709,6 +716,17 @@ impl VideoSurface for MockSurface {
     }
     fn set_cursor_control(&self, active: bool) {
         lock(&self.state).cursor_control = active;
+    }
+    fn set_top_inset(&self, css_px: u32) {
+        lock(&self.state).top_inset = css_px;
+    }
+    fn focus(&self) {
+        lock(&self.state).focus_requests += 1;
+    }
+    fn destroy(&self) {
+        let mut s = lock(&self.state);
+        s.destroyed = true;
+        s.visible = false;
     }
 }
 

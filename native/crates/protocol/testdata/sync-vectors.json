@@ -1,0 +1,564 @@
+{
+  "about": "Merge cases shared by the app (native/crates/protocol/src/sync/mod.rs tests) and the server (server/src/sync.js, run by server/test/sync-vectors.mjs). For each case both sides normalize a and b at now, merge them in both orders, and must produce merged exactly. A rule change on either side must keep these passing on both, or change them deliberately.",
+  "now": 1800000000000,
+  "cases": [
+    {
+      "name": "the newer name wins; uses take the later time",
+      "a": {
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Office",
+            "nameAt": 10,
+            "usedAt": 50
+          }
+        }
+      },
+      "b": {
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Work",
+            "nameAt": 20,
+            "usedAt": 30
+          }
+        }
+      },
+      "merged": {
+        "v": 2,
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Work",
+            "nameAt": 20,
+            "usedAt": 50
+          }
+        },
+        "recentsClearedAt": 0,
+        "tabs": {},
+        "prefs": {}
+      }
+    },
+    {
+      "name": "a newer removal beats an older name",
+      "a": {
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Office",
+            "nameAt": 10
+          }
+        }
+      },
+      "b": {
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "",
+            "nameAt": 20
+          }
+        }
+      },
+      "merged": {
+        "v": 2,
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "",
+            "nameAt": 20,
+            "usedAt": 0
+          }
+        },
+        "recentsClearedAt": 0,
+        "tabs": {},
+        "prefs": {}
+      }
+    },
+    {
+      "name": "same-time names: the tie goes to the larger name",
+      "a": {
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Alpha",
+            "nameAt": 5
+          }
+        }
+      },
+      "b": {
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Beta",
+            "nameAt": 5
+          }
+        }
+      },
+      "merged": {
+        "v": 2,
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Beta",
+            "nameAt": 5,
+            "usedAt": 0
+          }
+        },
+        "recentsClearedAt": 0,
+        "tabs": {},
+        "prefs": {}
+      }
+    },
+    {
+      "name": "names are cleaned and IDs that differ in case merge",
+      "a": {
+        "entries": {
+          "0F8FAD5B-D9CB-469F-A165-70867728950E": {
+            "name": "  Desk \n top ",
+            "nameAt": 4,
+            "usedAt": 2
+          },
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "older",
+            "nameAt": 3,
+            "usedAt": 9
+          }
+        }
+      },
+      "b": {},
+      "merged": {
+        "v": 2,
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Desk top",
+            "nameAt": 4,
+            "usedAt": 9
+          }
+        },
+        "recentsClearedAt": 0,
+        "tabs": {},
+        "prefs": {}
+      }
+    },
+    {
+      "name": "the later clear wins",
+      "a": {
+        "recentsClearedAt": 100,
+        "entries": {
+          "7c9e6679-7425-40de-944b-e07fc1f90ae7": {
+            "usedAt": 90
+          }
+        }
+      },
+      "b": {
+        "recentsClearedAt": 80,
+        "entries": {
+          "7c9e6679-7425-40de-944b-e07fc1f90ae7": {
+            "usedAt": 120
+          }
+        }
+      },
+      "merged": {
+        "v": 2,
+        "entries": {
+          "7c9e6679-7425-40de-944b-e07fc1f90ae7": {
+            "name": "",
+            "nameAt": 0,
+            "usedAt": 120
+          }
+        },
+        "recentsClearedAt": 100,
+        "tabs": {},
+        "prefs": {}
+      }
+    },
+    {
+      "name": "future stamps are clamped to now plus five minutes",
+      "a": {
+        "recentsClearedAt": 1900000000000,
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Fast clock",
+            "nameAt": 1900000000000,
+            "usedAt": 1900000000000
+          }
+        },
+        "prefs": {
+          "clipboardSync": {
+            "value": false,
+            "at": 1900000000000
+          }
+        }
+      },
+      "b": {
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Honest",
+            "nameAt": 1800000000000
+          }
+        }
+      },
+      "merged": {
+        "v": 2,
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Fast clock",
+            "nameAt": 1800000300000,
+            "usedAt": 1800000300000
+          }
+        },
+        "recentsClearedAt": 1800000300000,
+        "tabs": {},
+        "prefs": {
+          "clipboardSync": {
+            "value": false,
+            "at": 1800000300000
+          }
+        }
+      }
+    },
+    {
+      "name": "preferences: the later change wins; unknown keys are dropped",
+      "a": {
+        "prefs": {
+          "translateModifiers": {
+            "value": false,
+            "at": 10
+          },
+          "serverUrl": {
+            "value": true,
+            "at": 99
+          }
+        }
+      },
+      "b": {
+        "prefs": {
+          "translateModifiers": {
+            "value": true,
+            "at": 5
+          },
+          "captureShortcuts": {
+            "value": true,
+            "at": 7
+          }
+        }
+      },
+      "merged": {
+        "v": 2,
+        "entries": {},
+        "recentsClearedAt": 0,
+        "tabs": {},
+        "prefs": {
+          "translateModifiers": {
+            "value": false,
+            "at": 10
+          },
+          "captureShortcuts": {
+            "value": true,
+            "at": 7
+          }
+        }
+      }
+    },
+    {
+      "name": "preferences: the same stamp goes to true",
+      "a": {
+        "prefs": {
+          "clipboardSync": {
+            "value": false,
+            "at": 10
+          },
+          "pasteDroppedFiles": {
+            "value": true,
+            "at": 3
+          }
+        }
+      },
+      "b": {
+        "prefs": {
+          "clipboardSync": {
+            "value": true,
+            "at": 10
+          },
+          "pasteDroppedFiles": {
+            "value": false,
+            "at": 3
+          }
+        }
+      },
+      "merged": {
+        "v": 2,
+        "entries": {},
+        "recentsClearedAt": 0,
+        "tabs": {},
+        "prefs": {
+          "clipboardSync": {
+            "value": true,
+            "at": 10
+          },
+          "pasteDroppedFiles": {
+            "value": true,
+            "at": 3
+          }
+        }
+      }
+    },
+    {
+      "name": "tabs: a later close beats an earlier open; a later reopen beats both",
+      "a": {
+        "tabs": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "order": "m",
+            "orderAt": 1799999000000,
+            "openedAt": 1799999000010
+          },
+          "7c9e6679-7425-40de-944b-e07fc1f90ae7": {
+            "order": "n",
+            "orderAt": 1799999000000,
+            "openedAt": 1799999000010,
+            "closedAt": 1799999000020
+          }
+        }
+      },
+      "b": {
+        "tabs": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "order": "m",
+            "orderAt": 1799999000000,
+            "closedAt": 1799999000015
+          },
+          "7c9e6679-7425-40de-944b-e07fc1f90ae7": {
+            "order": "n",
+            "orderAt": 1799999000000,
+            "openedAt": 1799999000030
+          }
+        }
+      },
+      "merged": {
+        "v": 2,
+        "entries": {},
+        "recentsClearedAt": 0,
+        "tabs": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "order": "m",
+            "orderAt": 1799999000000,
+            "openedAt": 1799999000010,
+            "closedAt": 1799999000015
+          },
+          "7c9e6679-7425-40de-944b-e07fc1f90ae7": {
+            "order": "n",
+            "orderAt": 1799999000000,
+            "openedAt": 1799999000030,
+            "closedAt": 1799999000020
+          }
+        },
+        "prefs": {}
+      }
+    },
+    {
+      "name": "tabs: the later order wins; the same stamp goes to the larger key",
+      "a": {
+        "tabs": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "order": "b",
+            "orderAt": 5,
+            "openedAt": 1
+          },
+          "7c9e6679-7425-40de-944b-e07fc1f90ae7": {
+            "order": "c",
+            "orderAt": 9,
+            "openedAt": 1
+          }
+        }
+      },
+      "b": {
+        "tabs": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "order": "a",
+            "orderAt": 9,
+            "openedAt": 1
+          },
+          "7c9e6679-7425-40de-944b-e07fc1f90ae7": {
+            "order": "d",
+            "orderAt": 9,
+            "openedAt": 1
+          }
+        }
+      },
+      "merged": {
+        "v": 2,
+        "entries": {},
+        "recentsClearedAt": 0,
+        "tabs": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "order": "a",
+            "orderAt": 9,
+            "openedAt": 1,
+            "closedAt": 0
+          },
+          "7c9e6679-7425-40de-944b-e07fc1f90ae7": {
+            "order": "d",
+            "orderAt": 9,
+            "openedAt": 1,
+            "closedAt": 0
+          }
+        },
+        "prefs": {}
+      }
+    },
+    {
+      "name": "tabs: bad keys and IDs are dropped; tabs closed over 90 days ago are forgotten",
+      "a": {
+        "tabs": {
+          "0F8FAD5B-D9CB-469F-A165-70867728950E": {
+            "order": "a0",
+            "orderAt": 1,
+            "openedAt": 2
+          },
+          "7c9e6679-7425-40de-944b-e07fc1f90ae7": {
+            "order": "A!",
+            "openedAt": 2
+          },
+          "not-a-uuid": {
+            "order": "a",
+            "openedAt": 2
+          },
+          "16fd2706-8baf-433b-82eb-8c7fada847da": {
+            "order": "z",
+            "orderAt": 1,
+            "openedAt": 1,
+            "closedAt": 1792000000000
+          },
+          "886313e1-3b8a-4372-9b90-0c9aee199e5d": {
+            "order": "y",
+            "orderAt": 1,
+            "openedAt": 1,
+            "closedAt": 1795000000000
+          }
+        }
+      },
+      "b": {},
+      "merged": {
+        "v": 2,
+        "entries": {},
+        "recentsClearedAt": 0,
+        "tabs": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "order": "a0",
+            "orderAt": 1,
+            "openedAt": 2,
+            "closedAt": 0
+          },
+          "886313e1-3b8a-4372-9b90-0c9aee199e5d": {
+            "order": "y",
+            "orderAt": 1,
+            "openedAt": 1,
+            "closedAt": 1795000000000
+          }
+        },
+        "prefs": {}
+      }
+    },
+    {
+      "name": "a version 1 document merges with a version 2 one",
+      "a": {
+        "v": 1,
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Old app",
+            "nameAt": 7,
+            "usedAt": 8
+          }
+        },
+        "recentsClearedAt": 0
+      },
+      "b": {
+        "v": 2,
+        "prefs": {
+          "captureShortcuts": {
+            "value": true,
+            "at": 9
+          }
+        },
+        "tabs": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "order": "a",
+            "orderAt": 1,
+            "openedAt": 9
+          }
+        }
+      },
+      "merged": {
+        "v": 2,
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Old app",
+            "nameAt": 7,
+            "usedAt": 8
+          }
+        },
+        "recentsClearedAt": 0,
+        "tabs": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "order": "a",
+            "orderAt": 1,
+            "openedAt": 9,
+            "closedAt": 0
+          }
+        },
+        "prefs": {
+          "captureShortcuts": {
+            "value": true,
+            "at": 9
+          }
+        }
+      }
+    },
+    {
+      "name": "entries that are not UUIDs are dropped",
+      "a": {
+        "entries": {
+          "office-pc": {
+            "name": "Kept nowhere",
+            "nameAt": 5,
+            "usedAt": 5
+          },
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Office",
+            "nameAt": 6
+          }
+        }
+      },
+      "b": {},
+      "merged": {
+        "v": 2,
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Office",
+            "nameAt": 6,
+            "usedAt": 0
+          }
+        },
+        "recentsClearedAt": 0,
+        "tabs": {},
+        "prefs": {}
+      }
+    },
+    {
+      "name": "a byte order mark in a name is folded like whitespace",
+      "a": {
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "﻿Office﻿PC﻿",
+            "nameAt": 5
+          }
+        }
+      },
+      "b": {},
+      "merged": {
+        "v": 2,
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Office PC",
+            "nameAt": 5,
+            "usedAt": 0
+          }
+        },
+        "recentsClearedAt": 0,
+        "tabs": {},
+        "prefs": {}
+      }
+    }
+  ]
+}

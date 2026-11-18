@@ -3,24 +3,21 @@
 //
 // One AccountStore Durable Object per username holds that account's password
 // hash, its sign-in tokens (hashes only) and its synced document. The document
-// is the same last-writer-wins value the app merges (native/crates/protocol/
-// src/sync.rs): per remote ID a name + nameAt (an empty name with a non-zero
-// nameAt is a removed name) and usedAt, plus one recentsClearedAt. Merging
-// keeps the newer name and the later times, so every device converges no
-// matter the order of syncs. mergeDocs/normalizeDoc below must keep the same
-// rules as the Rust side.
+// is the same last-writer-wins value the app merges; its rules live in sync.js,
+// the mirror of native/crates/protocol/src/sync/ (names and recents per remote
+// ID, and since server 1.2.0 the open tabs and the preferences that follow the
+// account).
 //
 //   POST /api/account/signup  {username, password}  → {username, token}
 //   POST /api/account/login   {username, password}  → {username, token}
 //   POST /api/account/logout  (Bearer)              → {ok: true}
-//   POST /api/sync            (Bearer) {doc?}       → {doc}   (merged)
+//   POST /api/sync            (Bearer) {doc?}       → {doc, features, serverTime}
 //
 // Errors are {error: "<code>"} with a 4xx status.
 
 import { DurableObject } from "cloudflare:workers";
+import { FEATURES, emptyDoc, mergeDocs, normalizeDoc, normalizeIncoming } from "./sync.js";
 
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const USERNAME_RE = /^[a-z0-9][a-z0-9._-]{2,31}$/;
 const MIN_PASSWORD = 8;
 const MAX_PASSWORD = 256;
@@ -33,9 +30,6 @@ const TOKEN_IDLE_MS = 180 * 24 * 3600 * 1000; // unused this long → expired
 const TOKEN_TOUCH_MS = 24 * 3600 * 1000; // lastUsedAt write granularity
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_FAILS = 10; // per account per window
-const MAX_ENTRIES = 500; // same as MAX_SYNC_ENTRIES in sync.rs
-const MAX_RAW_ENTRIES = 2000; // read at most this many from one request
-const MAX_NAME_CHARS = 40; // same as MAX_REMOTE_NAME_CHARS in config.rs
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -108,108 +102,6 @@ export function parseToken(header) {
   return { username, secret };
 }
 
-// ---- the synced document (mirror of native/crates/protocol/src/sync.rs) -----
-
-// A name as stored: control characters dropped, whitespace runs folded to one
-// space, trimmed, capped at MAX_NAME_CHARS code points. "" when empty.
-export function cleanName(name) {
-  if (typeof name !== "string") return "";
-  const folded = name
-    .split(/[\s\p{Cc}]+/u)
-    .filter((w) => w)
-    .join(" ");
-  return Array.from(folded).slice(0, MAX_NAME_CHARS).join("").trimEnd();
-}
-
-// Code-point order, which is the byte order Rust compares Strings in, so a
-// tie between two names is broken the same way on both sides.
-function cmpCodePoints(a, b) {
-  const x = Array.from(a);
-  const y = Array.from(b);
-  for (let i = 0; i < Math.min(x.length, y.length); i++) {
-    const d = x[i].codePointAt(0) - y[i].codePointAt(0);
-    if (d) return d;
-  }
-  return x.length - y.length;
-}
-
-function mergeEntry(into, other) {
-  if (
-    other.nameAt > into.nameAt ||
-    (other.nameAt === into.nameAt && cmpCodePoints(other.name, into.name) > 0)
-  ) {
-    into.name = other.name;
-    into.nameAt = other.nameAt;
-  }
-  into.usedAt = Math.max(into.usedAt, other.usedAt);
-}
-
-function emptyDoc() {
-  return { v: 1, entries: {}, recentsClearedAt: 0 };
-}
-
-// Over the cap: keep named IDs first, then the most recently touched.
-function prune(doc) {
-  const ids = Object.keys(doc.entries);
-  if (ids.length <= MAX_ENTRIES) return doc;
-  const touched = (e) => Math.max(e.nameAt, e.usedAt);
-  ids.sort((a, b) => {
-    const ea = doc.entries[a];
-    const eb = doc.entries[b];
-    const named = (eb.name !== "") - (ea.name !== "");
-    if (named) return named;
-    const t = touched(eb) - touched(ea);
-    if (t) return t;
-    return a < b ? -1 : a > b ? 1 : 0;
-  });
-  for (const id of ids.slice(MAX_ENTRIES)) delete doc.entries[id];
-  return doc;
-}
-
-export function mergeDocs(a, b) {
-  const out = emptyDoc();
-  for (const doc of [a, b]) {
-    for (const [id, e] of Object.entries(doc.entries)) {
-      const cur = out.entries[id] || (out.entries[id] = { name: "", nameAt: 0, usedAt: 0 });
-      mergeEntry(cur, e);
-    }
-  }
-  out.recentsClearedAt = Math.max(a.recentsClearedAt, b.recentsClearedAt);
-  return prune(out);
-}
-
-// A time from a client: a non-negative integer, never later than `now` (a
-// device whose clock runs ahead must not win every future edit).
-function stamp(v, now) {
-  return Number.isSafeInteger(v) && v > 0 ? Math.min(v, now) : 0;
-}
-
-// Validate and clean an untrusted document. null if it is not one at all.
-export function normalizeDoc(raw, now) {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
-  const out = emptyDoc();
-  const entries =
-    typeof raw.entries === "object" && raw.entries !== null && !Array.isArray(raw.entries)
-      ? raw.entries
-      : {};
-  let seen = 0;
-  for (const [rawId, e] of Object.entries(entries)) {
-    if (++seen > MAX_RAW_ENTRIES) break;
-    const id = rawId.trim().toLowerCase();
-    if (!UUID_RE.test(id)) continue;
-    if (typeof e !== "object" || e === null || Array.isArray(e)) continue;
-    const clean = {
-      name: cleanName(e.name),
-      nameAt: stamp(e.nameAt, now),
-      usedAt: stamp(e.usedAt, now),
-    };
-    const cur = out.entries[id] || (out.entries[id] = { name: "", nameAt: 0, usedAt: 0 });
-    mergeEntry(cur, clean);
-  }
-  out.recentsClearedAt = stamp(raw.recentsClearedAt, now);
-  return prune(out);
-}
-
 // ---- the per-account Durable Object ------------------------------------------
 
 export class AccountStore extends DurableObject {
@@ -257,20 +149,31 @@ export class AccountStore extends DurableObject {
     return { status: 200, body: { ok: true } };
   }
 
-  // Merge `doc` (if given) into the account's document; answer the result.
+  // Merge `doc` (if given) into the account's document; answer the result,
+  // what this server stores (`features`) and its clock (`serverTime`, for the
+  // client's stamps).
   async sync(secret, doc) {
     if (!(await this.checkToken(secret))) {
       return { status: 401, body: { error: "unauthorized" } };
     }
-    const stored = (await this.ctx.storage.get("doc")) || emptyDoc();
-    if (doc === null || doc === undefined) return { status: 200, body: { doc: stored } };
-    const incoming = normalizeDoc(doc, Date.now());
+    const now = Date.now();
+    const raw = await this.ctx.storage.get("doc");
+    // The stored document is cleaned too: that upgrades a version 1 document to
+    // the version 2 shape, and forgets tabs closed long ago (sync.js).
+    const stored = normalizeDoc(raw || emptyDoc(), now) || emptyDoc();
+    const reply = (merged) => ({
+      status: 200,
+      body: { doc: merged, features: FEATURES, serverTime: now },
+    });
+    if (doc === null || doc === undefined) return reply(stored);
+    const incoming = normalizeIncoming(doc, now);
     if (!incoming) return { status: 400, body: { error: "bad-doc" } };
-    const merged = mergeDocs(stored, incoming);
-    if (JSON.stringify(merged) !== JSON.stringify(stored)) {
+    if (incoming.tooLarge) return { status: 413, body: { error: "too-large" } };
+    const merged = mergeDocs(stored, incoming.doc);
+    if (JSON.stringify(merged) !== JSON.stringify(raw)) {
       await this.ctx.storage.put("doc", merged);
     }
-    return { status: 200, body: { doc: merged } };
+    return reply(merged);
   }
 
   async issueToken(username) {

@@ -190,14 +190,49 @@ impl Xdnd {
                 &[self.window],
             )
             .map(|_| ())
+            .and_then(|()| conn.flush())
+            .map_err(x11rb::errors::ReplyError::from)
         } else {
-            conn.delete_property(self.toplevel, self.atoms.proxy)
-                .map(|_| ())
+            self.release(conn)
         };
-        match result.and_then(|()| conn.flush()) {
+        match result {
             Ok(()) => *proxied = on,
             Err(e) => tracing::warn!("video surface: XdndProxy update failed: {e}"),
         }
+    }
+
+    /// Remove the app window's `XdndProxy` if it still names our window — with
+    /// several tabs, another surface may have set it to its own since (each
+    /// has its own X connection, and the server does not order requests across
+    /// connections) — and wait until the server has done it, so a surface shown
+    /// next sets its proxy strictly after (B9: hide before show).
+    fn release(&self, conn: &RustConnection) -> Result<(), x11rb::errors::ReplyError> {
+        let current = conn
+            .get_property(
+                false,
+                self.toplevel,
+                self.atoms.proxy,
+                AtomEnum::WINDOW,
+                0,
+                1,
+            )?
+            .reply();
+        let ours = match current {
+            Ok(reply) => reply
+                .value32()
+                .and_then(|mut v| v.next())
+                .is_some_and(|w| w == self.window),
+            // Unreadable (the app window is going away): nothing to keep.
+            Err(e) => {
+                tracing::debug!("video surface: XdndProxy read failed: {e}");
+                false
+            }
+        };
+        if ours {
+            conn.delete_property(self.toplevel, self.atoms.proxy)?;
+            conn.sync()?;
+        }
+        Ok(())
     }
 
     /// Handle an XDND event; `false` when it was not one. `top_inset`: the

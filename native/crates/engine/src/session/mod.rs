@@ -1,19 +1,21 @@
-//! One remote-control session (one at a time): WebRTC setup, the session's
+//! One remote-control session: WebRTC setup, the session's
 //! threads, and teardown. The host offers and streams; the viewer answers,
 //! decodes, presents and sends input.
 //!
-//! Threads per session (all named `sct-*`, all stopped by one flag and joined in
-//! [`teardown`]):
+//! Threads per session (all named `sct-*`, all stopped by one flag and joined by
+//! [`Session::stop_and_join`]):
 //! * transport — owns the str0m `Rtc` + UDP socket ([`driver`]),
 //! * host media (capture → encode) or viewer media (decode → present),
 //! * clipboard sync,
 //! * viewer only: input translation, file push, and optionally shortcut capture.
 
+pub(crate) mod active;
 mod clipboard;
 mod ctl_queue;
 mod driver;
 mod files;
 mod ice;
+pub(crate) mod registry;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -25,10 +27,11 @@ use parking_lot::Mutex;
 use platform_api::{FileDrop, KeyForwarder, Rect, VideoInput};
 use protocol::{ControlMsg, InputMsg, Permission, SignalData, SignalMsg};
 
+use crate::events::{SessionEvent, SessionId};
 use crate::media::host::{host_media_loop, HostCtx, HostStreams, StreamSpec, MAX_POPOUTS};
 use crate::media::viewer::{viewer_media_loop, ViewerMedia};
 use crate::modifiers::{KeyTranslator, OsFamily};
-use crate::{Engine, Role};
+use crate::Engine;
 
 pub(crate) use crate::tuning::{DESIRED_BITRATE, TARGET_BITRATE};
 
@@ -58,6 +61,9 @@ pub(crate) struct Shared {
     /// held frame once and clears it (or, with nothing decoded yet, asks for a
     /// keyframe so a fresh frame arrives to show).
     pub repaint_requested: AtomicBool,
+    /// Host: the viewer put this session in the background (`vpause`, P6):
+    /// the main stream neither captures nor encodes until `vresume`.
+    pub video_paused: AtomicBool,
     /// Host: a monitor switch (a `DisplayInfo::id`) waiting for the media
     /// thread, which owns the capture. Set by the host UI or by a controlling
     /// viewer's `seldisp`; the newest request wins.
@@ -95,12 +101,21 @@ pub(crate) struct Shared {
     /// link varies (V2 has no resolution ladder).
     #[cfg(feature = "test-hooks")]
     pub encode_dims: AtomicU64,
+    /// Test hook (`test-hooks` feature only): encoded units the main stream
+    /// has sent, so the loopback can see a paused stream send nothing (P6).
+    #[cfg(feature = "test-hooks")]
+    pub main_units: AtomicU64,
     /// Test hook (`test-hooks` feature only): a forced bandwidth estimate in bps
     /// (0 = none). While set, the driver re-applies it every tick and ignores
     /// str0m's real estimate, so a loopback test can drive a constrained-then-
     /// recovering link deterministically. Never written in a shipping build.
     #[cfg(feature = "test-hooks")]
     pub bwe_inject: AtomicU32,
+    /// Test hook (`test-hooks` feature only): make the transport declare the
+    /// link dead on its next pass, as a cut network would. Never written in a
+    /// shipping build.
+    #[cfg(feature = "test-hooks")]
+    pub sever: AtomicBool,
 }
 
 /// The pointer as the last position message described it.
@@ -152,18 +167,152 @@ pub(crate) struct Session {
     clip_on: Arc<AtomicBool>,
     /// The user's clipboard-sync setting at session start.
     clipboard_setting: bool,
-    /// The per-session shared state: on the viewer so [`request_repaint`] can
+    /// The per-session shared state: on the viewer so the ActiveGate can
     /// set the repaint flag when the surface is re-shown (task D12); on the host
     /// so [`request_display`] can hand a monitor switch to the media thread.
     shared: Arc<Shared>,
     /// Viewer: what opening a pop-out window needs. `None` on a host.
     viewer: Option<ViewerCtx>,
     threads: Vec<JoinHandle<()>>,
+    /// Viewer: its main video as the ActiveGate sees it (`None` on a host).
+    view: Option<Arc<active::SessionView>>,
+    /// Viewer: whether it is the active session, and what follows that (the
+    /// clipboard, the shortcut hook). `None` on a host.
+    activity: Option<Arc<Activity>>,
     /// Test hooks (`test-hooks` feature only): the host's rate state, so the
     /// loopback can observe the encoder target / raw link and inject estimates.
     /// `None` on a viewer session.
     #[cfg(feature = "test-hooks")]
     hooks: Option<TestHooks>,
+}
+
+/// Viewer: what the ActiveGate switches for one session — its view and its
+/// [`Activity`]. Put in the session's registry slot by `start_viewer` as soon
+/// as it exists, before any thread runs, so a switch or an overlay change
+/// reaches a session that is still being built (it would otherwise start
+/// from a stale "active" and show over the tab on screen).
+pub(crate) struct TabGate {
+    pub(crate) view: Arc<active::SessionView>,
+    activity: Arc<Activity>,
+    /// The control channel, for pausing the host's main stream while the
+    /// tab is in the background (plans/08 P6).
+    ctl: Sender<Vec<u8>>,
+    /// The host advertised `vpause`.
+    host_vpause: bool,
+    /// Whether the host is (to be) streaming the main video to this tab: it
+    /// starts streaming, so a session born active sends nothing.
+    streaming: AtomicBool,
+}
+
+impl TabGate {
+    pub(crate) fn new(
+        view: Arc<active::SessionView>,
+        activity: Arc<Activity>,
+        ctl: Sender<Vec<u8>>,
+        host_vpause: bool,
+    ) -> Self {
+        TabGate {
+            view,
+            activity,
+            ctl,
+            host_vpause,
+            streaming: AtomicBool::new(true),
+        }
+    }
+
+    /// A web dialog opened over the video, or the last one closed: the video
+    /// is hidden meanwhile (the flag is engine-wide; this re-decides), and so
+    /// is shortcut capture — a dialog's typing and Ctrl+Tab are this
+    /// computer's, not the hidden session's.
+    pub(crate) fn set_overlay(&self, open: bool) {
+        self.activity.overlay(open);
+        self.view.refresh();
+    }
+
+    /// Only atomics and non-blocking queue sends: safe under `reg`.
+    pub(crate) fn set_active(&self, active: bool) {
+        self.activity.set(active);
+        self.view.set_active(active);
+        // Background tabs pause (08a §6.14). Ordered on the reliable control
+        // channel, so a quick back-and-forth ends in the right state; queued
+        // until the channel opens when the session is still starting.
+        if self.streaming.swap(active, Ordering::SeqCst) == active {
+            return;
+        }
+        // An older host keeps streaming, and the tab keeps decoding it (only
+        // not presenting), so nothing needs saying: its picture stays current.
+        if !self.host_vpause {
+            return;
+        }
+        let msg = if active {
+            ControlMsg::VideoResume
+        } else {
+            ControlMsg::VideoPause
+        };
+        let _ = self.ctl.send(serialize(&msg));
+    }
+}
+
+/// Viewer: what follows the session being the active one (plans/08 P3). Only
+/// the active session exchanges the clipboard (B3: otherwise text copied from
+/// one host would be forwarded to another) and holds the shortcut hook (B2).
+pub(crate) struct Activity {
+    active: AtomicBool,
+    /// The clipboard loop's gate: the user's setting AND active.
+    clip_on: Arc<AtomicBool>,
+    clipboard_setting: bool,
+    /// Tells the shortcut thread to uninstall its hook: set while inactive and
+    /// once the session stops.
+    hook_quit: AtomicBool,
+    /// Bumped on every activation, so the shortcut thread can tell "still the
+    /// same activation" from "deactivated and activated again since".
+    generation: AtomicU64,
+    /// Wakes the clipboard loop when its gate changes, so it re-baselines at
+    /// once rather than up to a poll later — a copy made right after switching
+    /// to this tab then counts as new (and is sent), not as the baseline.
+    clip_wake: std::sync::mpsc::Sender<()>,
+}
+
+impl Activity {
+    /// The activity and the clipboard loop's wake-up receiver.
+    fn new(clipboard_setting: bool, active: bool) -> (Self, std::sync::mpsc::Receiver<()>) {
+        let (clip_wake, wake_rx) = std::sync::mpsc::channel();
+        let activity = Activity {
+            active: AtomicBool::new(active),
+            clip_on: Arc::new(AtomicBool::new(clipboard_setting && active)),
+            clipboard_setting,
+            hook_quit: AtomicBool::new(!active),
+            generation: AtomicU64::new(0),
+            clip_wake,
+        };
+        (activity, wake_rx)
+    }
+
+    /// A web dialog opened (`true`) or the last one closed: the shortcut
+    /// hook goes while it is open, and comes back for the active session.
+    fn overlay(&self, open: bool) {
+        if open {
+            self.hook_quit.store(true, Ordering::SeqCst);
+        } else if self.active.load(Ordering::SeqCst) {
+            // A fresh activation for the hook thread, which waits for one.
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.hook_quit.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn set(&self, active: bool) {
+        self.active.store(active, Ordering::SeqCst);
+        // The clipboard loop re-baselines when its gate opens, so text copied
+        // while another tab was active is never forwarded here (08a §6.4 step 4).
+        self.clip_on
+            .store(active && self.clipboard_setting, Ordering::SeqCst);
+        if active {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+        self.hook_quit.store(!active, Ordering::SeqCst);
+        // Never blocks; fails only once the loop is gone (session over).
+        let _ = self.clip_wake.send(());
+    }
 }
 
 /// Host-side rate state exposed to tests under the `test-hooks` feature.
@@ -188,7 +337,7 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> std::io::Result<JoinH
 /// started, end the session with a message. (A failed spawn means the OS is out
 /// of threads; panicking would abort the whole app in release builds.)
 macro_rules! spawn_or_abort {
-    ($engine:expr, $stop:expr, $threads:expr, $name:literal, $body:expr) => {
+    ($engine:expr, $id:expr, $stop:expr, $threads:expr, $name:literal, $body:expr) => {
         match spawn($name, $body) {
             Ok(h) => $threads.push(h),
             Err(e) => {
@@ -197,7 +346,7 @@ macro_rules! spawn_or_abort {
                 for t in $threads.drain(..) {
                     let _ = t.join();
                 }
-                $engine.fail_session("the session could not be started");
+                $engine.fail_session($id, "the session could not be started");
                 return;
             }
         }
@@ -233,11 +382,25 @@ pub(crate) fn input_rect_for(d: &platform_api::DisplayInfo) -> Option<Rect> {
 /// encode and clipboard threads, then send the offer to `peer`.
 /// `popouts`: the viewer said it can show pop-out windows (D14), so spare
 /// video tracks are worth offering.
-pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, popouts: bool) {
-    teardown(engine);
+pub(crate) fn begin_host(
+    engine: &Engine,
+    id: SessionId,
+    peer: String,
+    permission: Permission,
+    popouts: bool,
+    codec: platform_api::Codec,
+) {
+    // Set when the session ends any way; the transport thread reports a dead
+    // link only if nothing ended it first.
+    let Some(ended) = engine.host_start(id) else {
+        return; // ended before it started
+    };
+    let ui = engine.session_ui(id, &peer, true);
     let platform = engine.platform();
     let cfg = engine.config();
-    let codec = engine.negotiated_codec();
+    // The person's synced settings (clipboard, dropped files) come from the
+    // active workspace (plans/08 D5); the defaults while signed out.
+    let prefs = engine.prefs();
     let shared = Arc::new(Shared::default());
     let stop = Arc::new(AtomicBool::new(false));
     let (signal_tx, signal_rx) = std::sync::mpsc::channel::<SignalData>();
@@ -262,7 +425,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, 
     let ice = ice::ice_config_from(engine);
     let Some((socket, turn_alloc)) = ice::bind_and_gather(&mut rtc, &ice) else {
         tracing::error!("host: failed to bind a UDP socket");
-        engine.fail_session("no network socket available");
+        engine.fail_session(id, "no network socket available");
         return;
     };
     // Data channels (ctl reliable, cursor unreliable-latest, bulk reliable);
@@ -303,7 +466,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, 
     api.add_channel("init".to_string());
     let Some((offer, pending)) = api.apply() else {
         tracing::error!("host: str0m produced no offer");
-        engine.fail_session("the connection could not be set up");
+        engine.fail_session(id, "the connection could not be set up");
         return;
     };
 
@@ -316,7 +479,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, 
         codec,
         shared: shared.clone(),
         ctl_tx: ctl_tx.clone(),
-        ui: engine.ui_sender(),
+        ui: ui.clone(),
         frame_tx,
         cursor_tx,
         bitrate: bitrate.clone(),
@@ -326,7 +489,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, 
     // peer must not read this machine's clipboard (it can hold a password that
     // was never on screen) or write to it.
     let clip_on = Arc::new(AtomicBool::new(
-        cfg.clipboard_sync && permission == Permission::Control,
+        prefs.clipboard_sync && permission == Permission::Control,
     ));
     let (clip_tx, clip_rx) = std::sync::mpsc::channel::<String>();
     let mut threads = Vec::new();
@@ -338,8 +501,8 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, 
             clip_on.clone(),
             stop.clone(),
         );
-        spawn_or_abort!(engine, stop, threads, "clipboard", move || {
-            clipboard::clipboard_loop(platform, ctl, clip_rx, gate, stop_c)
+        spawn_or_abort!(engine, id, stop, threads, "clipboard", move || {
+            clipboard::clipboard_loop(platform, ctl, clip_rx, None, gate, stop_c)
         });
     }
 
@@ -359,20 +522,23 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, 
         force_key: Some(force_key.clone()),
         bitrate: Some(bitrate.clone()),
         link: Some(link.clone()),
-        ui: engine.ui_sender(),
-        role: engine.role_handle(),
+        ui: ui.clone(),
+        ended: ended.clone(),
+        end_tx: engine.ended_sender(),
+        id,
         socket,
         turn: turn_alloc,
         stop: stop.clone(),
         platform: platform.clone(),
         surface: None,
+        view: None,
         shared: shared.clone(),
         downloads_dir: platform.paths().downloads_dir,
-        paste_dropped: cfg.paste_dropped_files,
+        paste_dropped: prefs.paste_dropped_files,
         target_rect: target_rect_for(engine, cfg.share_display_id.as_deref()),
         host: Some(host_ctx.clone()),
     };
-    spawn_or_abort!(engine, stop, threads, "transport", move || {
+    spawn_or_abort!(engine, id, stop, threads, "transport", move || {
         driver::transport_driver(driver)
     });
 
@@ -390,13 +556,11 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, 
             view_size: shared.view_size.clone(),
             stream_stop: None,
         };
-        let ui = engine.ui_sender();
-        spawn_or_abort!(engine, stop, threads, "host-media", move || {
+        let ui = ui.clone();
+        spawn_or_abort!(engine, id, stop, threads, "host-media", move || {
             if let Err(e) = host_media_loop(host_ctx, spec) {
                 tracing::warn!("host media loop ended: {e}");
-                let _ = ui.send(crate::UiEvent::Toast(format!(
-                    "Screen sharing stopped: {e}"
-                )));
+                ui.send(SessionEvent::Toast(format!("Screen sharing stopped: {e}")));
             }
         });
     }
@@ -405,16 +569,18 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, 
     let _ = ctl_tx.send(serialize(&ControlMsg::Perm { value: permission }));
 
     // Register the session BEFORE the offer leaves: the answer must find it.
-    *engine.session.lock() = Some(Session {
+    let session = Session {
         peer: peer.clone(),
         stop,
         signal_tx,
         ctl_tx,
         control,
         clip_on,
-        clipboard_setting: cfg.clipboard_sync,
+        clipboard_setting: prefs.clipboard_sync,
         shared: host_shared,
         viewer: None,
+        view: None,
+        activity: None,
         threads,
         #[cfg(feature = "test-hooks")]
         hooks: Some(TestHooks {
@@ -422,7 +588,10 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, 
             link: hooks_link,
             shared: hooks_shared,
         }),
-    });
+    };
+    if !engine.store_host_session(id, session) {
+        return; // ended while starting: its threads were stopped
+    }
     let _ = engine.signaling().send(SignalMsg::Signal {
         to: Some(peer),
         from: None,
@@ -434,55 +603,51 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, 
 
 // ---- viewer ------------------------------------------------------------------
 
-/// Route an inbound WebRTC payload. An offer starts a viewer session — but only
-/// from the host this engine is connected to as a viewer; anything else is
-/// forwarded to the live session with that same peer.
-pub(crate) fn on_signal(engine: &Engine, peer: &str, data: SignalData) {
-    match data {
-        SignalData::Offer { sdp } => {
-            let expected = matches!(
-                engine.role(),
-                Role::Viewer { peer: ref p, .. } if p == peer
-            );
-            if !expected {
-                tracing::warn!("ignoring a WebRTC offer from {peer}: not the host we connected to");
-                return;
-            }
-            start_viewer(engine, peer.to_string(), sdp);
-        }
-        other => match engine.session.lock().as_ref() {
-            Some(s) if s.peer == peer => {
-                let _ = s.signal_tx.send(other);
-            }
-            Some(_) => tracing::warn!("ignoring signal from {peer}: not the session peer"),
-            None => tracing::debug!("signal from {peer} with no session — dropped"),
-        },
-    }
+/// What a viewer session needs from its registry slot to start.
+pub(crate) struct ViewerStart {
+    pub(crate) peer: String,
+    pub(crate) surface: Option<Arc<dyn platform_api::VideoSurface>>,
+    pub(crate) codec: platform_api::Codec,
+    pub(crate) host_os: OsFamily,
+    /// The host pauses a background tab's video on request (P6).
+    pub(crate) host_vpause: bool,
+    pub(crate) permission: Permission,
+    pub(crate) ended: Arc<AtomicBool>,
 }
 
-fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
-    // An offer always means a new session (the host restarts by re-offering).
-    teardown(engine);
-    let Some(surface) = engine.surface() else {
+/// Viewer: the host's offer arrived for session `id` — answer it and start the
+/// session's threads.
+pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
+    let Some(start) = engine.viewer_start(id) else {
+        return; // ended meanwhile
+    };
+    let ViewerStart {
+        peer,
+        surface,
+        codec,
+        host_os,
+        host_vpause,
+        permission,
+        ended,
+    } = start;
+    // Test hook: a slow start (a long ICE gather), so a test can end the
+    // session while it is being built.
+    #[cfg(feature = "test-hooks")]
+    std::thread::sleep(engine.test_viewer_start_delay());
+    let Some(surface) = surface else {
         tracing::error!("viewer: no video surface on this platform");
-        engine.fail_session("this computer cannot display the remote screen yet");
+        engine.fail_session(id, "this computer cannot display the remote screen yet");
         return;
     };
+    let ui = engine.session_ui(id, &peer, false);
     let platform = engine.platform();
-    let cfg = engine.config();
-    let codec = engine.negotiated_codec();
+    let prefs = engine.prefs();
     let shared = Arc::new(Shared::default());
     // Viewer control state (task D10): drives the local-pointer cursor
     // prediction and the OS-cursor hide. The host re-asserts it over ctl via
     // `Perm`, but seeding it from the permission the host already granted means
     // the first frames are correct before that message arrives.
-    let has_control = matches!(
-        engine.role(),
-        Role::Viewer {
-            permission: Permission::Control,
-            ..
-        }
-    );
+    let has_control = permission == Permission::Control;
     shared.control.store(has_control, Ordering::SeqCst);
     let stop = Arc::new(AtomicBool::new(false));
     let (signal_tx, signal_rx) = std::sync::mpsc::channel::<SignalData>();
@@ -493,7 +658,7 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
     let ice = ice::ice_config_from(engine);
     let Some((socket, turn_alloc)) = ice::bind_and_gather(&mut rtc, &ice) else {
         tracing::error!("viewer: failed to bind a UDP socket");
-        engine.fail_session("no network socket available");
+        engine.fail_session(id, "no network socket available");
         return;
     };
     let answer = match str0m::change::SdpOffer::from_sdp_string(&offer_sdp)
@@ -503,7 +668,7 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
         Ok(answer) => answer,
         Err(e) => {
             tracing::warn!("viewer: could not accept the host's offer: {e}");
-            engine.fail_session("the connection could not be set up");
+            engine.fail_session(id, "the connection could not be set up");
             return;
         }
     };
@@ -515,15 +680,37 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
     let (bulk_tx, bulk_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let (drop_tx, drop_rx) = std::sync::mpsc::channel::<FileDrop>();
     {
-        let (ui, stop_f) = (engine.ui_sender(), stop.clone());
-        spawn_or_abort!(engine, stop, threads, "file-push", move || {
+        let (ui, stop_f) = (ui.clone(), stop.clone());
+        spawn_or_abort!(engine, id, stop, threads, "file-push", move || {
             files::file_send_loop(drop_rx, bulk_tx, ui, stop_f)
         });
     }
 
     // Clipboard sync. The host applies its own permission gate; here the user's
     // setting governs.
-    let clip_on = Arc::new(AtomicBool::new(cfg.clipboard_sync));
+    // Its view (shown only while active, ready, untroubled and uncovered)
+    // and what follows being the active session (clipboard, shortcut hook).
+    // Inactive until the registry says otherwise: `attach_gate` applies the
+    // current answer under the same lock every switch takes.
+    let view = active::SessionView::new(
+        surface.clone(),
+        shared.clone(),
+        engine.overlay_flag(),
+        engine.view_ops(),
+        false,
+    );
+    let (activity, clip_wake) = Activity::new(prefs.clipboard_sync, false);
+    let activity = Arc::new(activity);
+    engine.attach_gate(
+        id,
+        Arc::new(TabGate::new(
+            view.clone(),
+            activity.clone(),
+            ctl_tx.clone(),
+            host_vpause,
+        )),
+    );
+    let clip_on = activity.clip_on.clone();
     let (clip_tx, clip_rx) = std::sync::mpsc::channel::<String>();
     {
         let (platform, ctl, gate, stop_c) = (
@@ -532,8 +719,8 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
             clip_on.clone(),
             stop.clone(),
         );
-        spawn_or_abort!(engine, stop, threads, "clipboard", move || {
-            clipboard::clipboard_loop(platform, ctl, clip_rx, gate, stop_c)
+        spawn_or_abort!(engine, id, stop, threads, "clipboard", move || {
+            clipboard::clipboard_loop(platform, ctl, clip_rx, Some(clip_wake), gate, stop_c)
         });
     }
 
@@ -542,13 +729,17 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
     // and remembers what it sent for each held key (D8).
     let keys = {
         let viewer_os = OsFamily::from_name(platform.info().name);
-        let host_os = engine.peer_os();
         tracing::info!("key translation: {viewer_os:?} viewer → {host_os:?} host");
-        Arc::new(Mutex::new(KeyTranslator::new(
-            viewer_os,
-            host_os,
-            engine.translate_modifiers_handle(),
-        )))
+        let ui = engine.ui_sender();
+        Arc::new(Mutex::new(
+            KeyTranslator::new(viewer_os, host_os, engine.translate_modifiers_handle())
+                .with_tab_shortcuts(
+                    Box::new(move |step| {
+                        let _ = ui.send(crate::UiEvent::TabShortcut(step));
+                    }),
+                    engine.tab_chord_keys(),
+                ),
+        ))
     };
 
     // Input from the video surface → protocol messages on ctl. The host enforces
@@ -560,7 +751,7 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
             current: shared.input_target.clone(),
         };
         let (ctl, keys, stop_i) = (ctl_tx.clone(), keys.clone(), stop.clone());
-        spawn_or_abort!(engine, stop, threads, "input", move || {
+        spawn_or_abort!(engine, id, stop, threads, "input", move || {
             input_loop(input_rx, ctl, keys, target, stop_i)
         });
     }
@@ -583,20 +774,23 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
         force_key: None,
         bitrate: None,
         link: None,
-        ui: engine.ui_sender(),
-        role: engine.role_handle(),
+        ui: ui.clone(),
+        ended: ended.clone(),
+        end_tx: engine.ended_sender(),
+        id,
         socket,
         turn: turn_alloc,
         stop: stop.clone(),
         platform: platform.clone(),
         surface: Some(surface.clone()),
+        view: Some(view.clone()),
         shared: shared.clone(),
         downloads_dir: platform.paths().downloads_dir,
         paste_dropped: false,
         target_rect: None,
         host: None,
     };
-    spawn_or_abort!(engine, stop, threads, "transport", move || {
+    spawn_or_abort!(engine, id, stop, threads, "transport", move || {
         driver::transport_driver(driver)
     });
 
@@ -607,40 +801,48 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
             codec,
             shared: shared.clone(),
             slot: 0,
+            view: Some(view.clone()),
         };
-        let (ctl, stop_r, ui) = (ctl_tx.clone(), stop.clone(), engine.ui_sender());
-        spawn_or_abort!(engine, stop, threads, "viewer-media", move || {
+        let (ctl, stop_r, ui) = (ctl_tx.clone(), stop.clone(), ui.clone());
+        spawn_or_abort!(engine, id, stop, threads, "viewer-media", move || {
             if let Err(e) = viewer_media_loop(media, video_rx, ctl, stop_r) {
                 tracing::warn!("viewer media loop ended: {e}");
-                let _ = ui.send(crate::UiEvent::Toast(format!(
+                ui.send(SessionEvent::Toast(format!(
                     "Cannot display the remote screen: {e}"
                 )));
             }
         });
     }
 
-    // OS shortcut capture (Win/Alt+Tab, Cmd+Tab, Super), when the user enabled it.
-    if cfg.capture_shortcuts {
-        let (platform, surface, ctl, keys, stop_k, hook_input) = (
+    // OS shortcut capture (Win/Alt+Tab, Cmd+Tab, Super), when the user enabled
+    // it — held only while this session is the active one, and by one session
+    // at a time: a Windows hook is process-wide, so a second install would
+    // take over the first and either uninstall would end both (B2). The
+    // engine-wide owner slot makes the next session wait until the previous
+    // one has uninstalled.
+    if prefs.capture_shortcuts {
+        let (platform, surface, ctl, keys, stop_k, hook_input, activity, owner) = (
             platform.clone(),
             surface.clone(),
             ctl_tx.clone(),
             keys.clone(),
             stop.clone(),
             input_tx.clone(),
+            activity.clone(),
+            engine.hook_owner(),
         );
-        spawn_or_abort!(engine, stop, threads, "shortcuts", move || {
-            let Some(mut hook) = platform.create_shortcut_hook() else {
-                tracing::info!("shortcut capture is not available on this platform");
-                return;
-            };
-            let forward = hook_forwarder(hook_input, keys, ctl);
-            if hook.install(surface.as_ref(), forward) {
-                hook.run(&stop_k);
-            } else {
-                tracing::info!("shortcut capture could not be installed");
-            }
-            hook.uninstall();
+        let overlay = engine.overlay_flag();
+        spawn_or_abort!(engine, id, stop, threads, "shortcuts", move || {
+            shortcut_loop(
+                id,
+                platform.as_ref(),
+                surface.as_ref(),
+                &activity,
+                &overlay,
+                &owner,
+                &stop_k,
+                || hook_forwarder(hook_input.clone(), keys.clone(), ctl.clone()),
+            );
         });
     }
 
@@ -649,14 +851,14 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
     // Hide the OS cursor over the video while controlling (task D10); a
     // view-only session leaves it shown. Mirrors `shared.control`.
     surface.set_cursor_control(has_control);
-    *engine.session.lock() = Some(Session {
+    let session = Session {
         peer: peer.clone(),
         stop,
         signal_tx,
         ctl_tx,
         control: Arc::new(AtomicBool::new(false)),
         clip_on,
-        clipboard_setting: cfg.clipboard_sync,
+        clipboard_setting: prefs.clipboard_sync,
         shared,
         viewer: Some(ViewerCtx {
             platform: platform.clone(),
@@ -664,9 +866,14 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
             keys,
         }),
         threads,
+        view: Some(view),
+        activity: Some(activity.clone()),
         #[cfg(feature = "test-hooks")]
         hooks: None,
-    });
+    };
+    if !engine.store_viewer_session(id, session) {
+        return; // ended while starting: its threads were stopped
+    }
     let _ = engine.signaling().send(SignalMsg::Signal {
         to: Some(peer),
         from: None,
@@ -679,6 +886,72 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
 /// Queue one input message for the host on the ctl channel.
 fn send_input(ctl: &Sender<Vec<u8>>, msg: &InputMsg) {
     let _ = ctl.send(serde_json::to_vec(msg).unwrap_or_default());
+}
+
+/// Session `id`'s shortcut capture: whenever the session is active and no
+/// other session holds the hook, install it, run it until the session stops
+/// being active (or stops), uninstall it and hand the owner slot back.
+/// Polls at 50 ms: activation is a user action, and a hook a tick late is
+/// invisible.
+fn shortcut_loop(
+    id: SessionId,
+    platform: &dyn platform_api::Platform,
+    surface: &dyn platform_api::VideoSurface,
+    activity: &Activity,
+    overlay: &AtomicBool,
+    owner: &Mutex<Option<SessionId>>,
+    stop: &AtomicBool,
+    forwarder: impl Fn() -> KeyForwarder,
+) {
+    const TICK: Duration = Duration::from_millis(50);
+    while !stop.load(Ordering::SeqCst) {
+        // Not while a web dialog is open over the video (its keys are this
+        // computer's).
+        let claimed =
+            activity.active.load(Ordering::SeqCst) && !overlay.load(Ordering::SeqCst) && {
+                let mut o = owner.lock();
+                if o.is_none() {
+                    *o = Some(id);
+                    true
+                } else {
+                    *o == Some(id)
+                }
+            };
+        if !claimed {
+            std::thread::sleep(TICK);
+            continue;
+        }
+        // This activation. Taken before installing, so an activation that
+        // comes and goes while the hook runs is seen below, however quick.
+        let generation = activity.generation.load(Ordering::SeqCst);
+        match platform.create_shortcut_hook() {
+            Some(mut hook) => {
+                if hook.install(surface, forwarder()) {
+                    hook.run(&activity.hook_quit);
+                } else {
+                    tracing::info!("shortcut capture could not be installed");
+                }
+                hook.uninstall();
+            }
+            None => {
+                tracing::info!("shortcut capture is not available on this platform");
+                *owner.lock() = None;
+                return;
+            }
+        }
+        *owner.lock() = None;
+        // Ended with this activation (the tab went inactive — even if it is
+        // active again already — or the session stopped): straight back to
+        // the top. Ended while this activation lasts (it would not install,
+        // or the OS dropped it): not straight back in, so it is not retried
+        // in a tight loop — wait for the next activation.
+        while activity.active.load(Ordering::SeqCst)
+            && !stop.load(Ordering::SeqCst)
+            && activity.generation.load(Ordering::SeqCst) == generation
+        {
+            std::thread::sleep(TICK);
+        }
+    }
 }
 
 /// The shortcut hook's forwarder: its keys join the surface's input channel,
@@ -819,43 +1092,76 @@ fn translate_input(ev: VideoInput) -> Option<InputMsg> {
 
 // ---- session control -----------------------------------------------------------
 
-/// Send a control message (perm change, keyframe request) on the ctl channel.
-pub(crate) fn send_ctl(engine: &Engine, msg: &ControlMsg) {
-    if let Some(s) = engine.session.lock().as_ref() {
-        let _ = s.ctl_tx.send(serialize(msg));
+impl Session {
+    /// Hand an inbound WebRTC payload (answer, ICE) to the transport thread.
+    pub(crate) fn signal(&self, data: SignalData) {
+        let _ = self.signal_tx.send(data);
+    }
+
+    /// Send a control message (perm change, keyframe request) on the ctl channel.
+    pub(crate) fn send_ctl(&self, msg: &ControlMsg) {
+        let _ = self.ctl_tx.send(serialize(msg));
+    }
+
+    /// Host: flip the injection gate when the live permission changes (§4.2).
+    /// The transport thread releases held input when control is revoked.
+    pub(crate) fn set_control(&self, allow: bool) {
+        self.control.store(allow, Ordering::SeqCst);
+        // Clipboard exchange is part of "control": revoking it must stop the
+        // peer reading this machine's clipboard too, not just its input.
+        self.clip_on
+            .store(allow && self.clipboard_setting, Ordering::SeqCst);
+    }
+
+    /// Host: switch the shared monitor to `id`. The media thread picks it up
+    /// on its next pass, swaps the capture, re-targets input and announces the
+    /// result to both UIs.
+    pub(crate) fn request_display(&self, id: String) {
+        *self.shared.display_req.lock() = Some(id);
+    }
+
+    /// Stop every thread of this session (the flag first, so they all wind
+    /// down together) and join them, its pop-out streams and windows too.
+    /// Blocking: called on a reaper thread, never under a lock.
+    pub(crate) fn stop_and_join(self) {
+        self.signal_stop();
+        for t in self.threads {
+            let _ = t.join();
+        }
+        // Host pop-out streams, and viewer pop-out windows (D14).
+        let extra: Vec<_> = self.shared.stream_threads.lock().drain(..).collect();
+        for t in extra {
+            let _ = t.join();
+        }
+        let popouts = std::mem::take(&mut *self.shared.popouts.lock());
+        for (_, p) in popouts {
+            stop_viewer_popout(p);
+        }
+    }
+
+    /// Set the stop flag only (the threads wind down; joining comes later).
+    pub(crate) fn signal_stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(a) = &self.activity {
+            a.hook_quit.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Viewer: its view, for the gate (`None` on a host).
+    pub(crate) fn view(&self) -> Option<Arc<active::SessionView>> {
+        self.view.clone()
     }
 }
 
-/// Host: flip the injection gate when the live permission changes (§4.2). The
-/// transport thread releases held input when control is revoked.
-pub(crate) fn set_control(engine: &Engine, allow: bool) {
-    if let Some(s) = engine.session.lock().as_ref() {
-        s.control.store(allow, Ordering::SeqCst);
-        // Clipboard exchange is part of "control": revoking it must stop the peer
-        // reading this machine's clipboard too, not just its input.
-        s.clip_on
-            .store(allow && s.clipboard_setting, Ordering::SeqCst);
-    }
-}
-
-/// Viewer (task D12): ask the present loop to repaint the last decoded frame
-/// once, immediately. Called after the video surface is re-shown (e.g. Settings
-/// closed mid-session): `show()` does not itself repaint, and on a static host
-/// screen the surface would otherwise stay black until the next frame. A no-op
-/// on a host session (no viewer `shared`).
-pub(crate) fn request_repaint(engine: &Engine) {
-    if let Some(s) = engine.session.lock().as_ref() {
-        s.shared.repaint_requested.store(true, Ordering::SeqCst);
-    }
-}
-
-/// Host: switch the shared monitor to `id`. The media thread picks it up on its
-/// next pass, swaps the capture, re-targets input and announces the result to
-/// both UIs. A no-op without a session.
-pub(crate) fn request_display(engine: &Engine, id: String) {
-    if let Some(s) = engine.session.lock().as_ref() {
-        *s.shared.display_req.lock() = Some(id);
-    }
+/// A viewer session's surface as it ends: input and drops stop at once (held
+/// keys are released first, by the surface contract) and the OS cursor is
+/// restored (task D10). Synchronous, so a session that ends never keeps
+/// capturing input while its threads are being joined. Hiding it is the
+/// gate's (`SessionView::retire`), in order with its other operations.
+pub(crate) fn detach_surface(s: &dyn platform_api::VideoSurface) {
+    s.set_input_sink(None);
+    s.set_drop_sink(None);
+    s.set_cursor_control(false);
 }
 
 /// Viewer: no stream known — the next positional input from any window sends
@@ -863,36 +1169,56 @@ pub(crate) fn request_display(engine: &Engine, id: String) {
 /// by another monitor; the host may also have mapped input elsewhere).
 const NO_INPUT_TARGET: u8 = u8::MAX;
 
-/// Viewer (D14): whether pop-out stream `slot` currently has a window
-/// attached.
-pub(crate) fn viewer_popout_attached(engine: &Engine, slot: u8) -> bool {
+/// Viewer (D14): whether pop-out stream `slot` of session `id` currently has
+/// a window attached.
+pub(crate) fn viewer_popout_attached(engine: &Engine, id: SessionId, slot: u8) -> bool {
     engine
-        .session
-        .lock()
-        .as_ref()
-        .is_some_and(|s| s.shared.popouts.lock().contains_key(&slot))
+        .with_viewer(id, |s| s.shared.popouts.lock().contains_key(&slot))
+        .unwrap_or(false)
 }
 
-/// Viewer (D14): the app opened a window for pop-out stream `slot` and made
-/// `surface` in it. Start that stream's decode → present and input threads.
-/// Returns the attachment's generation (what [`close_viewer_popout`] takes),
-/// or `None` without a viewer session, for slot 0, or when the slot is already
-/// attached.
+/// What opening a pop-out window takes from its session.
+struct PopoutParent {
+    ctx: ViewerCtx,
+    main: Arc<Shared>,
+    ctl_tx: Sender<Vec<u8>>,
+    stop: Arc<AtomicBool>,
+    ui: crate::SessionUi,
+}
+
+/// Viewer (D14): the app opened a window for pop-out stream `slot` of session
+/// `id` and made `surface` in it. Start that stream's decode → present and
+/// input threads. Returns the attachment's generation (what
+/// [`close_viewer_popout`] takes), or `None` without that viewer session, for
+/// slot 0, or when the slot is already attached.
 pub(crate) fn open_viewer_popout(
     engine: &Engine,
+    id: SessionId,
     slot: u8,
     surface: Arc<dyn platform_api::VideoSurface>,
 ) -> Option<u64> {
-    let guard = engine.session.lock();
-    let session = guard.as_ref()?;
-    let ctx = session.viewer.clone()?;
-    if slot == 0 || session.shared.popouts.lock().contains_key(&slot) {
-        return None;
-    }
-    let main = session.shared.clone();
-    let ctl_tx = session.ctl_tx.clone();
-    let session_stop = session.stop.clone();
-    drop(guard);
+    let parent = engine
+        .with_viewer(id, |session| {
+            let ctx = session.viewer.clone()?;
+            if slot == 0 || session.shared.popouts.lock().contains_key(&slot) {
+                return None;
+            }
+            Some(PopoutParent {
+                ctx,
+                main: session.shared.clone(),
+                ctl_tx: session.ctl_tx.clone(),
+                stop: session.stop.clone(),
+                ui: engine.session_ui(id, &session.peer, false),
+            })
+        })
+        .flatten()?;
+    let PopoutParent {
+        ctx,
+        main,
+        ctl_tx,
+        stop: session_stop,
+        ui,
+    } = parent;
 
     let control = main.control.load(Ordering::SeqCst);
     let shared = Arc::new(Shared {
@@ -925,12 +1251,14 @@ pub(crate) fn open_viewer_popout(
             codec: ctx.codec,
             shared: shared.clone(),
             slot,
+            // A pop-out shows itself: the gate decides the main video only.
+            view: None,
         };
-        let (ctl, stop_r, ui) = (ctl_tx.clone(), loop_stop.clone(), engine.ui_sender());
+        let (ctl, stop_r) = (ctl_tx.clone(), loop_stop.clone());
         let media_thread = spawn(&format!("popout-{slot}-media"), move || {
             if let Err(e) = viewer_media_loop(media, video_rx, ctl, stop_r) {
                 tracing::warn!("pop-out {slot} media loop ended: {e}");
-                let _ = ui.send(crate::UiEvent::Toast(format!(
+                ui.send(SessionEvent::Toast(format!(
                     "Cannot display that monitor: {e}"
                 )));
             }
@@ -968,24 +1296,26 @@ pub(crate) fn open_viewer_popout(
         threads,
     };
     let gen = popout.gen;
-    // Register under the session lock, and only into the session we started
-    // from: teardown takes the session out under this lock and then stops
-    // every registered pop-out, so nothing registered here can be missed —
-    // and a session that ended meanwhile gets nothing registered at all.
-    {
-        let guard = engine.session.lock();
-        let live = guard
-            .as_ref()
-            .is_some_and(|s| Arc::ptr_eq(&s.shared, &main) && !s.stop.load(Ordering::SeqCst));
+    // Register under the registry lock, and only into the session we started
+    // from: ending a session takes it out under this lock and its reaper then
+    // stops every registered pop-out, so nothing registered here can be
+    // missed — and a session that ended meanwhile gets nothing registered.
+    let mut pending = Some(popout);
+    engine.with_viewer(id, |s| {
+        let live = Arc::ptr_eq(&s.shared, &main) && !s.stop.load(Ordering::SeqCst);
         let mut popouts = main.popouts.lock();
-        if !live || popouts.contains_key(&slot) {
-            drop(popouts);
-            drop(guard);
-            stop_viewer_popout(popout);
-            return None;
+        if live && !popouts.contains_key(&slot) {
+            if let Some(p) = pending.take() {
+                popouts.insert(slot, p);
+                *main.input_target.lock() = NO_INPUT_TARGET;
+            }
         }
-        popouts.insert(slot, popout);
-        *main.input_target.lock() = NO_INPUT_TARGET;
+    });
+    if let Some(p) = pending {
+        // Not registered (the session ended, or the slot was taken): its
+        // threads must not outlive this call.
+        stop_viewer_popout(p);
+        return None;
     }
     // The host forced an IDR when it started this stream, probably before
     // this window existed to decode it.
@@ -1002,23 +1332,30 @@ pub(crate) fn open_viewer_popout(
 /// is taken down, so a late close of an old window can never take down a
 /// newer window that reuses the slot. `None` = the window never attached;
 /// nothing is taken down (the host is still told, with `tell_host`).
-pub(crate) fn close_viewer_popout(engine: &Engine, slot: u8, gen: Option<u64>, tell_host: bool) {
-    let (popout, ctl_tx) = {
-        let guard = engine.session.lock();
-        let Some(session) = guard.as_ref() else {
-            return;
-        };
-        let mut popouts = session.shared.popouts.lock();
-        let mine = gen.is_some() && popouts.get(&slot).map(|p| p.gen) == gen;
-        if gen.is_some() && !mine {
-            // Already gone (session teardown, or closed twice): the host was
-            // told then, if it needed telling.
-            return;
-        }
-        let popout = if mine { popouts.remove(&slot) } else { None };
-        drop(popouts);
-        *session.shared.input_target.lock() = NO_INPUT_TARGET;
-        (popout, session.ctl_tx.clone())
+pub(crate) fn close_viewer_popout(
+    engine: &Engine,
+    id: SessionId,
+    slot: u8,
+    gen: Option<u64>,
+    tell_host: bool,
+) {
+    let found = engine
+        .with_viewer(id, |session| {
+            let mut popouts = session.shared.popouts.lock();
+            let mine = gen.is_some() && popouts.get(&slot).map(|p| p.gen) == gen;
+            if gen.is_some() && !mine {
+                // Already gone (session teardown, or closed twice): the host
+                // was told then, if it needed telling.
+                return None;
+            }
+            let popout = if mine { popouts.remove(&slot) } else { None };
+            drop(popouts);
+            *session.shared.input_target.lock() = NO_INPUT_TARGET;
+            Some((popout, session.ctl_tx.clone()))
+        })
+        .flatten();
+    let Some((popout, ctl_tx)) = found else {
+        return;
     };
     if let Some(p) = popout {
         stop_viewer_popout(p);
@@ -1039,42 +1376,6 @@ fn stop_viewer_popout(p: ViewerPopout) {
         let _ = t.join();
     }
     p.surface.hide();
-}
-
-/// End the session: stop capturing input, stop and join every thread, hide the
-/// video. Idempotent.
-pub(crate) fn teardown(engine: &Engine) {
-    let surface = engine.surface();
-    if let Some(s) = &surface {
-        // Releases held keys first (surface contract), then stops capturing.
-        s.set_input_sink(None);
-        s.set_drop_sink(None);
-        // Restore the OS cursor (task D10): the session is over, so nothing
-        // should keep it hidden. `hide()` below unhides too, but doing it here
-        // means a view-only teardown and a control teardown look the same.
-        s.set_cursor_control(false);
-    }
-    // Take the session out BEFORE joining, so the lock is not held while threads
-    // that may need it (signal routing) wind down.
-    let session = engine.session.lock().take();
-    if let Some(session) = session {
-        session.stop.store(true, Ordering::SeqCst);
-        for t in session.threads {
-            let _ = t.join();
-        }
-        // Host pop-out streams, and viewer pop-out windows (D14).
-        let extra: Vec<_> = session.shared.stream_threads.lock().drain(..).collect();
-        for t in extra {
-            let _ = t.join();
-        }
-        let popouts = std::mem::take(&mut *session.shared.popouts.lock());
-        for (_, p) in popouts {
-            stop_viewer_popout(p);
-        }
-    }
-    if let Some(s) = &surface {
-        s.hide();
-    }
 }
 
 /// Host-side rate observation + bandwidth injection for the loopback test. Never
@@ -1098,11 +1399,29 @@ impl Session {
             ((v >> 32) as u32, v as u32)
         })
     }
+    /// Whether the viewer paused the main stream (P6), or `None` on a viewer
+    /// session.
+    pub(crate) fn video_paused(&self) -> Option<bool> {
+        self.hooks
+            .as_ref()
+            .map(|h| h.shared.video_paused.load(Ordering::SeqCst))
+    }
+    /// Encoded units the main stream has sent, or `None` on a viewer session.
+    pub(crate) fn main_units(&self) -> Option<u64> {
+        self.hooks
+            .as_ref()
+            .map(|h| h.shared.main_units.load(Ordering::SeqCst))
+    }
     /// Force the bandwidth estimate to `bps` (0 = release to the real estimate).
     pub(crate) fn inject_bwe(&self, bps: u32) {
         if let Some(h) = &self.hooks {
             h.shared.bwe_inject.store(bps, Ordering::SeqCst);
         }
+    }
+
+    /// Make the transport declare the link dead on its next pass.
+    pub(crate) fn sever(&self) {
+        self.shared.sever.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1115,6 +1434,46 @@ mod tests {
             slot: 0,
             current: Arc::default(),
         }
+    }
+
+    /// What a tab's host is told as it goes to the background and back (P6):
+    /// pause / resume to a host that offers it, nothing to an older one;
+    /// never a repeat of the same state.
+    #[test]
+    fn background_tabs_pause_their_host() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let sent_for = |vpause: bool, steps: &[bool]| -> Vec<String> {
+            let surface = platform_api::mock::MockSurface::new((64, 64));
+            let view = active::SessionView::new(
+                surface,
+                Arc::default(),
+                Arc::default(),
+                active::applier(rt.handle()),
+                false,
+            );
+            let (activity, _wake) = Activity::new(true, false);
+            let (ctl_tx, ctl_rx) = std::sync::mpsc::channel();
+            let gate = TabGate::new(view, Arc::new(activity), ctl_tx, vpause);
+            for &on in steps {
+                gate.set_active(on);
+            }
+            ctl_rx
+                .try_iter()
+                .map(|b| String::from_utf8(b).unwrap())
+                .collect()
+        };
+        // Born active: the host streams already, nothing to say.
+        assert!(sent_for(true, &[true, true]).is_empty());
+        assert_eq!(
+            sent_for(true, &[false, false, true, false]),
+            [
+                r#"{"t":"vpause"}"#,
+                r#"{"t":"vresume"}"#,
+                r#"{"t":"vpause"}"#
+            ]
+        );
+        // An older host is told nothing: it keeps streaming, the tab decoding.
+        assert!(sent_for(false, &[false, true, false]).is_empty());
     }
 
     /// D14: a pop-out window's pointer input is preceded by ONE switch of the

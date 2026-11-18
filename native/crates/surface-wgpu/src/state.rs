@@ -3,7 +3,7 @@
 //! [`platform_api::VideoSurface`] methods. Everything here is lock-free or
 //! behind a short mutex, so the UI thread never waits on the render thread.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
@@ -47,6 +47,15 @@ pub struct SurfaceState {
     /// `VideoSurface::set_cursor_control`; the backend combines it with
     /// `pointer_inside` and `key_focus` to decide whether to hide.
     cursor_control: AtomicBool,
+    /// The parent's top strip kept for the web UI (the tab bar, plans/08
+    /// P3), in CSS (GTK logical, AppKit point) px. A real layout inset: the
+    /// backend sizes the surface to the area below it, so [`size`](Self::size)
+    /// already excludes it. Set through `VideoSurface::set_top_inset`.
+    top_inset: AtomicU32,
+    /// Whether the backend shows the surface, for presenters that cannot ask
+    /// the windowing system off its thread (macOS): a hidden surface is not
+    /// presented to (plans/08 B5).
+    shown: AtomicBool,
     input: Mutex<InputState>,
     drops: Mutex<Option<Sender<FileDrop>>>,
 }
@@ -95,6 +104,23 @@ impl SurfaceState {
         } else {
             1.0
         }
+    }
+
+    /// Keep the top `css_px` for the web UI; the backend re-lays out.
+    pub fn set_top_inset(&self, css_px: u32) {
+        self.top_inset.store(css_px, Ordering::Release);
+    }
+
+    pub fn top_inset(&self) -> u32 {
+        self.top_inset.load(Ordering::Acquire)
+    }
+
+    pub fn set_shown(&self, shown: bool) {
+        self.shown.store(shown, Ordering::Release);
+    }
+
+    pub fn is_shown(&self) -> bool {
+        self.shown.load(Ordering::Acquire)
     }
 
     pub fn set_video_size(&self, w: u32, h: u32) {
