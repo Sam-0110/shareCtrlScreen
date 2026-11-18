@@ -220,6 +220,15 @@ impl TabGate {
         }
     }
 
+    /// A web dialog opened over the video, or the last one closed: the video
+    /// is hidden meanwhile (the flag is engine-wide; this re-decides), and so
+    /// is shortcut capture — a dialog's typing and Ctrl+Tab are this
+    /// computer's, not the hidden session's.
+    pub(crate) fn set_overlay(&self, open: bool) {
+        self.activity.overlay(open);
+        self.view.refresh();
+    }
+
     /// Only atomics and non-blocking queue sends: safe under `reg`.
     pub(crate) fn set_active(&self, active: bool) {
         self.activity.set(active);
@@ -277,6 +286,18 @@ impl Activity {
             clip_wake,
         };
         (activity, wake_rx)
+    }
+
+    /// A web dialog opened (`true`) or the last one closed: the shortcut
+    /// hook goes while it is open, and comes back for the active session.
+    fn overlay(&self, open: bool) {
+        if open {
+            self.hook_quit.store(true, Ordering::SeqCst);
+        } else if self.active.load(Ordering::SeqCst) {
+            // A fresh activation for the hook thread, which waits for one.
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.hook_quit.store(false, Ordering::SeqCst);
+        }
     }
 
     fn set(&self, active: bool) {
@@ -810,12 +831,14 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
             activity.clone(),
             engine.hook_owner(),
         );
+        let overlay = engine.overlay_flag();
         spawn_or_abort!(engine, id, stop, threads, "shortcuts", move || {
             shortcut_loop(
                 id,
                 platform.as_ref(),
                 surface.as_ref(),
                 &activity,
+                &overlay,
                 &owner,
                 &stop_k,
                 || hook_forwarder(hook_input.clone(), keys.clone(), ctl.clone()),
@@ -875,21 +898,25 @@ fn shortcut_loop(
     platform: &dyn platform_api::Platform,
     surface: &dyn platform_api::VideoSurface,
     activity: &Activity,
+    overlay: &AtomicBool,
     owner: &Mutex<Option<SessionId>>,
     stop: &AtomicBool,
     forwarder: impl Fn() -> KeyForwarder,
 ) {
     const TICK: Duration = Duration::from_millis(50);
     while !stop.load(Ordering::SeqCst) {
-        let claimed = activity.active.load(Ordering::SeqCst) && {
-            let mut o = owner.lock();
-            if o.is_none() {
-                *o = Some(id);
-                true
-            } else {
-                *o == Some(id)
-            }
-        };
+        // Not while a web dialog is open over the video (its keys are this
+        // computer's).
+        let claimed =
+            activity.active.load(Ordering::SeqCst) && !overlay.load(Ordering::SeqCst) && {
+                let mut o = owner.lock();
+                if o.is_none() {
+                    *o = Some(id);
+                    true
+                } else {
+                    *o == Some(id)
+                }
+            };
         if !claimed {
             std::thread::sleep(TICK);
             continue;

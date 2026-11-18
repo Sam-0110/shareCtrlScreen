@@ -86,8 +86,10 @@ function renderStrip() {
     el.className = 'tab' + (t.remoteId === S.tabs.active ? ' active' : '');
     el.setAttribute('role', 'tab');
     el.setAttribute('aria-selected', String(t.remoteId === S.tabs.active));
-    el.title = peerLabel(t.remoteId);
-    el.draggable = renaming !== t.remoteId;
+    el.title = t.closedElsewhere
+      ? `${peerLabel(t.remoteId)} — closed on another computer; it goes when disconnected`
+      : peerLabel(t.remoteId);
+    el.draggable = renaming !== t.remoteId && !t.closedElsewhere;
     el.dataset.remote = t.remoteId;
 
     const dot = document.createElement('span');
@@ -149,9 +151,8 @@ function renderStrip() {
     });
     el.appendChild(close);
 
-    el.addEventListener('click', () => {
-      if (t.remoteId !== S.tabs.active) api.tabActivate(t.remoteId);
-    });
+    // Clicking the tab on screen again gives its video the keyboard back.
+    el.addEventListener('click', () => api.tabActivate(t.remoteId));
     // Middle click closes, as in browsers.
     el.addEventListener('auxclick', (e) => {
       if (e.button === 1) api.tabClose(t.remoteId);

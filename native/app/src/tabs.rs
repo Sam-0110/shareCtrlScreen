@@ -113,6 +113,9 @@ struct Inner {
     /// copy because a sync may close the tab on screen elsewhere while it is
     /// connected here: it stays on screen until it disconnects (08a §6.12).
     shown: Option<Option<String>>,
+    /// The workspace `shown` was chosen in: another account's choice does
+    /// not carry over (each workspace has its own `active_tab`).
+    shown_epoch: u64,
     /// The Monitor menu as last applied (`Some(None)`: emptied); `None`:
     /// unknown, so the next pass applies it.
     menu_applied: Option<Option<MonitorMenu>>,
@@ -356,8 +359,22 @@ impl TabManager {
             }
         }
         self.engine.set_active_tab(remote.clone());
-        self.lock().shown = Some(remote);
+        let focus = {
+            let mut inner = self.lock();
+            inner.shown = Some(remote.clone());
+            // Choosing a live tab (again) gives its video the keyboard, as a
+            // click in it does: that is how the keys leave the web page.
+            remote
+                .as_ref()
+                .and_then(|r| inner.live.get(r))
+                .filter(|t| t.phase == Phase::Live)
+                .and_then(|t| t.session)
+                .and_then(|id| inner.surfaces.get(&id).cloned())
+        };
         self.apply_active();
+        if let Some(surface) = focus {
+            surface.focus();
+        }
         Ok(())
     }
 
@@ -473,17 +490,32 @@ impl TabManager {
 
     /// A viewer session's event (08a §5.1). `peer` is the remote: its tab.
     pub(crate) fn on_session(&self, id: SessionId, peer: &str, ev: SessionEvent) {
-        // A tab closed on another computer while connected here stays until
-        // it disconnects; read before the lock (lock order: engine first).
-        let still_open = self.is_open(peer);
         let mut out: Vec<(&'static str, Value)> = Vec::new();
         let mut forget = false;
+        let mut new_active: Option<Option<String>> = None;
         let mut released = None;
         {
             let mut inner = self.lock();
             if let SessionEvent::Released = ev {
                 released = inner.surfaces.remove(&id);
             }
+            // A tab closed on another computer while connected here stays
+            // until it disconnects (08a §6.12 step 5). Read under `inner`, so a
+            // sync landing meanwhile cannot leave a stale entry (lock order:
+            // the TabManager's, then the engine's).
+            let ws = self.engine.workspace();
+            let still_open = ws
+                .as_ref()
+                .is_some_and(|w| w.tabs.get(peer).is_some_and(|t| t.is_open()));
+            // If it is on screen and goes, its neighbour takes its place, as
+            // for a close here.
+            let was_shown = ws
+                .as_ref()
+                .is_some_and(|w| shown_tab(w, &inner).as_deref() == Some(peer));
+            let neighbour = ws
+                .as_ref()
+                .filter(|_| was_shown)
+                .and_then(|w| neighbour_of(&visible(w, &inner), peer));
             let Some(tab) = inner.live.get_mut(peer).filter(|t| t.session == Some(id)) else {
                 // An earlier session of this tab (or a closed tab): only its
                 // surface (above) still matters.
@@ -539,7 +571,14 @@ impl TabManager {
             }
             if forget {
                 inner.live.remove(peer);
+                if was_shown {
+                    inner.shown = Some(neighbour.clone());
+                    new_active = Some(neighbour);
+                }
             }
+        }
+        if let Some(active) = new_active {
+            self.engine.set_active_tab(active);
         }
         if let Some(s) = released {
             self.surfaces.destroy(s);
@@ -558,11 +597,16 @@ impl TabManager {
             .workspace()
             .map(|w| w.open_tabs().into_iter().collect())
             .unwrap_or_default();
+        let epoch = self.engine.workspace_epoch();
         {
             let mut inner = self.lock();
             inner
                 .live
                 .retain(|remote, t| open.contains(remote) || t.session.is_some());
+            if inner.shown_epoch != epoch {
+                inner.shown_epoch = epoch;
+                inner.shown = None;
+            }
         }
         self.apply_active();
     }
@@ -586,6 +630,15 @@ impl TabManager {
         let menu = {
             let mut inner = self.lock();
             let ws = self.engine.workspace();
+            // A choice that left the strip is forgotten, so it cannot come back
+            // by itself if that tab is reopened later.
+            let stale = matches!(
+                (&ws, &inner.shown),
+                (Some(w), Some(Some(choice))) if !visible(w, &inner).contains(choice)
+            );
+            if stale {
+                inner.shown = None;
+            }
             let (session, menu) = ws
                 .as_ref()
                 .and_then(|ws| shown_tab(ws, &inner))
@@ -656,6 +709,9 @@ impl TabManager {
                     "lastEnd": live.and_then(|t| t.last_end.clone()),
                     "autoSignIn": ws.saved_logins.contains_key(&remote),
                     "displays": live.and_then(|t| t.displays.clone()),
+                    // Closed on another computer, still connected here: it goes
+                    // when it disconnects, and cannot be moved meanwhile.
+                    "closedElsewhere": !ws.tabs.get(&remote).is_some_and(|t| t.is_open()),
                 })
             })
             .collect();
@@ -711,5 +767,81 @@ fn shown_tab(ws: &protocol::Workspace, inner: &Inner) -> Option<String> {
     match &inner.shown {
         Some(choice) if choice.as_ref().is_none_or(|r| strip.contains(r)) => choice.clone(),
         _ => ws.active_tab.clone().filter(|r| strip.contains(r)),
+    }
+}
+
+/// The tab next to `remote` in `strip` — the right-hand one, else the
+/// left-hand one — as a close picks it (`Workspace::close_tab`).
+fn neighbour_of(strip: &[String], remote: &str) -> Option<String> {
+    let at = strip.iter().position(|r| r == remote)?;
+    strip
+        .get(at + 1)
+        .or_else(|| at.checked_sub(1).and_then(|i| strip.get(i)))
+        .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: &str = "11111111-1111-4111-8111-111111111111";
+    const B: &str = "22222222-2222-4222-8222-222222222222";
+    const C: &str = "33333333-3333-4333-8333-333333333333";
+
+    fn workspace() -> protocol::Workspace {
+        let mut w = protocol::Workspace::default();
+        for (i, t) in [A, B, C].iter().enumerate() {
+            w.open_tab(t, 10 + i as u64);
+        }
+        w
+    }
+
+    fn live(inner: &mut Inner, remote: &str) {
+        let tab = inner.live.entry(remote.to_string()).or_default();
+        tab.session = Some(SessionId(7));
+        tab.phase = Phase::Live;
+    }
+
+    /// 08a §6.12 step 5: a tab closed elsewhere stays while connected here.
+    #[test]
+    fn a_tab_closed_elsewhere_stays_while_connected() {
+        let mut w = workspace();
+        let mut inner = Inner::default();
+        w.close_tab(B, 20);
+        assert_eq!(visible(&w, &inner), [A, C], "disconnected: gone at once");
+        live(&mut inner, B);
+        assert_eq!(
+            visible(&w, &inner),
+            [A, B, C],
+            "connected: kept, in its place"
+        );
+    }
+
+    #[test]
+    fn the_tab_on_screen_is_the_users_choice_while_it_is_in_the_strip() {
+        let mut w = workspace();
+        let mut inner = Inner::default();
+        w.active_tab = Some(A.into());
+        assert_eq!(shown_tab(&w, &inner).as_deref(), Some(A), "no choice yet");
+        inner.shown = Some(Some(B.into()));
+        assert_eq!(shown_tab(&w, &inner).as_deref(), Some(B));
+        inner.shown = Some(None);
+        assert_eq!(shown_tab(&w, &inner), None, "the connect page");
+        // The chosen tab was closed elsewhere and is not connected: the
+        // workspace's active tab (if still in the strip) is shown instead.
+        inner.shown = Some(Some(B.into()));
+        w.close_tab(B, 20);
+        assert_eq!(shown_tab(&w, &inner).as_deref(), Some(A));
+        w.active_tab = Some(B.into());
+        assert_eq!(shown_tab(&w, &inner), None);
+    }
+
+    #[test]
+    fn a_neighbour_is_picked_as_a_close_picks_it() {
+        let strip: Vec<String> = [A, B, C].iter().map(|s| s.to_string()).collect();
+        assert_eq!(neighbour_of(&strip, B).as_deref(), Some(C));
+        assert_eq!(neighbour_of(&strip, C).as_deref(), Some(B));
+        assert_eq!(neighbour_of(&strip[..1], A), None);
+        assert_eq!(neighbour_of(&strip, "nope"), None);
     }
 }

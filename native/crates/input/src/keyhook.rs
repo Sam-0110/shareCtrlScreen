@@ -39,6 +39,7 @@ const VK_CONTROL: i32 = 0x11;
 const VK_SHIFT: i32 = 0x10;
 const VK_PRIOR: i32 = 0x21; // PageUp
 const VK_NEXT: i32 = 0x22; // PageDown
+const VK_RMENU: i32 = 0xa5; // right Alt (AltGr on many layouts)
 const VK_LWIN: i32 = 0x5b;
 const VK_RWIN: i32 = 0x5c;
 
@@ -162,8 +163,17 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
     // suppressed locally.
     if is_up {
         if let Some(m) = modifier_of(info.vkCode as i32) {
-            if m.synthesized
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            // Only once neither side is held: with both Ctrl keys down, letting
+            // go of one leaves the modifier held. (The key-state table is not
+            // yet updated for the event being hooked, so the other side is
+            // asked, not the generic key.)
+            let other_held = m
+                .sides
+                .iter()
+                .any(|&side| side != info.vkCode as i32 && key_down(side));
+            if !other_held
+                && m.synthesized
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
                 forward_key(m.code, false);
             }
@@ -211,7 +221,13 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
         // the WebView (not the video window), so guarantee them: synthesize
         // each held one's down once per hold, before the key.
         if is_down {
+            // AltGr is reported as a fake left Ctrl plus right Alt: it means
+            // Alt here, never Ctrl (AltGr+Tab must not become Ctrl+Alt+Tab).
+            let alt_gr = key_down(VK_RMENU);
             for m in &MODIFIERS {
+                if m.vk == VK_CONTROL && alt_gr {
+                    continue;
+                }
                 if key_down(m.vk)
                     && !m
                         .synthesized
@@ -244,7 +260,7 @@ struct Modifier {
 static MODIFIERS: [Modifier; 3] = [
     Modifier {
         vk: VK_MENU,
-        sides: [0xa4, 0xa5],
+        sides: [0xa4, VK_RMENU],
         code: "AltLeft",
         synthesized: std::sync::atomic::AtomicBool::new(false),
     },

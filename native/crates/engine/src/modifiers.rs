@@ -21,8 +21,8 @@
 //!   Win as Meta would give two keys for Cmd and none for the Mac's Control
 //!   (Control+C in Terminal, Control+arrows for Spaces). With the swap every
 //!   Mac modifier stays reachable, in the same positions a Mac keyboard has.
-//! * Both directions: Ctrl+Tab keeps meaning Ctrl+Tab (next tab in browsers
-//!   and editors on all three OSes). The swap alone would turn it into
+//! * Both directions: Ctrl+Tab and Ctrl+PageUp / PageDown keep meaning
+//!   themselves (tab switching in browsers and editors on all three OSes). The swap alone would turn it into
 //!   Win+Tab / Cmd+Tab — the very shortcuts this module exists to avoid.
 //! * Same-OS pairs, Linux ↔ Windows, an unknown host OS, or the setting off:
 //!   identity (the keys as pressed, the behaviour before D8).
@@ -147,9 +147,14 @@ fn chord(m: Mapping, modifier: &str, key: &str) -> Option<&'static str> {
         // AltGr (Ctrl+Alt), and AltGr+Tab does not switch apps.
         (Mapping::MacToPc, "MetaLeft" | "MetaRight", "Tab" | "Backquote") => Some("AltLeft"),
         (Mapping::PcToMac, "AltLeft" | "AltRight", "Tab") => Some("MetaLeft"),
-        // Ctrl+Tab switches tabs everywhere; undo the swap for it.
-        (Mapping::MacToPc | Mapping::PcToMac, "ControlLeft", "Tab") => Some("ControlLeft"),
-        (Mapping::MacToPc | Mapping::PcToMac, "ControlRight", "Tab") => Some("ControlRight"),
+        // Ctrl+Tab and Ctrl+PageUp / PageDown switch tabs everywhere (browsers
+        // and editors on all three OSes, P7); undo the swap for them.
+        (Mapping::MacToPc | Mapping::PcToMac, "ControlLeft", "Tab" | "PageUp" | "PageDown") => {
+            Some("ControlLeft")
+        }
+        (Mapping::MacToPc | Mapping::PcToMac, "ControlRight", "Tab" | "PageUp" | "PageDown") => {
+            Some("ControlRight")
+        }
         _ => None,
     }
 }
@@ -682,6 +687,25 @@ mod tests {
         assert_eq!(
             run(&mut t, &["+Tab", "+MetaLeft", "-Tab", "-MetaLeft"]),
             ["+Tab", "+ControlLeft", "-Tab", "-ControlLeft"]
+        );
+    }
+
+    #[test]
+    fn ctrl_page_keys_stay_ctrl_both_ways() {
+        let (mut t, _) = translator(OsFamily::Windows, OsFamily::Mac);
+        assert_eq!(
+            run(
+                &mut t,
+                &["+ControlLeft", "+PageDown", "-PageDown", "-ControlLeft"]
+            ),
+            [
+                "+MetaLeft",
+                "+ControlLeft",
+                "-MetaLeft",
+                "+PageDown",
+                "-PageDown",
+                "-ControlLeft"
+            ]
         );
     }
 

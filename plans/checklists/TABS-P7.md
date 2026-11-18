@@ -22,9 +22,10 @@ key handler), so these chords are forwarded there already; they are on this list
 
 1. Connect with control. Click into the video, press Ctrl+Tab and Ctrl+Shift+Tab: the host's
    browser switches tabs forward and back. Ctrl+PageDown / PageUp do the same.
-2. Click this app's tab strip (the web page now has the keyboard) — without clicking back into
-   the video — and repeat step 1 (Windows: this is the case that failed before P7). The keys
-   still reach the host.
+2. Click this app's session bar (the web page now has the keyboard) — without clicking back
+   into the video — and repeat step 1 (Windows: this is the case that failed before P7). Windows
+   and Linux: the keys still reach the host. macOS: they do not (the page keeps them, a known
+   gap); clicking the tab on screen, or the video, gives the keys back, then they do.
 3. Alt+Tab (Cmd+Tab on macOS) still switches the host's windows; Win/Super still opens the host's
    start menu; release everything — no modifier is left held on the host (type a letter: it is
    not upper-case or a shortcut).
@@ -32,6 +33,11 @@ key handler), so these chords are forwarded there already; they are on this list
    the host.
 5. Capture off: with the video holding the keyboard (click into it), Ctrl+Tab still reaches the
    host.
+6. Open Settings while connected, press Ctrl+Tab and Win / Alt+Tab: they act on this computer
+   (the dialog), not the hidden host. Close it: capture works again.
+7. Windows with an AltGr layout (German, French): AltGr+Tab does not send Ctrl+Alt+Tab to the
+   host. Hold both Ctrl keys, press Tab, release one: the host keeps Ctrl held until the other
+   is released.
 
 ## Record
 

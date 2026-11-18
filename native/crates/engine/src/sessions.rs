@@ -820,16 +820,15 @@ impl Engine {
     /// a backend's show/hide may run there.
     pub async fn set_overlay(&self, open: bool) {
         self.overlay.store(open, Ordering::SeqCst);
-        let views: Vec<_> = {
+        let gates: Vec<_> = {
             let reg = self.reg.lock();
             reg.viewers
                 .values()
-                .filter_map(|v| v.gate.as_ref())
-                .map(|g| g.view.clone())
+                .filter_map(|v| v.gate.clone())
                 .collect()
         };
-        for v in views {
-            v.refresh();
+        for g in gates {
+            g.set_overlay(open);
         }
         // Bounded: a UI thread stuck elsewhere must not hang the dialog.
         let (done, applied) = tokio::sync::oneshot::channel();
