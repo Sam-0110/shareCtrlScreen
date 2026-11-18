@@ -57,8 +57,9 @@ fn translate(
             tabs.on_workspace_changed();
             vec![("workspace-changed", json!({}))]
         }
-        UiEvent::TabShortcut(step) => {
-            tabs.step(step);
+        // Ignored when it came from a detached window (plans/09 Decision 2).
+        UiEvent::TabShortcut { step, session } => {
+            tabs.shortcut(step, session);
             Vec::new()
         }
         UiEvent::Session {
@@ -142,6 +143,8 @@ fn host_session(
                 displays_json(&list, &current, can_switch, &popouts),
             )]
         }
-        SessionEvent::Phase(_) | SessionEvent::Released => Vec::new(),
+        SessionEvent::Phase(_) | SessionEvent::Released | SessionEvent::SurfaceReleased { .. } => {
+            Vec::new()
+        }
     }
 }

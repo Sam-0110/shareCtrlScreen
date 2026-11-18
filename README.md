@@ -217,6 +217,20 @@ names and order come back after a restart, disconnected — nothing connects by
 itself. Closing the app ends every session first. While another computer is viewing
 this one, no tab can connect (and the other way round).
 
+**Tabs in windows of their own** (native app). **⧉** on a tab (or **Detach** in the
+session bar) moves that computer into a normal window you can move, resize, maximise
+and put on another screen — the connection stays, nothing reconnects. Every such
+window shows its computer live at the same time as the tab on screen in the main
+window; the window you are in takes the keyboard, the clipboard and shortcut capture
+(the clipboard stays with the last one you used while another app is in front). A
+minimised window pauses its computer, as a background tab does (on Wayland a window
+cannot tell it is minimised, so it keeps streaming). **Dock** puts it back at the end
+of the strip as the tab on screen; **×** on the window disconnects and closes that tab.
+Tab-switch chords do nothing inside such a window. Which tabs are in windows, and
+where — as a share of the screen, so it fits another computer's screen too — comes
+back at the next launch and follows your account (on Wayland only the size and state,
+not the position). Device checks pending: `plans/checklists/DETACH-W3.md`.
+
 **Accounts: your tabs, names and settings on every computer** (native app, ⚙ Settings
 → Account). Accounts are optional; connecting never needs one. Without one,
 everything is kept on this computer. An account owns a whole **workspace**: the

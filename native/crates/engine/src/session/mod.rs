@@ -12,6 +12,7 @@
 pub(crate) mod active;
 mod clipboard;
 mod ctl_queue;
+pub(crate) mod current;
 mod driver;
 mod files;
 mod ice;
@@ -176,7 +177,7 @@ pub(crate) struct Session {
     threads: Vec<JoinHandle<()>>,
     /// Viewer: its main video as the ActiveGate sees it (`None` on a host).
     view: Option<Arc<active::SessionView>>,
-    /// Viewer: whether it is the active session, and what follows that (the
+    /// Viewer: whether it is the focused session, and what follows that (the
     /// clipboard, the shortcut hook). `None` on a host.
     activity: Option<Arc<Activity>>,
     /// Test hooks (`test-hooks` feature only): the host's rate state, so the
@@ -200,7 +201,7 @@ pub(crate) struct TabGate {
     /// The host advertised `vpause`.
     host_vpause: bool,
     /// Whether the host is (to be) streaming the main video to this tab: it
-    /// starts streaming, so a session born active sends nothing.
+    /// starts streaming, so a session born on screen sends nothing.
     streaming: AtomicBool,
 }
 
@@ -220,20 +221,35 @@ impl TabGate {
         }
     }
 
-    /// A web dialog opened over the video, or the last one closed: the video
-    /// is hidden meanwhile (the flag is engine-wide; this re-decides), and so
-    /// is shortcut capture — a dialog's typing and Ctrl+Tab are this
-    /// computer's, not the hidden session's.
-    pub(crate) fn set_overlay(&self, open: bool) {
-        self.activity.overlay(open);
+    /// A web dialog opened over this session's window, or the last one
+    /// closed: its video is hidden meanwhile (the overlay set changed
+    /// already; this re-decides), and so is shortcut capture — a dialog's
+    /// typing and Ctrl+Tab are this computer's, not the hidden session's.
+    pub(crate) fn overlay_changed(&self) {
         self.view.refresh();
+        self.activity.overlay_changed(&self.view);
     }
 
-    /// Only atomics and non-blocking queue sends: safe under `reg`.
-    pub(crate) fn set_active(&self, active: bool) {
-        self.activity.set(active);
-        self.view.set_active(active);
-        // Background tabs pause (08a §6.14). Ordered on the reliable control
+    /// The session's window — the view reads it.
+    pub(crate) fn window(&self) -> crate::WindowId {
+        self.view.window()
+    }
+
+    /// Became (or stopped being) the focused session: the keyboard, the
+    /// clipboard and the shortcut hook follow it (plans/09 W1). Only atomics
+    /// and non-blocking queue sends: safe under `reg`.
+    pub(crate) fn set_focused(&self, focused: bool) {
+        self.activity.set(focused, &self.view);
+        self.view.set_focused(focused);
+    }
+
+    /// Came on screen (shown when ready, streaming) or went off it (hidden,
+    /// its host paused). Only atomics and non-blocking queue sends: safe
+    /// under `reg`.
+    pub(crate) fn set_on_screen(&self, active: bool) {
+        self.view.set_on_screen(active);
+        self.activity.set_on_screen(active, &self.view);
+        // Off-screen sessions pause (08a §6.14). Ordered on the reliable control
         // channel, so a quick back-and-forth ends in the right state; queued
         // until the channel opens when the session is still starting.
         if self.streaming.swap(active, Ordering::SeqCst) == active {
@@ -253,24 +269,47 @@ impl TabGate {
     }
 }
 
-/// Viewer: what follows the session being the active one (plans/08 P3). Only
-/// the active session exchanges the clipboard (B3: otherwise text copied from
-/// one host would be forwarded to another) and holds the shortcut hook (B2).
+/// Viewer: what follows the session being the **focused** one (plans/08 P3,
+/// plans/09 W1). Only the focused session exchanges the clipboard (B3:
+/// otherwise text copied from one host would be forwarded to another), and
+/// focus is sticky for it: it stays while another app is in front
+/// (plans/09 §7, blocker 5). The shortcut hook (B2) asks more: focused **and**
+/// on screen **and** not under a web dialog in its window, so a session kept
+/// focused for the clipboard while the strip shows another tab never takes
+/// that window's Win / Alt+Tab.
 pub(crate) struct Activity {
-    active: AtomicBool,
-    /// The clipboard loop's gate: the user's setting AND active.
+    /// The clipboard loop's gate: the user's setting AND focused.
     clip_on: Arc<AtomicBool>,
     clipboard_setting: bool,
-    /// Tells the shortcut thread to uninstall its hook: set while inactive and
-    /// once the session stops.
+    /// Tells the shortcut thread to uninstall its hook: set whenever the hook
+    /// is not wanted (see [`HookInputs`]) and once the session stops.
     hook_quit: AtomicBool,
-    /// Bumped on every activation, so the shortcut thread can tell "still the
-    /// same activation" from "deactivated and activated again since".
+    /// Bumped each time the hook becomes wanted, so the shortcut thread can
+    /// tell "still the same claim" from "dropped and wanted again since".
     generation: AtomicU64,
     /// Wakes the clipboard loop when its gate changes, so it re-baselines at
     /// once rather than up to a poll later — a copy made right after switching
     /// to this tab then counts as new (and is sent), not as the baseline.
     clip_wake: std::sync::mpsc::Sender<()>,
+    /// What the hook follows. Every change re-decides `hook_quit` from all of
+    /// it under this lock (a leaf lock; the overlay set it reads is one too),
+    /// so racing changes — a dialog closing while another opens, focus moving
+    /// as the tab leaves the screen — always end on the answer for the final
+    /// inputs, never on whichever store came last.
+    hook: Mutex<HookInputs>,
+}
+
+/// The inputs of the shortcut hook's decision.
+#[derive(Default)]
+struct HookInputs {
+    focused: bool,
+    on_screen: bool,
+    stopped: bool,
+    /// A move asked for the hook to come down and go up again on the new
+    /// window; cleared by the shortcut thread once its hook is down.
+    rebind: bool,
+    /// The last decision.
+    wanted: bool,
 }
 
 impl Activity {
@@ -278,40 +317,83 @@ impl Activity {
     fn new(clipboard_setting: bool, active: bool) -> (Self, std::sync::mpsc::Receiver<()>) {
         let (clip_wake, wake_rx) = std::sync::mpsc::channel();
         let activity = Activity {
-            active: AtomicBool::new(active),
             clip_on: Arc::new(AtomicBool::new(clipboard_setting && active)),
             clipboard_setting,
-            hook_quit: AtomicBool::new(!active),
+            hook_quit: AtomicBool::new(true),
             generation: AtomicU64::new(0),
             clip_wake,
+            hook: Mutex::new(HookInputs {
+                focused: active,
+                ..HookInputs::default()
+            }),
         };
         (activity, wake_rx)
     }
 
-    /// A web dialog opened (`true`) or the last one closed: the shortcut
-    /// hook goes while it is open, and comes back for the active session.
-    fn overlay(&self, open: bool) {
-        if open {
-            self.hook_quit.store(true, Ordering::SeqCst);
-        } else if self.active.load(Ordering::SeqCst) {
-            // A fresh activation for the hook thread, which waits for one.
+    /// A web dialog opened or the last one closed over the session's window
+    /// (the overlay set changed already): the hook goes while one is open.
+    fn overlay_changed(&self, view: &active::SessionView) {
+        self.decide(view, |_| {});
+    }
+
+    fn set(&self, active: bool, view: &active::SessionView) {
+        // The clipboard loop re-baselines when its gate opens, so text copied
+        // while another tab was focused is never forwarded here (08a §6.4 step 4).
+        self.clip_on
+            .store(active && self.clipboard_setting, Ordering::SeqCst);
+        self.decide(view, |h| h.focused = active);
+        // Never blocks; fails only once the loop is gone (session over).
+        let _ = self.clip_wake.send(());
+    }
+
+    fn set_on_screen(&self, on: bool, view: &active::SessionView) {
+        self.decide(view, |h| h.on_screen = on);
+    }
+
+    /// The session is stopping: the hook goes for good.
+    fn stop(&self) {
+        let mut h = self.hook.lock();
+        h.stopped = true;
+        h.wanted = false;
+        self.hook_quit.store(true, Ordering::SeqCst);
+    }
+
+    /// Apply `change`, then re-decide the hook from every input, reading the
+    /// overlay set now (under the lock), not a value passed in that a racing
+    /// change may have overtaken.
+    fn decide(&self, view: &active::SessionView, change: impl FnOnce(&mut HookInputs)) {
+        let mut h = self.hook.lock();
+        change(&mut h);
+        let wanted = !h.stopped && h.focused && h.on_screen && !view.covered();
+        if wanted && !h.wanted {
+            // A fresh claim for the hook thread, which waits for one.
             self.generation.fetch_add(1, Ordering::SeqCst);
-            self.hook_quit.store(false, Ordering::SeqCst);
+        }
+        h.wanted = wanted;
+        // A pending re-install holds the hook down until the shortcut thread
+        // has seen it (a quick re-decision must not hide it from that thread).
+        self.hook_quit.store(!wanted || h.rebind, Ordering::SeqCst);
+    }
+
+    /// The session moved to another surface (plans/09 W2): a hook installed
+    /// on the old one's window comes down and the shortcut thread installs it
+    /// again on the new one ([`take_rebind`](Self::take_rebind)).
+    pub(crate) fn rebind(&self, view: &active::SessionView) {
+        self.decide(view, |h| h.rebind = true);
+    }
+
+    /// The shortcut thread, before it claims: a move asked for a re-install,
+    /// and the hook it ran (if any) is down — decide again without it.
+    fn take_rebind(&self, view: &active::SessionView) {
+        let pending = self.hook.lock().rebind;
+        if pending {
+            self.decide(view, |h| h.rebind = false);
         }
     }
 
-    fn set(&self, active: bool) {
-        self.active.store(active, Ordering::SeqCst);
-        // The clipboard loop re-baselines when its gate opens, so text copied
-        // while another tab was active is never forwarded here (08a §6.4 step 4).
-        self.clip_on
-            .store(active && self.clipboard_setting, Ordering::SeqCst);
-        if active {
-            self.generation.fetch_add(1, Ordering::SeqCst);
-        }
-        self.hook_quit.store(!active, Ordering::SeqCst);
-        // Never blocks; fails only once the loop is gone (session over).
-        let _ = self.clip_wake.send(());
+    /// Whether the shortcut hook is wanted right now.
+    fn hook_wanted(&self) -> bool {
+        !self.hook_quit.load(Ordering::SeqCst)
     }
 }
 
@@ -606,7 +688,8 @@ pub(crate) fn begin_host(
 /// What a viewer session needs from its registry slot to start.
 pub(crate) struct ViewerStart {
     pub(crate) peer: String,
-    pub(crate) surface: Option<Arc<dyn platform_api::VideoSurface>>,
+    /// Its current surface (plans/09 W2).
+    pub(crate) surface: Option<Arc<current::SurfaceCell>>,
     pub(crate) codec: platform_api::Codec,
     pub(crate) host_os: OsFamily,
     /// The host pauses a background tab's video on request (P6).
@@ -634,11 +717,14 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
     // session while it is being built.
     #[cfg(feature = "test-hooks")]
     std::thread::sleep(engine.test_viewer_start_delay());
-    let Some(surface) = surface else {
+    let Some(cell) = surface else {
         tracing::error!("viewer: no video surface on this platform");
         engine.fail_session(id, "this computer cannot display the remote screen yet");
         return;
     };
+    // Moves wait while the session is starting (`Busy`), so this is the
+    // surface it starts on; a move later goes through the cell.
+    let surface = cell.current();
     let ui = engine.session_ui(id, &peer, false);
     let platform = engine.platform();
     let prefs = engine.prefs();
@@ -688,17 +774,17 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
 
     // Clipboard sync. The host applies its own permission gate; here the user's
     // setting governs.
-    // Its view (shown only while active, ready, untroubled and uncovered)
+    // Its view (shown only while on screen, ready, untroubled and uncovered)
     // and what follows being the active session (clipboard, shortcut hook).
     // Inactive until the registry says otherwise: `attach_gate` applies the
     // current answer under the same lock every switch takes.
     let view = active::SessionView::new(
         surface.clone(),
         shared.clone(),
-        engine.overlay_flag(),
+        engine.overlays(),
         engine.view_ops(),
-        false,
     );
+    view.set_window(cell.window());
     let (activity, clip_wake) = Activity::new(prefs.clipboard_sync, false);
     let activity = Arc::new(activity);
     engine.attach_gate(
@@ -710,6 +796,11 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
             host_vpause,
         )),
     );
+    // A move from now on takes the view and the activity along.
+    cell.set_gate(current::Gate {
+        view: view.clone(),
+        activity: activity.clone(),
+    });
     let clip_on = activity.clip_on.clone();
     let (clip_tx, clip_rx) = std::sync::mpsc::channel::<String>();
     {
@@ -735,7 +826,7 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
             KeyTranslator::new(viewer_os, host_os, engine.translate_modifiers_handle())
                 .with_tab_shortcuts(
                     Box::new(move |step| {
-                        let _ = ui.send(crate::UiEvent::TabShortcut(step));
+                        let _ = ui.send(crate::UiEvent::TabShortcut { step, session: id });
                     }),
                     engine.tab_chord_keys(),
                 ),
@@ -782,7 +873,7 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
         turn: turn_alloc,
         stop: stop.clone(),
         platform: platform.clone(),
-        surface: Some(surface.clone()),
+        surface: Some(cell.clone()),
         view: Some(view.clone()),
         shared: shared.clone(),
         downloads_dir: platform.paths().downloads_dir,
@@ -802,14 +893,28 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
             shared: shared.clone(),
             slot: 0,
             view: Some(view.clone()),
+            moves: Some(crate::media::viewer::Moves {
+                cell: cell.clone(),
+                ui: ui.clone(),
+            }),
         };
-        let (ctl, stop_r, ui) = (ctl_tx.clone(), stop.clone(), ui.clone());
+        let (ctl, stop_r, ui, cell) = (ctl_tx.clone(), stop.clone(), ui.clone(), cell.clone());
+        // Before it runs: from here a move is the media thread's to carry
+        // out, even if it fails at once (then `media_gone` hands it back).
+        cell.media_started();
         spawn_or_abort!(engine, id, stop, threads, "viewer-media", move || {
             if let Err(e) = viewer_media_loop(media, video_rx, ctl, stop_r) {
                 tracing::warn!("viewer media loop ended: {e}");
                 ui.send(SessionEvent::Toast(format!(
                     "Cannot display the remote screen: {e}"
                 )));
+            }
+            // Moves from now on are carried out by their caller; one this
+            // thread had not reached is carried out here.
+            if let Some(old) = cell.media_gone() {
+                ui.send(SessionEvent::SurfaceReleased {
+                    surface: crate::SurfaceTag::of(&old),
+                });
             }
         });
     }
@@ -823,7 +928,7 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
     if prefs.capture_shortcuts {
         let (platform, surface, ctl, keys, stop_k, hook_input, activity, owner) = (
             platform.clone(),
-            surface.clone(),
+            cell.clone(),
             ctl_tx.clone(),
             keys.clone(),
             stop.clone(),
@@ -831,14 +936,14 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
             activity.clone(),
             engine.hook_owner(),
         );
-        let overlay = engine.overlay_flag();
+        let hook_view = view.clone();
         spawn_or_abort!(engine, id, stop, threads, "shortcuts", move || {
             shortcut_loop(
                 id,
                 platform.as_ref(),
-                surface.as_ref(),
+                &surface,
                 &activity,
-                &overlay,
+                &hook_view,
                 &owner,
                 &stop_k,
                 || hook_forwarder(hook_input.clone(), keys.clone(), ctl.clone()),
@@ -846,11 +951,14 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
         });
     }
 
-    surface.set_drop_sink(Some(drop_tx));
-    surface.set_input_sink(Some(input_tx));
-    // Hide the OS cursor over the video while controlling (task D10); a
-    // view-only session leaves it shown. Mirrors `shared.control`.
-    surface.set_cursor_control(has_control);
+    // The sinks, and the OS cursor hidden over the video while controlling
+    // (task D10; a view-only session leaves it shown, mirroring
+    // `shared.control`), on the current surface — and moved with it.
+    cell.bind(current::Bound {
+        input: input_tx,
+        drops: drop_tx,
+        shared: shared.clone(),
+    });
     let session = Session {
         peer: peer.clone(),
         stop,
@@ -888,35 +996,36 @@ fn send_input(ctl: &Sender<Vec<u8>>, msg: &InputMsg) {
     let _ = ctl.send(serde_json::to_vec(msg).unwrap_or_default());
 }
 
-/// Session `id`'s shortcut capture: whenever the session is active and no
-/// other session holds the hook, install it, run it until the session stops
-/// being active (or stops), uninstall it and hand the owner slot back.
+/// Session `id`'s shortcut capture: whenever its hook is wanted (Activity)
+/// and no other session holds the hook, install it, run it until it is no
+/// longer wanted (or the session stops), uninstall it and hand the owner slot back.
 /// Polls at 50 ms: activation is a user action, and a hook a tick late is
 /// invisible.
 fn shortcut_loop(
     id: SessionId,
     platform: &dyn platform_api::Platform,
-    surface: &dyn platform_api::VideoSurface,
+    surface: &current::SurfaceCell,
     activity: &Activity,
-    overlay: &AtomicBool,
+    view: &active::SessionView,
     owner: &Mutex<Option<SessionId>>,
     stop: &AtomicBool,
     forwarder: impl Fn() -> KeyForwarder,
 ) {
     const TICK: Duration = Duration::from_millis(50);
     while !stop.load(Ordering::SeqCst) {
-        // Not while a web dialog is open over the video (its keys are this
-        // computer's).
-        let claimed =
-            activity.active.load(Ordering::SeqCst) && !overlay.load(Ordering::SeqCst) && {
-                let mut o = owner.lock();
-                if o.is_none() {
-                    *o = Some(id);
-                    true
-                } else {
-                    *o == Some(id)
-                }
-            };
+        // A move brought the hook down: up again, on the new window.
+        activity.take_rebind(view);
+        // Only while focused, on screen and not under a web dialog (its keys
+        // are this computer's): see Activity.
+        let claimed = activity.hook_wanted() && {
+            let mut o = owner.lock();
+            if o.is_none() {
+                *o = Some(id);
+                true
+            } else {
+                *o == Some(id)
+            }
+        };
         if !claimed {
             std::thread::sleep(TICK);
             continue;
@@ -926,7 +1035,8 @@ fn shortcut_loop(
         let generation = activity.generation.load(Ordering::SeqCst);
         match platform.create_shortcut_hook() {
             Some(mut hook) => {
-                if hook.install(surface, forwarder()) {
+                // The surface now: a move since the last install changed it.
+                if hook.install(surface.current().as_ref(), forwarder()) {
                     hook.run(&activity.hook_quit);
                 } else {
                     tracing::info!("shortcut capture could not be installed");
@@ -945,7 +1055,7 @@ fn shortcut_loop(
         // the top. Ended while this activation lasts (it would not install,
         // or the OS dropped it): not straight back in, so it is not retried
         // in a tight loop — wait for the next activation.
-        while activity.active.load(Ordering::SeqCst)
+        while activity.hook_wanted()
             && !stop.load(Ordering::SeqCst)
             && activity.generation.load(Ordering::SeqCst) == generation
         {
@@ -1143,7 +1253,7 @@ impl Session {
     pub(crate) fn signal_stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(a) = &self.activity {
-            a.hook_quit.store(true, Ordering::SeqCst);
+            a.stop();
         }
     }
 
@@ -1151,17 +1261,6 @@ impl Session {
     pub(crate) fn view(&self) -> Option<Arc<active::SessionView>> {
         self.view.clone()
     }
-}
-
-/// A viewer session's surface as it ends: input and drops stop at once (held
-/// keys are released first, by the surface contract) and the OS cursor is
-/// restored (task D10). Synchronous, so a session that ends never keeps
-/// capturing input while its threads are being joined. Hiding it is the
-/// gate's (`SessionView::retire`), in order with its other operations.
-pub(crate) fn detach_surface(s: &dyn platform_api::VideoSurface) {
-    s.set_input_sink(None);
-    s.set_drop_sink(None);
-    s.set_cursor_control(false);
 }
 
 /// Viewer: no stream known — the next positional input from any window sends
@@ -1253,6 +1352,7 @@ pub(crate) fn open_viewer_popout(
             slot,
             // A pop-out shows itself: the gate decides the main video only.
             view: None,
+            moves: None,
         };
         let (ctl, stop_r) = (ctl_tx.clone(), loop_stop.clone());
         let media_thread = spawn(&format!("popout-{slot}-media"), move || {
@@ -1436,6 +1536,74 @@ mod tests {
         }
     }
 
+    /// plans/09 W1: the shortcut hook is wanted only while the session is
+    /// focused, on screen and not under a dialog in its window — focus kept
+    /// for the clipboard alone never takes the window's keys — and never once
+    /// the session stops.
+    #[test]
+    fn the_hook_follows_focus_screen_and_dialogs() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let overlays = active::Overlays::default();
+        let view = active::SessionView::new(
+            platform_api::mock::MockSurface::new((64, 64)),
+            Arc::default(),
+            overlays.clone(),
+            active::applier(rt.handle()),
+        );
+        let (activity, _wake) = Activity::new(true, false);
+        let generation = || activity.generation.load(Ordering::SeqCst);
+        activity.set(true, &view);
+        assert!(!activity.hook_wanted(), "focused but off screen");
+        assert!(
+            activity.clip_on.load(Ordering::SeqCst),
+            "the clipboard is sticky"
+        );
+        activity.set_on_screen(true, &view);
+        assert!(activity.hook_wanted());
+        let claim = generation();
+        overlays.lock().insert(crate::WindowId(3));
+        activity.overlay_changed(&view);
+        assert!(activity.hook_wanted(), "a dialog in another window");
+        overlays.lock().insert(crate::WindowId::MAIN);
+        activity.overlay_changed(&view);
+        assert!(!activity.hook_wanted(), "a dialog in its own window");
+        overlays.lock().remove(&crate::WindowId::MAIN);
+        activity.overlay_changed(&view);
+        assert!(activity.hook_wanted());
+        assert!(generation() > claim, "wanted again: a fresh claim");
+        activity.set_on_screen(false, &view);
+        assert!(!activity.hook_wanted());
+        activity.set_on_screen(true, &view);
+        activity.stop();
+        activity.set(true, &view);
+        activity.overlay_changed(&view);
+        assert!(!activity.hook_wanted(), "stopped for good");
+    }
+
+    /// plans/09 W2: a move brings the hook down until the shortcut thread
+    /// has seen it, then it goes up again (on the new window), even when
+    /// other changes come in between.
+    #[test]
+    fn a_move_brings_the_hook_down_once_then_back() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let view = active::SessionView::new(
+            platform_api::mock::MockSurface::new((64, 64)),
+            Arc::default(),
+            active::Overlays::default(),
+            active::applier(rt.handle()),
+        );
+        let (activity, _wake) = Activity::new(true, false);
+        activity.set(true, &view);
+        activity.set_on_screen(true, &view);
+        assert!(activity.hook_wanted());
+        activity.rebind(&view);
+        assert!(!activity.hook_wanted());
+        activity.set_on_screen(true, &view);
+        assert!(!activity.hook_wanted(), "held down until the thread saw it");
+        activity.take_rebind(&view);
+        assert!(activity.hook_wanted());
+    }
+
     /// What a tab's host is told as it goes to the background and back (P6):
     /// pause / resume to a host that offers it, nothing to an older one;
     /// never a repeat of the same state.
@@ -1449,13 +1617,12 @@ mod tests {
                 Arc::default(),
                 Arc::default(),
                 active::applier(rt.handle()),
-                false,
             );
             let (activity, _wake) = Activity::new(true, false);
             let (ctl_tx, ctl_rx) = std::sync::mpsc::channel();
             let gate = TabGate::new(view, Arc::new(activity), ctl_tx, vpause);
             for &on in steps {
-                gate.set_active(on);
+                gate.set_on_screen(on);
             }
             ctl_rx
                 .try_iter()

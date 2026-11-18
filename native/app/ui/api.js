@@ -49,18 +49,24 @@ export const tabConnectAll = (confirmed) => invoke('tab_connect_all', { confirme
 export const tabPassword = (remoteId, password, remember) =>
   invoke('tab_password', { remoteId, password, remember });
 export const tabForgetPassword = (remoteId) => invoke('tab_forget_password', { remoteId });
+// Detached tab windows (plans/09): its own window, and back into the strip.
+export const tabDetach = (remoteId) => invoke('tab_detach', { remoteId });
+export const tabDock = (remoteId) => invoke('tab_dock', { remoteId });
 export const getSnapshot = () => invoke('get_snapshot');
 
 // ---- answering, and the session on screen ---------------------------------------
 export const approve = (from, decision) => invoke('approve', { from, decision });
-export const endSession = () => invoke('end_session');
+// The session bar names its tab (several may be on screen, plans/09); null:
+// the host screen's session.
+export const endSession = (remoteId = null) => invoke('end_session', { remoteId });
 
 // ---- the live session -----------------------------------------------------------
 export const setPermission = (value) => invoke('set_permission', { value });
 export const setVideoVisible = (visible) => invoke('set_video_visible', { visible });
-export const requestRefresh = () => invoke('request_refresh');
-export const selectDisplay = (id) => invoke('select_display', { id });
-export const popoutDisplay = (id) => invoke('popout_display', { id });
+export const requestRefresh = (remoteId) => invoke('request_refresh', { remoteId });
+export const selectDisplay = (id, remoteId = null) =>
+  invoke('select_display', { id, remoteId });
+export const popoutDisplay = (id, remoteId) => invoke('popout_display', { id, remoteId });
 
 // ---- OS permissions -------------------------------------------------------------
 export const getPermissions = () => invoke('get_permissions');

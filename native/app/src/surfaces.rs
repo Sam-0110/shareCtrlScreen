@@ -1,5 +1,6 @@
 //! The native video surfaces (plans/08a §2.3, §6.2, §6.5): one per connected
-//! tab in the main window, plus the pop-out windows' (popout.rs). Surfaces are
+//! tab, in the main window or its detached window (plans/09), plus the
+//! pop-out windows' (popout.rs). Surfaces are
 //! created and destroyed only on the UI thread — the OS backends require it,
 //! and a surface torn down by whichever thread dropped the last reference
 //! would leave Windows child windows behind (B6).
@@ -16,7 +17,7 @@
 
 use std::sync::Arc;
 
-use engine::Engine;
+use engine::{Engine, WindowId};
 use platform_api::VideoSurface;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use tauri::{AppHandle, Manager};
@@ -55,16 +56,18 @@ impl SurfaceFactory {
         SurfaceFactory { app, engine }
     }
 
-    /// A hidden surface in the main window, below the tab strip. Waits for
-    /// the UI thread, so call it from a task, never from the UI thread.
-    pub(crate) async fn create(&self) -> Result<Arc<dyn VideoSurface>, String> {
+    /// A hidden surface in `window`: below the tab strip in the main window,
+    /// the whole page in a detached one (plans/09: it has no strip). Waits
+    /// for the UI thread, so call it from a task, never from the UI thread.
+    pub(crate) async fn create(&self, window: WindowId) -> Result<Arc<dyn VideoSurface>, String> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let (app, engine) = (self.app.clone(), self.engine.clone());
+        let label = crate::windows::label_of(window);
         self.app
             .run_on_main_thread(move || {
-                let made = match app.get_webview_window("main") {
+                let made = match app.get_webview_window(&label) {
                     Some(win) => create_in(&engine, &win),
-                    None => Err("the main window is gone".to_string()),
+                    None => Err("that window is gone".to_string()),
                 };
                 // The caller may have given up (app closing); nothing to do.
                 let _ = tx.send(made);
@@ -73,7 +76,9 @@ impl SurfaceFactory {
         let surface = rx
             .await
             .map_err(|_| "the UI thread dropped the request".to_string())??;
-        surface.set_top_inset(TAB_BAR_CSS_PX);
+        if window == WindowId::MAIN {
+            surface.set_top_inset(TAB_BAR_CSS_PX);
+        }
         Ok(surface)
     }
 

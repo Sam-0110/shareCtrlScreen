@@ -21,6 +21,15 @@ pub(crate) struct ViewerMedia {
     /// and the loop presents only while it is. `None` for a pop-out, which
     /// shows itself.
     pub view: Option<Arc<crate::session::active::SessionView>>,
+    /// The main video's moves to other windows (plans/09 W2); `None` for a
+    /// pop-out, which stays in its own window.
+    pub moves: Option<Moves>,
+}
+
+/// What carrying out a move takes.
+pub(crate) struct Moves {
+    pub cell: Arc<crate::session::current::SurfaceCell>,
+    pub ui: crate::SessionUi,
 }
 
 /// Idle repaint cadence (D11): how long the loop blocks for a new frame before
@@ -43,7 +52,9 @@ pub(crate) fn viewer_media_loop(
         shared,
         slot,
         view,
+        moves,
     } = media;
+    let mut surface = surface;
 
     // Presenter + decoder share one device (zero-copy decode → present). Create
     // both BEFORE revealing the surface, so a failure here never leaves an empty
@@ -88,6 +99,44 @@ pub(crate) fn viewer_media_loop(
     let mut last_frame: Option<Frame<'_>> = None;
     let mut last_cursor: Option<(f64, f64)> = None;
     while !stop.load(Ordering::SeqCst) {
+        // A move to another window (plans/09 W2): a presenter on the new
+        // surface, on the decoder's device — the decoder and its held frame
+        // stay, so nothing waits for a keyframe an idle host would not send.
+        // The view shows the new surface and asks for a repaint, which the
+        // idle tick below answers with the held frame.
+        if let Some(m) = &moves {
+            if let Some(target) = m.cell.pending() {
+                match target.surface.create_presenter_on(presenter.device()) {
+                    Ok(next) => match m.cell.complete() {
+                        Some(old) => {
+                            // The old presenter goes before the app may
+                            // destroy the old surface's window.
+                            drop(std::mem::replace(&mut presenter, next));
+                            surface = target.surface;
+                            sprite = InstalledSprite::default();
+                            last_cursor = None;
+                            tracing::info!("viewer: moved to window {}", target.window.0);
+                            m.ui.send(crate::SessionEvent::SurfaceReleased {
+                                surface: crate::SurfaceTag::of(&old),
+                            });
+                        }
+                        // Ended meanwhile: `Released` covers both surfaces.
+                        None => drop(next),
+                    },
+                    Err(e) => {
+                        tracing::warn!("viewer: could not move to the new window: {e}");
+                        if let Some(t) = m.cell.fail() {
+                            m.ui.send(crate::SessionEvent::SurfaceReleased {
+                                surface: crate::SurfaceTag::of(&t),
+                            });
+                        }
+                        m.ui.send(crate::SessionEvent::Toast(format!(
+                            "Could not move the remote screen to that window: {e}"
+                        )));
+                    }
+                }
+            }
+        }
         // Track window resizes (and hover-reveal offsets) — no-op when unchanged.
         surface.fit();
         {

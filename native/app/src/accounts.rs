@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use engine::{Engine, WorkspaceSel};
 use protocol::SyncDoc;
 use serde::Deserialize;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 use crate::AppState;
 
@@ -196,6 +196,8 @@ async fn post<T: for<'de> Deserialize<'de>>(
 struct Features {
     tabs: bool,
     prefs: bool,
+    /// Detached windows' placement (plans/09 W4).
+    placement: bool,
 }
 
 impl Features {
@@ -203,6 +205,7 @@ impl Features {
         Features {
             tabs: list.iter().any(|f| f == protocol::sync::FEATURE_TABS),
             prefs: list.iter().any(|f| f == protocol::sync::FEATURE_PREFS),
+            placement: list.iter().any(|f| f == protocol::sync::FEATURE_PLACEMENT),
         }
     }
 }
@@ -294,6 +297,13 @@ impl AccountManager {
             }
         }
         self.emit_state();
+        // Signed in at launch: the first sync, then the account's detached
+        // tabs' windows (plans/09 09a §5.5; the setup's seeding saw the
+        // account still locked).
+        if matches!(self.engine.workspace_sel(), WorkspaceSel::Account(_)) {
+            let _ = self.sync_once().await;
+            self.seed_windows();
+        }
     }
 
     /// Sync whenever the workspace changes (coalesced), when kicked, and every
@@ -344,9 +354,14 @@ impl AccountManager {
             return Err("Not signed in.".into());
         };
         let sent = self.inner().features.get(&key).copied().unwrap_or_default();
-        let Some(doc) = self.engine.sync_doc(&key, sent.tabs, sent.prefs) else {
+        let Some(mut doc) = self.engine.sync_doc(&key, sent.tabs, sent.prefs) else {
             return Err("Not signed in.".into());
         };
+        // Detached windows go only to a server that stores them (plans/09
+        // W4); until its first reply says so, none is assumed.
+        if !sent.placement {
+            doc.strip_placement();
+        }
         let result: Result<SyncBody, Failure> = post(
             &format!("{server}/api/sync"),
             Some(&token),
@@ -364,7 +379,9 @@ impl AccountManager {
                     .apply_sync(&key, epoch, &body.doc, sent.tabs, sent.prefs);
                 self.inner().error = None;
                 self.emit_state();
-                let gained = (now.tabs && !sent.tabs) || (now.prefs && !sent.prefs);
+                let gained = (now.tabs && !sent.tabs)
+                    || (now.prefs && !sent.prefs)
+                    || (now.placement && !sent.placement);
                 Ok(if gained {
                     Round::AgainWithNewFeatures
                 } else {
@@ -528,9 +545,25 @@ impl AccountManager {
                 .await;
         }
         self.emit_state();
-        // The first sync runs now, so the account's data appears at once.
-        self.sync_once().await?;
+        // The first sync runs now, so the account's data appears at once —
+        // its detached tabs' windows included, opened once it settled.
+        let synced = self.sync_once().await;
+        self.seed_windows();
+        synced?;
         Ok(warning)
+    }
+
+    /// The account's first sync settled (applied, or failed: the cached copy
+    /// stands): its detached tabs' windows open now (plans/09 J6, 09a §5.5).
+    fn seed_windows(&self) {
+        let tabs = self
+            .handle
+            .get()
+            .and_then(|h| h.try_state::<Arc<crate::tabs::TabManager>>())
+            .map(|t| t.inner().clone());
+        if let Some(tabs) = tabs {
+            tabs.seed_windows();
+        }
     }
 
     /// The answer to "bring this computer's tabs and names in?" (§6.10 step 3).
@@ -549,7 +582,9 @@ impl AccountManager {
             .await;
         self.engine.hold_connects(false);
         self.emit_state();
-        self.sync_once().await
+        let synced = self.sync_once().await;
+        self.seed_windows();
+        synced
     }
 
     /// Switch to the local workspace or to an account (§6.11). An account
@@ -574,6 +609,7 @@ impl AccountManager {
         self.emit_state();
         if signed_in {
             let _ = self.sync_once().await;
+            self.seed_windows();
         }
         Ok(())
     }
@@ -844,10 +880,16 @@ mod tests {
             Features::from_reply(&b.features),
             Features {
                 tabs: true,
-                prefs: true
-            }
+                prefs: true,
+                placement: false
+            },
+            "a server from before plans/09 stores no placement"
         );
         assert_eq!(b.server_time, 1_800_000_000_000);
+        let b: SyncBody =
+            serde_json::from_str(r#"{"doc":{"v":2},"features":["placement","prefs","tabs"]}"#)
+                .unwrap();
+        assert!(Features::from_reply(&b.features).placement);
     }
 
     /// Two computers, one account, through a real server (`server/`):

@@ -21,10 +21,12 @@ use std::sync::Arc;
 use platform_api::{Codec, VideoSurface};
 use protocol::{Config, ControlMsg, Mode, Permission, SignalData, SignalMsg};
 
-use crate::events::{EndReason, PwReason, SessionEvent, SessionId, SessionPhase, UiEvent};
+use crate::events::{
+    EndReason, PwReason, SessionEvent, SessionId, SessionPhase, UiEvent, WindowId,
+};
 use crate::handshake::{self, ApprovalDecision};
 use crate::session::registry::{HostSlot, PendingLogin, ViewerPhase, ViewerSlot, REQUEST_TIMEOUT};
-use crate::{modifiers, session, ConnectError, Engine, Role, SECRET_PROMPT_TIMEOUT};
+use crate::{modifiers, session, ConnectError, Engine, MoveError, Role, SECRET_PROMPT_TIMEOUT};
 
 /// Holds `Registry::admitting` for one peer and clears it when dropped, so an
 /// admission that ends any way (accepted, denied, a wrong password, a panic)
@@ -362,6 +364,17 @@ impl Engine {
         host_uuid: &str,
         surface: Arc<dyn VideoSurface>,
     ) -> Result<SessionId, ConnectError> {
+        self.connect_in(host_uuid, surface, WindowId::MAIN)
+    }
+
+    /// [`connect`](Self::connect) with the video in `window` (plans/09: a
+    /// detached window's card reconnects in that window).
+    pub fn connect_in(
+        &self,
+        host_uuid: &str,
+        surface: Arc<dyn VideoSurface>,
+        window: WindowId,
+    ) -> Result<SessionId, ConnectError> {
         let host_uuid = host_uuid.trim().to_lowercase();
         if !protocol::is_valid_uuid_v4(&host_uuid) {
             return Err(ConnectError::InvalidId);
@@ -403,7 +416,8 @@ impl Engine {
             }
             let id = reg.reserve();
             let started_in = ws.sel.workspace_key().map(|k| (k.to_string(), ws.epoch));
-            let mut slot = ViewerSlot::requesting(host_uuid.clone(), Some(surface));
+            let cell = session::current::SurfaceCell::new(surface, window);
+            let mut slot = ViewerSlot::requesting(host_uuid.clone(), Some(cell));
             slot.workspace = started_in.clone();
             reg.viewers.insert(id, slot);
             // Queued (not awaited) inside the section, so a switch's
@@ -777,55 +791,92 @@ impl Engine {
 
     // ---- the ActiveGate (08a §6.4, §6.18) -----------------------------------------
 
-    /// Make viewer session `id` the one on screen (or none): its video is
-    /// shown once ready, it alone exchanges the clipboard (re-baselined, so
-    /// text copied while another tab was active is never sent) and holds the
-    /// shortcut hook; the previous one is hidden first (I2). The gate does the
-    /// showing and hiding, in this order, on its own thread.
-    pub fn set_active(&self, id: Option<SessionId>) {
-        // Done under `reg` so two racing switches cannot both leave their tab
-        // active; `Session::set_active` only stores atomics and queues to the
-        // gate's thread (never blocks, never touches the OS), so holding the
-        // lock is allowed. Old first: "hide the old tab" is queued before
-        // "show the new one".
+    /// Put viewer sessions `on_screen` on screen and make `focused` the one
+    /// with the keyboard (plans/09 W1, 09a §3.2). Their videos are shown once
+    /// ready (not under their window's dialog, not in link trouble) and their
+    /// hosts stream; every other viewer session is hidden and its host paused.
+    /// Only `focused` exchanges the clipboard (re-baselined when it becomes
+    /// focused, so text copied for another session is never sent here).
+    /// `focused` need not be on screen: the clipboard stays with the session
+    /// used last while another app is in front (plans/09 §7, blocker 5). It
+    /// holds the shortcut hook only while it is also on screen and not under
+    /// a dialog in its window.
+    ///
+    /// One atomic change under `reg`, so two racing callers cannot leave a
+    /// mix of both answers. The gates only store atomics and queue to the
+    /// applier (never block, never touch the OS), so holding the lock is
+    /// allowed. What leaves the screen is queued before what comes on it, so
+    /// "hide" always precedes "show" (I2).
+    pub fn set_screen(&self, on_screen: &[SessionId], focused: Option<SessionId>) {
         let mut reg = self.reg.lock();
-        if reg.active == id {
+        let on: std::collections::BTreeSet<SessionId> = on_screen
+            .iter()
+            .copied()
+            .filter(|i| reg.viewers.contains_key(i))
+            .collect();
+        let focused = focused.filter(|i| reg.viewers.contains_key(i));
+        if reg.on_screen == on && reg.focused == focused {
             return;
         }
-        let id = id.filter(|i| reg.viewers.contains_key(i));
-        let old = std::mem::replace(&mut reg.active, id);
-        for (s, on) in [(old, false), (id, true)] {
-            if let Some(gate) = s
-                .and_then(|s| reg.viewers.get(&s))
-                .and_then(|v| v.gate.as_ref())
-            {
-                gate.set_active(on);
+        let gate = |reg: &session::registry::Registry, id: SessionId| {
+            reg.viewers.get(&id).and_then(|v| v.gate.clone())
+        };
+        let leaving: Vec<SessionId> = reg.on_screen.difference(&on).copied().collect();
+        let coming: Vec<SessionId> = on.difference(&reg.on_screen).copied().collect();
+        for id in leaving {
+            if let Some(g) = gate(&reg, id) {
+                g.set_on_screen(false);
             }
         }
+        if reg.focused != focused {
+            if let Some(g) = reg.focused.and_then(|id| gate(&reg, id)) {
+                g.set_focused(false);
+            }
+        }
+        for id in coming {
+            if let Some(g) = gate(&reg, id) {
+                g.set_on_screen(true);
+            }
+        }
+        if reg.focused != focused {
+            if let Some(g) = focused.and_then(|id| gate(&reg, id)) {
+                g.set_focused(true);
+            }
+        }
+        reg.on_screen = on;
+        reg.focused = focused;
     }
 
-    /// The viewer session on screen, if any.
-    pub fn active_session(&self) -> Option<SessionId> {
-        self.reg.lock().active
+    /// The viewer session with the keyboard, if any.
+    pub fn focused_session(&self) -> Option<SessionId> {
+        self.reg.lock().focused
     }
 
-    /// A web dialog opened over the video (`true`) or the last one closed
-    /// (`false`): every main video is hidden meanwhile, then the active one is
-    /// shown and repainted again (08a §6.18). Returns once the hides and shows
-    /// are done, so the UI paints a dialog only after the native video is out
-    /// of its way (the surface contract). Must not be awaited on the UI thread:
-    /// a backend's show/hide may run there.
-    pub async fn set_overlay(&self, open: bool) {
-        self.overlay.store(open, Ordering::SeqCst);
+    /// A web dialog opened over `window`'s video (`true`) or the last one
+    /// there closed (`false`): that window's video is hidden meanwhile, then
+    /// shown and repainted again (08a §6.18, plans/09 J4). Returns once the
+    /// hides and shows are done, so the UI paints a dialog only after the
+    /// native video is out of its way (the surface contract). Must not be
+    /// awaited on the UI thread: a backend's show/hide may run there.
+    pub async fn set_overlay(&self, window: WindowId, open: bool) {
+        {
+            let mut overlays = self.overlays.lock();
+            if open {
+                overlays.insert(window);
+            } else {
+                overlays.remove(&window);
+            }
+        }
         let gates: Vec<_> = {
             let reg = self.reg.lock();
             reg.viewers
                 .values()
                 .filter_map(|v| v.gate.clone())
+                .filter(|g| g.window() == window)
                 .collect()
         };
         for g in gates {
-            g.set_overlay(open);
+            g.overlay_changed();
         }
         // Bounded: a UI thread stuck elsewhere must not hang the dialog.
         let (done, applied) = tokio::sync::oneshot::channel();
@@ -841,17 +892,83 @@ impl Engine {
         }
     }
 
+    /// Hand viewer session `id` to `surface` in `window` (plans/09 W2, 09a
+    /// §3.2 and §4.2): in any phase before it ends, without a reconnect —
+    /// the same session, the same host session. Never blocks: a live
+    /// session's media thread builds a presenter there on its decoder's
+    /// device and swaps (the input and drop sinks, cursor control, the view
+    /// and the shortcut hook follow, "hide the old" before "show the new").
+    /// `SessionEvent::SurfaceReleased` then names the surface the engine let
+    /// go of: the old one when the move went through, `surface` when it
+    /// failed (the session stays where it was; a toast says why).
+    ///
+    /// Refused while the session is being started or another move of it is
+    /// under way (`Busy`), when `surface` belongs to a session already, and
+    /// for a session that is gone or ending.
+    pub fn move_session(
+        &self,
+        id: SessionId,
+        surface: Arc<dyn VideoSurface>,
+        window: WindowId,
+    ) -> Result<(), MoveError> {
+        use session::current::{Carrier, Target};
+        // Checked and accepted under `reg`, like a connect's surface claim,
+        // so no connect can take the surface in between.
+        let (cell, peer, carrier) = {
+            let reg = self.reg.lock();
+            let Some(v) = reg.viewers.get(&id) else {
+                return Err(if reg.reaping.contains_key(&id) {
+                    MoveError::Ended
+                } else {
+                    MoveError::NotFound
+                });
+            };
+            if v.starting {
+                return Err(MoveError::Busy);
+            }
+            if reg.surface_in_use(&surface).is_some() {
+                return Err(MoveError::SurfaceInUse);
+            }
+            // Every viewer slot made by `connect` has a cell.
+            let Some(cell) = v.surface.clone() else {
+                return Err(MoveError::NotFound);
+            };
+            let carrier = cell.request(Target { surface, window })?;
+            (cell, v.peer.clone(), carrier)
+        };
+        let released = match carrier {
+            Carrier::Swapped(old) => Some(old),
+            Carrier::Media => None,
+            // Its media thread is gone (its decoder failed): nothing draws,
+            // so the sinks and the view move here, at once.
+            Carrier::Caller => cell.complete(),
+        };
+        if let Some(old) = released {
+            self.emit(
+                id,
+                &peer,
+                false,
+                SessionEvent::SurfaceReleased {
+                    surface: crate::SurfaceTag::of(&old),
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Put viewer session `id`'s [`session::TabGate`] in its slot and apply
-    /// whether it is the active session now — under `reg`, like every switch,
-    /// so no switch can fall between the two.
+    /// whether it is on screen and focused now — under `reg`, like every
+    /// switch, so no switch can fall between the two.
     pub(crate) fn attach_gate(&self, id: SessionId, gate: Arc<session::TabGate>) {
         let mut reg = self.reg.lock();
-        let active = reg.active == Some(id);
+        let on_screen = reg.on_screen.contains(&id);
+        let focused = reg.focused == Some(id);
         // The slot stays while its start runs (an end then waits for the
         // starter), so it is always there; a missing one only means nothing
-        // can switch it, and it stays inactive.
+        // can switch it, and it stays off screen.
         if let Some(v) = reg.viewers.get_mut(&id) {
-            gate.set_active(active);
+            gate.set_on_screen(on_screen);
+            gate.set_focused(focused);
             v.gate = Some(gate);
         }
     }
@@ -866,8 +983,8 @@ impl Engine {
         self.ui.clone()
     }
 
-    pub(crate) fn overlay_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
-        Arc::clone(&self.overlay)
+    pub(crate) fn overlays(&self) -> session::active::Overlays {
+        Arc::clone(&self.overlays)
     }
 
     pub(crate) fn view_ops(&self) -> session::active::ViewOps {
@@ -1031,8 +1148,9 @@ impl Engine {
                 Some(Taken::Viewer(v)) => (v.peer, false, v.ended, v.surface, v.session),
             };
             // No tab is on screen until the UI picks the next one (08a §6.4).
-            if reg.active == Some(id) {
-                reg.active = None;
+            reg.on_screen.remove(&id);
+            if reg.focused == Some(id) {
+                reg.focused = None;
             }
             reg.reaping.insert(
                 id,
@@ -1055,8 +1173,9 @@ impl Engine {
         if let Some(v) = session.as_ref().and_then(|s| s.view()) {
             v.retire();
         }
-        if let Some(s) = &surface {
-            session::detach_surface(s.as_ref());
+        // No more moves; input and drops stop, the OS cursor comes back.
+        if let Some(cell) = &surface {
+            cell.retire();
         }
         tracing::info!("session {id} with {peer} ended: {reason:?}");
         self.emit(
@@ -1078,7 +1197,7 @@ impl Engine {
         peer: &str,
         host: bool,
         session: Option<session::Session>,
-        surface: Option<Arc<dyn VideoSurface>>,
+        surface: Option<Arc<session::current::SurfaceCell>>,
     ) {
         let ui = self.session_ui(id, peer, host);
         let reg = Arc::clone(&self.reg);
@@ -1092,7 +1211,7 @@ impl Engine {
             // view (nothing showed its surface): hide it directly.
             match (&view, &surface) {
                 (Some(v), _) => v.retire(),
-                (None, Some(s)) => s.hide(),
+                (None, Some(cell)) => cell.current().hide(),
                 (None, None) => {}
             }
             reg.lock().reaping.remove(&id);

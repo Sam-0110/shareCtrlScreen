@@ -171,7 +171,7 @@ impl Peer {
             .engine
             .connect(host, self.platform.surface.clone())
             .expect("this computer is not hosting");
-        self.engine.set_active(Some(id));
+        self.engine.set_screen(&[id], Some(id));
         id
     }
 
@@ -344,6 +344,7 @@ fn event_kind(ev: &SessionEvent) -> String {
         SessionEvent::Displays { .. } => "displays".into(),
         SessionEvent::Toast(_) => "toast".into(),
         SessionEvent::Released => "released".into(),
+        SessionEvent::SurfaceReleased { surface } => format!("surface-released:{surface:?}"),
     }
 }
 /// The one viewer session of `p` (the tests start at most one per engine,
@@ -476,6 +477,9 @@ async fn a_cancelled_password_prompt_does_not_leave_this_computer_busy() {
     // for that before the next request: answering "busy" until then is the
     // design (P2), not the stuck-busy bug this test guards against.
     me.engine.end_all_and_wait(t).await;
+    // The other viewer's refused request is still being released too (it
+    // holds that host and surface until then, `ConnectError::Ending`).
+    other.engine.end_all_and_wait(t).await;
     other.open(&me.uuid);
     let other_id = other.uuid.clone();
     eventually("the other viewer is let in", t, || {
@@ -1887,7 +1891,7 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
     .await;
     assert_eq!(presented(&surface_b), 0, "an inactive tab is not presented");
     assert!(!surface_b.state().visible, "an inactive tab is hidden");
-    assert_eq!(viewer.engine.active_session(), Some(a));
+    assert_eq!(viewer.engine.focused_session(), Some(a));
 
     // Only the active tab exchanges the clipboard (B3).
     viewer.platform.clipboard.user_copies("for A");
@@ -1898,15 +1902,15 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
     // A copy made right before switching (B's loop has not polled since)
     // is still never sent to B: the gate re-baselines when it opens.
     viewer.platform.clipboard.user_copies("also for A");
-    viewer.engine.set_active(Some(b));
+    viewer.engine.set_screen(&[b], Some(b));
     tokio::time::sleep(Duration::from_millis(900)).await;
     assert_ne!(
         host_b.platform.clipboard.get_text().as_deref(),
         Some("also for A")
     );
-    viewer.engine.set_active(Some(a));
+    viewer.engine.set_screen(&[a], Some(a));
 
-    let switch_to = |on: SessionId| viewer.engine.set_active(Some(on));
+    let switch_to = |on: SessionId| viewer.engine.set_screen(&[on], Some(on));
     // Brought to the front, a paused tab's host streams again and new
     // pictures appear promptly (P6); the tab it replaced pauses in turn.
     eventually("host B paused again", t, || {
@@ -1968,7 +1972,7 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
             );
         }
     }
-    assert_eq!(viewer.engine.active_session(), Some(a));
+    assert_eq!(viewer.engine.focused_session(), Some(a));
 
     // The copy made while A was active never reached B, even though B was
     // active since (the gate re-baselines when it opens); B's own copy does.
@@ -2064,6 +2068,355 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
     );
 }
 
+/// plans/09 W1: several sessions on screen at once, one focused. Two of three
+/// hosts stream and present; the third is paused. Only the focused session
+/// exchanges the clipboard, also when the other on-screen one presents.
+#[cfg(feature = "test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn several_sessions_on_screen_one_focused() {
+    let relay = start_relay().await;
+    let hosts = [
+        start_peer("screen-host-a", &relay),
+        start_peer("screen-host-b", &relay),
+        start_peer("screen-host-c", &relay),
+    ];
+    let viewer = start_peer("screen-viewer", &relay);
+    let t = Duration::from_secs(20);
+    eventually("all registered", t, || {
+        hosts.iter().all(|h| h.engine.server_connected()) && viewer.engine.server_connected()
+    })
+    .await;
+    let surfaces: Vec<_> = (0..3)
+        .map(|_| platform_api::mock::MockSurface::new((640, 360)))
+        .collect();
+    let presented = |s: &Arc<platform_api::mock::MockSurface>| s.state().presented.len();
+    let mut ids = Vec::new();
+    for (h, s) in hosts.iter().zip(&surfaces) {
+        ids.push(
+            viewer
+                .engine
+                .connect(&h.uuid, s.clone())
+                .expect("not hosting"),
+        );
+    }
+    let (a, b, c) = (ids[0], ids[1], ids[2]);
+    viewer.engine.set_screen(&[a, b], Some(b));
+    for (i, h) in hosts.iter().enumerate().take(2) {
+        eventually("on screen: presenting", t, || presented(&surfaces[i]) > 10).await;
+        assert_eq!(h.engine.test_video_paused(), Some(false));
+    }
+    eventually("off screen: its host paused", t, || {
+        hosts[2].engine.test_video_paused() == Some(true)
+    })
+    .await;
+    assert_eq!(
+        presented(&surfaces[2]),
+        0,
+        "an off-screen session is not presented"
+    );
+    assert_eq!(viewer.engine.focused_session(), Some(b));
+
+    // The clipboard goes to the focused session only.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    viewer.platform.clipboard.user_copies("for B");
+    eventually("B's host gets it", t, || {
+        hosts[1].platform.clipboard.get_text().as_deref() == Some("for B")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_ne!(
+        hosts[0].platform.clipboard.get_text().as_deref(),
+        Some("for B")
+    );
+
+    // Focus moves to A; both stay on screen and presenting.
+    viewer.engine.set_screen(&[a, b], Some(a));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    viewer.platform.clipboard.user_copies("for A");
+    eventually("A's host gets it", t, || {
+        hosts[0].platform.clipboard.get_text().as_deref() == Some("for A")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_ne!(
+        hosts[1].platform.clipboard.get_text().as_deref(),
+        Some("for A"),
+        "no longer focused: B gets nothing"
+    );
+    let (pa, pb) = (presented(&surfaces[0]), presented(&surfaces[1]));
+    eventually("both keep presenting", t, || {
+        presented(&surfaces[0]) > pa + 5 && presented(&surfaces[1]) > pb + 5
+    })
+    .await;
+
+    // C comes on screen, A goes off: A pauses, C resumes.
+    viewer.engine.set_screen(&[b, c], Some(c));
+    eventually("A paused", t, || {
+        hosts[0].engine.test_video_paused() == Some(true)
+    })
+    .await;
+    eventually("C presents", t, || presented(&surfaces[2]) > 3).await;
+    viewer.engine.end_all_and_wait(Duration::from_secs(3)).await;
+}
+
+/// The session-log entry for "the engine let go of `surface`" (plans/09 W2).
+fn released_entry(surface: &Arc<platform_api::mock::MockSurface>) -> String {
+    let s: Arc<dyn platform_api::VideoSurface> = surface.clone();
+    format!("surface-released:{:?}", engine::SurfaceTag::of(&s))
+}
+
+/// How often session `id` of `p` logged `what`.
+fn logged(p: &Peer, id: SessionId, what: &str) -> usize {
+    p.session_log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(i, k)| *i == id && k == what)
+        .count()
+}
+
+/// plans/09 W2: a live session moves between two surfaces twenty times with
+/// no reconnect — the same session and one host session throughout. Each time
+/// pictures reach the new surface, nothing is presented on the old one after
+/// it is let go, and a key held on the old one is released on the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_session_moves_between_surfaces() {
+    let relay = start_relay().await;
+    let host = start_peer("move-host", &relay);
+    let viewer = start_peer("move-viewer", &relay);
+    let t = Duration::from_secs(20);
+    eventually("registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    let a = platform_api::mock::MockSurface::new((640, 360));
+    let b = platform_api::mock::MockSurface::new((640, 360));
+    let id = viewer
+        .engine
+        .connect(&host.uuid, a.clone())
+        .expect("not hosting");
+    viewer.engine.set_screen(&[id], Some(id));
+    eventually("presenting on the first surface", t, || {
+        a.state().presented.len() > 5
+    })
+    .await;
+    let key_ups = |p: &Peer| {
+        injected(p)
+            .iter()
+            .filter(|m| matches!(m, InputMsg::KeyUp { code } if code == "KeyQ"))
+            .count()
+    };
+    let (mut from, mut to) = (a, b);
+    for round in 0..20u32 {
+        assert!(
+            from.user_input(VideoInput::Key {
+                code: "KeyQ",
+                down: true
+            }),
+            "round {round}: the current surface takes input"
+        );
+        let ups = key_ups(&host);
+        let focus_before = to.state().focus_requests;
+        let entry = released_entry(&from);
+        let before = logged(&viewer, id, &entry);
+        viewer
+            .engine
+            .move_session(id, to.clone(), engine::WindowId(1 + round % 2))
+            .expect("move accepted");
+        eventually("the old surface let go", t, || {
+            logged(&viewer, id, &entry) > before
+        })
+        .await;
+        let left = from.state().presented.len();
+        let shown = to.state().presented.len();
+        eventually(
+            "pictures on the new surface",
+            Duration::from_secs(5),
+            || to.state().presented.len() > shown && to.state().visible,
+        )
+        .await;
+        eventually("the key held on the old surface released", t, || {
+            key_ups(&host) > ups
+        })
+        .await;
+        {
+            let old = from.state();
+            assert_eq!(
+                old.presented.len(),
+                left,
+                "round {round}: drawn after release"
+            );
+            assert!(!old.visible, "round {round}: the old surface is hidden");
+            assert!(
+                !old.has_input_sink,
+                "round {round}: the old surface takes no input"
+            );
+            assert!(
+                !old.cursor_control,
+                "round {round}: the OS cursor is back there"
+            );
+        }
+        assert!(
+            to.state().cursor_control,
+            "round {round}: control moved along"
+        );
+        eventually("the focused session's keyboard moved along", t, || {
+            to.state().focus_requests > focus_before
+        })
+        .await;
+        std::mem::swap(&mut from, &mut to);
+    }
+    assert_eq!(viewer.engine.viewer_sessions(), vec![id]);
+    let negotiations = |p: &Peer| {
+        p.session_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, k)| k == "negotiating")
+            .count()
+    };
+    assert_eq!(negotiations(&host), 1, "one host session: no reconnect");
+    assert_eq!(negotiations(&viewer), 1);
+    viewer.engine.end_all_and_wait(Duration::from_secs(3)).await;
+}
+
+/// A session whose video never got a presenter (its media thread failed at
+/// once) still moves: its input and the surface go along at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_without_video_still_moves() {
+    let relay = start_relay().await;
+    let host = start_peer("move-novideo-host", &relay);
+    let viewer = start_peer("move-novideo-viewer", &relay);
+    let t = Duration::from_secs(20);
+    eventually("registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    let broken = platform_api::mock::MockSurface::new((640, 360));
+    broken.state().refuse_presenter = true;
+    let id = viewer
+        .engine
+        .connect(&host.uuid, broken.clone())
+        .expect("not hosting");
+    viewer.engine.set_screen(&[id], Some(id));
+    eventually("told it cannot display", t, || {
+        viewer
+            .toasts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.starts_with("Cannot display the remote screen"))
+    })
+    .await;
+    eventually("input bound", t, || broken.state().has_input_sink).await;
+    let next = platform_api::mock::MockSurface::new((640, 360));
+    viewer
+        .engine
+        .move_session(id, next.clone(), engine::WindowId(1))
+        .expect("move accepted");
+    eventually("the old surface let go", t, || {
+        logged(&viewer, id, &released_entry(&broken)) == 1
+    })
+    .await;
+    assert!(!broken.state().has_input_sink);
+    assert!(next.state().has_input_sink, "input moved along");
+    assert!(next.user_input(VideoInput::Key {
+        code: "KeyW",
+        down: true
+    }));
+    eventually("keys from the new surface reach the host", t, || {
+        injected(&host)
+            .iter()
+            .any(|m| matches!(m, InputMsg::KeyDown { code } if code == "KeyW"))
+    })
+    .await;
+    viewer.engine.end_all_and_wait(Duration::from_secs(3)).await;
+}
+
+/// A move whose new surface cannot get a presenter leaves the session where
+/// it was, still presenting, and lets go of the surface it was moving to.
+/// A move before the session is live only swaps: it goes live there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_move_stays_and_an_early_move_goes_live_there() {
+    let relay = start_relay().await;
+    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let host = start_peer_full(
+        "move-held-host",
+        &relay,
+        |_| {},
+        Arc::new(HeldApproval {
+            asked: asked.clone(),
+            release: release.clone(),
+        }),
+    );
+    let viewer = start_peer("move-early-viewer", &relay);
+    let t = Duration::from_secs(20);
+    eventually("registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    let first = platform_api::mock::MockSurface::new((640, 360));
+    let early = platform_api::mock::MockSurface::new((640, 360));
+    let id = viewer
+        .engine
+        .connect(&host.uuid, first.clone())
+        .expect("not hosting");
+    viewer.engine.set_screen(&[id], Some(id));
+    eventually("the host is asking", t, || {
+        asked.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    // Still requesting: the move is a swap, released at once.
+    viewer
+        .engine
+        .move_session(id, early.clone(), engine::WindowId(4))
+        .expect("an early move");
+    eventually("the first surface let go", t, || {
+        logged(&viewer, id, &released_entry(&first)) == 1
+    })
+    .await;
+    assert_eq!(
+        viewer
+            .engine
+            .move_session(id, early.clone(), engine::WindowId(4)),
+        Err(engine::MoveError::SurfaceInUse)
+    );
+    release.add_permits(1);
+    eventually("live on the surface it moved to", t, || {
+        early.state().presented.len() > 5
+    })
+    .await;
+    assert!(
+        first.state().presented.is_empty(),
+        "never drawn on the first"
+    );
+
+    let broken = platform_api::mock::MockSurface::new((640, 360));
+    broken.state().refuse_presenter = true;
+    viewer
+        .engine
+        .move_session(id, broken.clone(), engine::WindowId(5))
+        .expect("accepted; it fails on the media thread");
+    eventually("the broken surface let go", t, || {
+        logged(&viewer, id, &released_entry(&broken)) == 1
+    })
+    .await;
+    let n = early.state().presented.len();
+    eventually("still presenting where it was", t, || {
+        early.state().presented.len() > n
+    })
+    .await;
+    assert!(early.state().has_input_sink, "input stays with it");
+    assert!(viewer
+        .toasts
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|m| m.starts_with("Could not move the remote screen")));
+    viewer.engine.end_all_and_wait(Duration::from_secs(3)).await;
+}
+
 /// Ending a session while its start is still building it (a slow ICE gather)
 /// waits for the start to finish, then ends it for real: its threads are
 /// joined before `Released`, its surface is hidden, its sinks are gone and the
@@ -2113,6 +2466,11 @@ async fn ending_a_session_during_its_start_leaves_nothing_behind() {
         matches!(host.engine.role(), Role::Idle)
     })
     .await;
+
+    // The host's ended session must be released too (its threads joined)
+    // before it takes a new one: until then it answers "busy" (registry
+    // `busy_for`). Its role goes Idle earlier, so wait for the release.
+    host.engine.end_all_and_wait(Duration::from_secs(5)).await;
 
     // Waiting for every session to be released, as Quit does, returns with
     // nothing left running.

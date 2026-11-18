@@ -293,6 +293,10 @@ fn attach(
     match surface.and_then(|s| engine.attach_popout(session, slot, s)) {
         Some(gen) => {
             entry.gen = Some(gen);
+            // Its activation counts as its session's (09 §7, blocker 5).
+            if let Some(wm) = app.try_state::<Arc<crate::windows::WindowManager>>() {
+                wm.watch_popout(win, session);
+            }
             tracing::info!("pop-out window {slot} attached");
         }
         None => {
@@ -311,6 +315,9 @@ fn attach(
 /// `tell_host`), then destroy its window. Runs on its own thread: see the
 /// module docs.
 fn close_window(app: &AppHandle, engine: &Arc<Engine>, slot: u8, e: Entry, tell_host: bool) {
+    if let Some(wm) = app.try_state::<Arc<crate::windows::WindowManager>>() {
+        wm.unwatch(&e.label, crate::windows::Who::Popout(e.session));
+    }
     let win = app.get_webview_window(&e.label);
     let engine = engine.clone();
     std::thread::spawn(move || {

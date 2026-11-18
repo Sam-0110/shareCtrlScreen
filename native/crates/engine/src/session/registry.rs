@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use platform_api::{Codec, VideoSurface};
 use protocol::Permission;
 
+use super::current::SurfaceCell;
 use super::{Session, TabGate};
 use crate::events::{EndReason, SessionId};
 use crate::modifiers::OsFamily;
@@ -83,8 +84,8 @@ pub(crate) struct ViewerSlot {
     /// The host pauses a background tab's video on request (from its
     /// connect-response caps, P6).
     pub(crate) host_vpause: bool,
-    /// Where its video is presented.
-    pub(crate) surface: Option<Arc<dyn VideoSurface>>,
+    /// Where its video is presented: its current surface (plans/09 W2).
+    pub(crate) surface: Option<Arc<SurfaceCell>>,
     /// The workspace the connection was started in and its epoch, so the
     /// recent lands there and nowhere else (I13).
     pub(crate) workspace: Option<(String, u64)>,
@@ -104,7 +105,7 @@ pub(crate) struct ViewerSlot {
 }
 
 impl ViewerSlot {
-    pub(crate) fn requesting(peer: String, surface: Option<Arc<dyn VideoSurface>>) -> Self {
+    pub(crate) fn requesting(peer: String, surface: Option<Arc<SurfaceCell>>) -> Self {
         ViewerSlot {
             peer,
             phase: ViewerPhase::Requesting,
@@ -159,7 +160,7 @@ pub(crate) struct HostSlot {
 pub(crate) struct Reaping {
     pub(crate) peer: String,
     pub(crate) host: bool,
-    pub(crate) surface: Option<Arc<dyn VideoSurface>>,
+    pub(crate) surface: Option<Arc<SurfaceCell>>,
 }
 
 /// All sessions, under `Engine::reg`.
@@ -173,9 +174,11 @@ pub(crate) struct Registry {
     /// start (D1).
     pub(crate) admitting: Option<String>,
     pub(crate) viewers: BTreeMap<SessionId, ViewerSlot>,
-    /// The viewer session on screen (plans/08 P3): the only one whose video is
-    /// shown and which exchanges the clipboard and holds the shortcut hook.
-    pub(crate) active: Option<SessionId>,
+    /// The viewer sessions on screen (plans/09 W1): their video is shown and
+    /// their host streams; every other one is hidden and paused.
+    pub(crate) on_screen: std::collections::BTreeSet<SessionId>,
+    /// The one with the keyboard, the clipboard and the shortcut hook.
+    pub(crate) focused: Option<SessionId>,
     /// Ended sessions not released yet.
     pub(crate) reaping: BTreeMap<SessionId, Reaping>,
 }
@@ -207,14 +210,14 @@ impl Registry {
         })
     }
 
-    /// A session that has not been released and presents on `surface`.
+    /// A session that has not been released and holds `surface` (as its
+    /// current one or as a move's target).
     /// `true` with it when that session is already ending.
     pub(crate) fn surface_in_use(
         &self,
         surface: &Arc<dyn VideoSurface>,
     ) -> Option<(SessionId, bool)> {
-        let same =
-            |s: &Option<Arc<dyn VideoSurface>>| s.as_ref().is_some_and(|s| Arc::ptr_eq(s, surface));
+        let same = |s: &Option<Arc<SurfaceCell>>| s.as_ref().is_some_and(|c| c.holds(surface));
         self.viewers
             .iter()
             .find(|(_, v)| same(&v.surface))

@@ -70,6 +70,13 @@ pub(crate) fn install_native_menu(app: &tauri::App) -> tauri::Result<()> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 struct MonitorMenu(std::sync::Mutex<Option<tauri::menu::Submenu<tauri::Wry>>>);
 
+/// Bring the main window to the front (its dialogs serve every window).
+fn raise_main(app: &tauri::AppHandle) {
+    if let Some(wm) = app.try_state::<std::sync::Arc<crate::windows::WindowManager>>() {
+        wm.raise_main();
+    }
+}
+
 /// The tab manager (managed from setup on).
 fn tabs_of(app: &tauri::AppHandle) -> Option<std::sync::Arc<crate::tabs::TabManager>> {
     app.try_state::<std::sync::Arc<crate::tabs::TabManager>>()
@@ -178,21 +185,31 @@ pub(crate) fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::Menu
         return;
     }
     match event.id().as_ref() {
+        // Settings and updates live in the main window (a detached window's
+        // page ignores these, so one dialog opens, over its own video only,
+        // plans/09 J4): it comes to the front for them.
         "menu-settings" => {
+            raise_main(app);
             let _ = app.emit("menu://settings", ());
         }
         "menu-check-updates" => {
+            raise_main(app);
             let _ = app.emit("menu://check-updates", ());
         }
         "menu-end-session" => crate::commands::end_current(app),
         "menu-tab-next" => {
             if let Some(tabs) = tabs_of(app) {
-                tabs.step(engine::TabStep::Next);
+                // Nothing to step through in a detached window (Decision 2).
+                if tabs.window_in_use().is_none() {
+                    tabs.step(engine::TabStep::Next);
+                }
             }
         }
         "menu-tab-prev" => {
             if let Some(tabs) = tabs_of(app) {
-                tabs.step(engine::TabStep::Prev);
+                if tabs.window_in_use().is_none() {
+                    tabs.step(engine::TabStep::Prev);
+                }
             }
         }
         "menu-tab-new" => {
@@ -204,6 +221,11 @@ pub(crate) fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::Menu
             let Some(tabs) = tabs_of(app) else {
                 return;
             };
+            // In a detached window: that window's tab, as its X does.
+            if let Some((w, _)) = tabs.window_in_use() {
+                tabs.close_window(w);
+                return;
+            }
             if let Some(remote) = app
                 .state::<AppState>()
                 .engine
@@ -217,7 +239,7 @@ pub(crate) fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::Menu
             // The Monitor menu belongs to the tab on screen — or, when
             // hosting, to this computer's own shared monitor.
             let engine = &app.state::<AppState>().engine;
-            let viewer = engine.active_session();
+            let viewer = engine.focused_session();
             if let Some(id) = other.strip_prefix(MENU_DISPLAY_PREFIX) {
                 match viewer {
                     Some(session) => engine.select_display(session, id.to_string()),

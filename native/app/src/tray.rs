@@ -92,6 +92,11 @@ pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
         tabs.stop_starting();
     }
     app.state::<AppState>().engine.end_all();
+    // Detached tab windows go to the tray with it, and come back with it
+    // (disconnected, 09a §5.7).
+    if let Some(wm) = app.try_state::<std::sync::Arc<crate::windows::WindowManager>>() {
+        wm.set_all_visible(false);
+    }
     if let Err(e) = window.hide() {
         tracing::warn!("hiding the window to the tray failed: {e}");
     } else {

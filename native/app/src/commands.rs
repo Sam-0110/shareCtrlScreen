@@ -208,7 +208,7 @@ pub(crate) fn end_current(app: &tauri::AppHandle) {
     let engine = &app.state::<AppState>().engine;
     if matches!(engine.role(), Role::Host { .. }) {
         engine.end_hosting();
-    } else if let Some(id) = engine.active_session() {
+    } else if let Some(id) = engine.focused_session() {
         engine.disconnect(id);
     }
 }
@@ -223,15 +223,52 @@ pub fn set_permission(state: tauri::State<'_, AppState>, value: String) {
     state.engine.set_permission(perm);
 }
 
+/// The session bar's Disconnect: `remote_id`'s tab (the bar names its
+/// tab: there may be several on screen, plans/09); none — the host screen,
+/// or an older page — ends what `end_current` ends.
 #[tauri::command]
-pub fn end_session(app: tauri::AppHandle) {
-    end_current(&app);
+pub fn end_session(app: tauri::AppHandle, tabs: Tabs<'_>, remote_id: Option<String>) {
+    match remote_id {
+        Some(remote) => tabs.disconnect(&remote),
+        None => end_current(&app),
+    }
+}
+
+/// The viewer session a session-bar command is for: `remote_id`'s tab, or
+/// the focused one when none is named.
+fn bar_session(
+    state: &AppState,
+    tabs: &TabManager,
+    remote_id: Option<&str>,
+) -> Option<engine::SessionId> {
+    match remote_id {
+        Some(remote) => tabs.session_of(remote),
+        None => state.engine.focused_session(),
+    }
+}
+
+/// Put `remote_id`'s tab in a window of its own (plans/09 W3).
+#[tauri::command]
+pub async fn tab_detach(tabs: Tabs<'_>, remote_id: String) -> Result<(), String> {
+    let tabs = tabs.inner().clone();
+    tabs.detach(&remote_id).await
+}
+
+/// Put `remote_id`'s detached tab back in the strip (plans/09 W3).
+#[tauri::command]
+pub async fn tab_dock(tabs: Tabs<'_>, remote_id: String) -> Result<(), String> {
+    let tabs = tabs.inner().clone();
+    tabs.dock(&remote_id).await
 }
 
 /// Viewer: ask the host for a fresh keyframe (clears smear after packet loss).
 #[tauri::command]
-pub fn request_refresh(state: tauri::State<'_, AppState>) {
-    if let Some(id) = state.engine.active_session() {
+pub fn request_refresh(
+    state: tauri::State<'_, AppState>,
+    tabs: Tabs<'_>,
+    remote_id: Option<String>,
+) {
+    if let Some(id) = bar_session(&state, &tabs, remote_id.as_deref()) {
         state.engine.request_refresh(id);
     }
 }
@@ -239,8 +276,17 @@ pub fn request_refresh(state: tauri::State<'_, AppState>) {
 /// Switch the shared monitor mid-session (host: directly; viewer: asks the
 /// host, which needs control). The result arrives as a `displays` event.
 #[tauri::command]
-pub fn select_display(state: tauri::State<'_, AppState>, id: String) {
-    match state.engine.active_session() {
+pub fn select_display(
+    state: tauri::State<'_, AppState>,
+    tabs: Tabs<'_>,
+    remote_id: Option<String>,
+    id: String,
+) {
+    if matches!(state.engine.role(), Role::Host { .. }) && remote_id.is_none() {
+        state.engine.host_select_display(id);
+        return;
+    }
+    match bar_session(&state, &tabs, remote_id.as_deref()) {
         Some(viewer) => state.engine.select_display(viewer, id),
         None => state.engine.host_select_display(id),
     }
@@ -281,8 +327,13 @@ pub(crate) fn displays_json(
 /// Viewer: ask the host to also show monitor `id` in a separate window (D14;
 /// needs control). The window opens when the host's `displays` lists it.
 #[tauri::command]
-pub fn popout_display(state: tauri::State<'_, AppState>, id: String) {
-    if let Some(viewer) = state.engine.active_session() {
+pub fn popout_display(
+    state: tauri::State<'_, AppState>,
+    tabs: Tabs<'_>,
+    remote_id: Option<String>,
+    id: String,
+) {
+    if let Some(viewer) = bar_session(&state, &tabs, remote_id.as_deref()) {
         state.engine.popout_display(viewer, id);
     }
 }
@@ -306,10 +357,14 @@ pub(crate) fn display_label(d: &protocol::RemoteDisplay) -> String {
 /// the UI thread (macOS dispatches show/hide to the main thread).
 #[tauri::command]
 pub async fn set_video_visible(
+    window: tauri::Window,
     state: tauri::State<'_, AppState>,
     visible: bool,
 ) -> Result<(), String> {
-    state.engine.set_overlay(!visible).await;
+    // The calling window's video only (plans/09 J4).
+    let id = crate::windows::window_of(window.label())
+        .ok_or_else(|| format!("window {} shows no tab", window.label()))?;
+    state.engine.set_overlay(id, !visible).await;
     Ok(())
 }
 

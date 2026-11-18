@@ -32,9 +32,14 @@ pub enum UiEvent {
     /// The active workspace changed underneath the UI (a sync merged changes
     /// from another computer, or the account was switched): reload it.
     WorkspaceChanged,
-    /// The user pressed a tab-switch chord inside a session's video (D3,
-    /// 08a §6.19): it was taken out of the key stream, never forwarded.
-    TabShortcut(TabStep),
+    /// The user pressed a tab-switch chord inside `session`'s video (D3,
+    /// 08a §6.19): it was taken out of the key stream, never forwarded. The
+    /// app acts on it only when that video is in the main window (plans/09
+    /// Decision 2).
+    TabShortcut {
+        step: TabStep,
+        session: SessionId,
+    },
     /// Something happened in one session. `host`: this computer is the host
     /// of that session (it is being viewed or controlled).
     Session {
@@ -43,6 +48,29 @@ pub enum UiEvent {
         host: bool,
         ev: SessionEvent,
     },
+}
+
+/// An app window a session's video can be in (plans/09): `WindowId::MAIN`
+/// is the main window; the app numbers the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WindowId(pub u32);
+
+impl WindowId {
+    pub const MAIN: WindowId = WindowId(0);
+}
+
+/// Names one video surface the app made, in events about it (plans/09 W2):
+/// the address of the surface. Unique among the surfaces alive: the app
+/// holds each until it destroys it, and destroys it only after the engine
+/// let go of it (`SurfaceReleased` / `Released`), so no other surface can
+/// take the address while an event may still name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SurfaceTag(usize);
+
+impl SurfaceTag {
+    pub fn of(surface: &std::sync::Arc<dyn platform_api::VideoSurface>) -> Self {
+        SurfaceTag(std::sync::Arc::as_ptr(surface) as *const () as usize)
+    }
 }
 
 /// Which way a tab-switch chord goes (Ctrl+Alt+PageDown / PageUp; Cmd+Option
@@ -85,8 +113,14 @@ pub enum SessionEvent {
     Toast(String),
     /// The session's threads are joined and its decoder released: its video
     /// surface may now be destroyed (08a §5.2). Always follows
-    /// `Phase(Ended(..))`.
+    /// `Phase(Ended(..))`. It covers every surface the session held: its
+    /// current one and one a move was handing it to.
     Released,
+    /// The engine let go of `surface` (plans/09 W2): a move finished (the
+    /// old surface) or failed (the surface it was moving to). Destroy it.
+    SurfaceReleased {
+        surface: SurfaceTag,
+    },
 }
 
 /// Where a session is (08a §5.2).

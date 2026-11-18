@@ -31,7 +31,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) use events::SessionUi;
-pub use events::{EndReason, PwReason, SessionEvent, SessionId, SessionPhase, TabStep, UiEvent};
+pub use events::{
+    EndReason, PwReason, SessionEvent, SessionId, SessionPhase, SurfaceTag, TabStep, UiEvent,
+    WindowId,
+};
 pub use handshake::{ApprovalDecision, Decider};
 pub use workspace::WorkspaceSel;
 
@@ -127,6 +130,33 @@ impl std::fmt::Display for ConnectError {
 
 impl std::error::Error for ConnectError {}
 
+/// Why [`Engine::move_session`] refused (plans/09 W2, 09a §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveError {
+    /// No such viewer session.
+    NotFound,
+    /// The session ended or is ending.
+    Ended,
+    /// It is being started, or another move of it is still under way: one
+    /// at a time.
+    Busy,
+    /// That surface already belongs to a session (this one included).
+    SurfaceInUse,
+}
+
+impl std::fmt::Display for MoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            MoveError::NotFound => "That session is gone",
+            MoveError::Ended => "That session is ending",
+            MoveError::Busy => "That session is busy: try again in a moment",
+            MoveError::SurfaceInUse => "That window already shows a computer",
+        })
+    }
+}
+
+impl std::error::Error for MoveError {}
+
 /// A session to end, sent to the engine by a thread that holds no engine (a
 /// transport thread whose link died) or by a timer.
 pub(crate) struct EndRequest {
@@ -192,9 +222,10 @@ pub struct Engine {
     /// key without a reconnect. Kept equal to the workspace's preference.
     translate_modifiers: Arc<AtomicBool>,
     ice_policy: Mutex<IcePolicy>,
-    /// A web dialog (Settings, a confirm) is open over the video: no main
-    /// video is shown meanwhile (08a §6.18). Read by every session's view.
-    overlay: Arc<AtomicBool>,
+    /// The windows with a web dialog (Settings, a confirm) open over their
+    /// video: their video is hidden meanwhile (08a §6.18, plans/09 J4). Read
+    /// by every session's view.
+    overlays: session::active::Overlays,
     /// The ActiveGate's applier queue (session/active.rs): every main video
     /// is shown and hidden through it, in the order decided.
     view_ops: session::active::ViewOps,
@@ -259,7 +290,7 @@ impl Engine {
             platform,
             translate_modifiers,
             ice_policy: Mutex::new(IcePolicy::Full),
-            overlay: Arc::new(AtomicBool::new(false)),
+            overlays: Default::default(),
             view_ops: session::active::applier(&tokio::runtime::Handle::current()),
             hook_owner: Arc::new(Mutex::new(None)),
             tab_chord_keys: Default::default(),

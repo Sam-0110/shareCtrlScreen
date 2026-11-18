@@ -48,6 +48,7 @@ pub use keymap::{KeyId, Set1};
 pub use os::{Autostart, Clipboard, Paths, SecretStore, AUTOSTART_FLAG, MAX_TEXT_BYTES};
 pub use platform::{
     DisplayInfo, OsPermission, PermissionReport, PermissionState, Platform, PlatformInfo,
+    WindowActivity, WindowActivityFn, WindowWatch,
 };
 pub use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 pub use surface::{

@@ -204,6 +204,15 @@ impl Platform for LinuxPlatform {
         surface::create(window, display)
     }
 
+    fn watch_window(
+        &self,
+        window: RawWindowHandle,
+        _display: RawDisplayHandle,
+        on_change: platform_api::WindowActivityFn,
+    ) -> Result<Box<dyn platform_api::WindowWatch>, SurfaceError> {
+        surface::watch_window(window, on_change)
+    }
+
     fn create_injector(&self) -> Result<Box<dyn InputInjector>, InputError> {
         input::create(self.session, &self.paths().log_dir)
     }

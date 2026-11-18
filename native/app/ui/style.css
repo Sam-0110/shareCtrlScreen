@@ -346,6 +346,13 @@ select.input:disabled { opacity: 0.55; }
   cursor: pointer;
 }
 .tab-close:hover { background: var(--line); color: var(--fg); }
+/* A detached tab window (plans/09): no strip, no home page; its tab fills it. */
+body.window-mode .tab-strip,
+body.window-mode #screen-home { display: none; }
+body.window-mode .screen { height: 100%; }
+.btn-window-only { display: none; }
+body.window-mode .btn-window-only { display: inline-block; }
+body.window-mode .btn-main-only { display: none; }
 .tab .dot { flex: none; width: 8px; height: 8px; }
 .dot-grey { background: #4a5163; }
 .tab-new {

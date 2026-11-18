@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use super::{clean_remote_name, remote_name_key};
 use crate::sync::order::{between, spread};
 use crate::sync::tabs::MAX_ORDER_KEY_CHARS;
-use crate::sync::{SyncDoc, SyncEntry, SyncPref, SyncTab, SYNCED_PREFS};
+use crate::sync::{Pos, Size, SyncDoc, SyncEntry, SyncPref, SyncTab, WinState, SYNCED_PREFS};
 
 /// Most recents kept.
 pub const MAX_RECENTS: usize = 10;
@@ -222,6 +222,26 @@ impl Workspace {
         }
         let order = self.order_at_end(now);
         let tab = self.tabs.entry(key.clone()).or_default();
+        // Reopened: in the strip, its old window forgotten (09 §7.9), so a
+        // tab closed in a window does not come back in one.
+        if tab.closed_at > 0 {
+            if tab.detached {
+                tab.detached = false;
+                tab.detached_at = now.max(tab.detached_at);
+            }
+            if tab.size.is_some() {
+                tab.size = None;
+                tab.size_at = now.max(tab.size_at);
+            }
+            if tab.pos.is_some() {
+                tab.pos = None;
+                tab.pos_at = now.max(tab.pos_at);
+            }
+            if tab.state != WinState::Normal {
+                tab.state = WinState::Normal;
+                tab.state_at = now.max(tab.state_at);
+            }
+        }
         // Opened after its last close, wherever that close was stamped.
         tab.opened_at = now.max(tab.closed_at + 1);
         tab.order = order;
@@ -236,18 +256,24 @@ impl Workspace {
         let Some(key) = tab_key(id) else {
             return false;
         };
-        let open = self.open_tabs();
-        let Some(pos) = open.iter().position(|k| *k == key) else {
+        if !self.tabs.get(&key).is_some_and(TabRecord::is_open) {
             return false;
-        };
+        }
+        // The active tab is meant to be a docked one (one detached on another
+        // computer is tolerated: it has no docked position, so none is
+        // picked): its neighbours in the strip.
+        let docked = self.docked_tabs();
         if let Some(tab) = self.tabs.get_mut(&key) {
             tab.closed_at = now.max(tab.opened_at + 1);
         }
         if self.active_tab.as_deref() == Some(key.as_str()) {
-            self.active_tab = open
-                .get(pos + 1)
-                .or_else(|| pos.checked_sub(1).and_then(|p| open.get(p)))
-                .cloned();
+            let pos = docked.iter().position(|k| *k == key);
+            self.active_tab = pos.and_then(|pos| {
+                docked
+                    .get(pos + 1)
+                    .or_else(|| pos.checked_sub(1).and_then(|p| docked.get(p)))
+                    .cloned()
+            });
         }
         true
     }
@@ -313,6 +339,148 @@ impl Workspace {
             }
         }
     }
+    // ---- detached windows (plans/09, 09a §3.1, §5.1, §5.2) --------------------
+
+    /// The open tabs in the strip (not in a window of their own), in strip
+    /// order.
+    pub fn docked_tabs(&self) -> Vec<String> {
+        self.open_tabs()
+            .into_iter()
+            .filter(|k| !self.tabs[k].is_detached())
+            .collect()
+    }
+
+    /// The open tabs in a window of their own, in strip order.
+    pub fn detached_tabs(&self) -> Vec<String> {
+        self.open_tabs()
+            .into_iter()
+            .filter(|k| self.tabs[k].is_detached())
+            .collect()
+    }
+
+    /// Put `id`'s open tab in a window of its own. When it was the active
+    /// tab, the docked tab before it (else after it, else none) becomes
+    /// active. `false` when it is not an open, docked tab.
+    pub fn detach_tab(&mut self, id: &str, now: u64) -> bool {
+        let Some(key) = tab_key(id) else {
+            return false;
+        };
+        let docked = self.docked_tabs();
+        let Some(pos) = docked.iter().position(|k| *k == key) else {
+            return false;
+        };
+        if let Some(tab) = self.tabs.get_mut(&key) {
+            tab.detached = true;
+            tab.detached_at = now.max(tab.detached_at);
+        }
+        if self.active_tab.as_deref() == Some(key.as_str()) {
+            self.active_tab = pos
+                .checked_sub(1)
+                .and_then(|p| docked.get(p))
+                .or_else(|| docked.get(pos + 1))
+                .cloned();
+        }
+        true
+    }
+
+    /// Record whether `id`'s open tab is in a window of its own, stamped
+    /// only when it changes. Unlike [`detach_tab`](Self::detach_tab) /
+    /// [`dock_tab`](Self::dock_tab) it does not look at what the account
+    /// last said: a computer's own windows are its own until the next
+    /// sign-in (plans/09 J6), so the app records what it did. `false` when
+    /// it is not an open tab.
+    pub fn set_detached(&mut self, id: &str, detached: bool, now: u64) -> bool {
+        let Some(tab) = tab_key(id).and_then(|k| self.tabs.get_mut(&k)) else {
+            return false;
+        };
+        if !tab.is_open() {
+            return false;
+        }
+        // A detach counts only when stamped after the opening (`is_detached`).
+        if tab.detached != detached || (detached && tab.detached_at <= tab.opened_at) {
+            tab.detached = detached;
+            tab.detached_at = now.max(tab.detached_at).max(tab.opened_at + 1);
+        }
+        true
+    }
+
+    /// Put `id`'s detached tab back in the strip, at its end, as the active
+    /// tab. `false` when it is not an open, detached tab.
+    pub fn dock_tab(&mut self, id: &str, now: u64) -> bool {
+        let Some(key) = tab_key(id) else {
+            return false;
+        };
+        if !self.tabs.get(&key).is_some_and(SyncTab::is_detached) {
+            return false;
+        }
+        if let Some(tab) = self.tabs.get_mut(&key) {
+            tab.detached = false;
+            tab.detached_at = now.max(tab.detached_at);
+            // A docked tab is not minimised; its next window opens normal
+            // (or maximised, as it was).
+            if tab.state == WinState::Minimized {
+                tab.state = WinState::Normal;
+                tab.state_at = now.max(tab.state_at);
+            }
+        }
+        self.move_tab(&key, None, now);
+        self.active_tab = Some(key);
+        true
+    }
+
+    /// Record `id`'s window state. Stamped only when it changes. `false`
+    /// when it is not an open tab.
+    pub fn set_window_state(&mut self, id: &str, state: WinState, now: u64) -> bool {
+        let Some(tab) = tab_key(id).and_then(|k| self.tabs.get_mut(&k)) else {
+            return false;
+        };
+        if !tab.is_open() {
+            return false;
+        }
+        // Against what counts (`window_state`): a value from before the
+        // last reopen is stale, so recording it again must stamp it anew.
+        if tab.window_state() != state || tab.state_at <= tab.opened_at {
+            tab.state = state;
+            tab.state_at = now.max(tab.state_at).max(tab.opened_at + 1);
+        }
+        true
+    }
+
+    /// Record `id`'s window size and, when this computer knows it, its
+    /// position (`None`: unknown here, e.g. Wayland — a position saved
+    /// elsewhere is kept, 09a J9). Each stamped only when it changes. `false`
+    /// when it is not an open tab.
+    pub fn set_placement(&mut self, id: &str, size: Size, pos: Option<Pos>, now: u64) -> bool {
+        let Some(tab) = tab_key(id).and_then(|k| self.tabs.get_mut(&k)) else {
+            return false;
+        };
+        if !tab.is_open() {
+            return false;
+        }
+        // Within a rounding step of what is saved: unchanged. A window put
+        // back from its saved shares can read back a share off by one; that
+        // must not re-stamp (and re-sync) it on every launch.
+        // Compared with what counts (`window_size` / `window_pos`): a value
+        // from before the last reopen is stale and is stamped anew.
+        let opened = tab.opened_at;
+        if !tab
+            .window_size()
+            .is_some_and(|s| near(s.w, size.w) && near(s.h, size.h))
+        {
+            tab.size = Some(size);
+            tab.size_at = now.max(tab.size_at).max(opened + 1);
+        }
+        let current = tab.window_pos();
+        let moved = |p: &Pos| {
+            !current.is_some_and(|q| q.monitor == p.monitor && near(q.x, p.x) && near(q.y, p.y))
+        };
+        if let Some(pos) = pos.filter(moved) {
+            tab.pos = Some(pos);
+            tab.pos_at = now.max(tab.pos_at).max(opened + 1);
+        }
+        true
+    }
+
     /// The name given to `id`, if any.
     pub fn remote_name(&self, id: &str) -> Option<&str> {
         let key = remote_name_key(id)?;
@@ -547,9 +715,7 @@ impl Workspace {
             if !crate::is_valid_uuid_v4(&id) || !crate::sync::valid_order_key(&tab.order) {
                 continue;
             }
-            tab.order_at = tab.order_at.min(max_stamp);
-            tab.opened_at = tab.opened_at.min(max_stamp);
-            tab.closed_at = tab.closed_at.min(max_stamp);
+            tab.clamp_stamps(max_stamp);
             self.tabs.insert(id, tab);
         }
         // `max_stamp` is now plus the slack: the same 90-day rule as the sync.
@@ -605,6 +771,11 @@ impl Workspace {
     }
 }
 
+/// Two placement shares that differ by at most a rounding step.
+fn near(a: u16, b: u16) -> bool {
+    a.abs_diff(b) <= 2
+}
+
 /// A tab's key: the remote ID, lower-cased; `None` for anything else.
 fn tab_key(id: &str) -> Option<String> {
     let key = id.trim().to_lowercase();
@@ -629,6 +800,66 @@ mod tests {
         assert_eq!(w.open_tabs(), [T2, T1]);
         assert_eq!(w.open_tab("not-an-id", 13), None);
         assert_eq!(w.open_tab_count(), 2);
+    }
+
+    #[test]
+    fn detaching_and_docking_keep_the_strip_and_the_active_tab_right() {
+        let mut w = Workspace::default();
+        for (i, t) in [T1, T2, T3].iter().enumerate() {
+            w.open_tab(t, 10 + i as u64);
+        }
+        w.active_tab = Some(T2.into());
+        assert!(w.detach_tab(T2, 20));
+        assert_eq!(w.active_tab.as_deref(), Some(T1), "the tab before it");
+        assert_eq!(w.docked_tabs(), [T1, T3]);
+        assert_eq!(w.detached_tabs(), [T2]);
+        assert!(!w.detach_tab(T2, 21), "already detached");
+        w.active_tab = Some(T1.into());
+        assert!(w.detach_tab(T1, 22));
+        assert_eq!(
+            w.active_tab.as_deref(),
+            Some(T3),
+            "none before: the one after"
+        );
+        // Closing a detached tab leaves the active tab alone.
+        assert!(w.close_tab(T1, 23));
+        assert_eq!(w.active_tab.as_deref(), Some(T3));
+        // Dock: at the end of the strip, active.
+        assert!(w.dock_tab(T2, 24));
+        assert_eq!(w.docked_tabs(), [T3, T2]);
+        assert_eq!(w.active_tab.as_deref(), Some(T2));
+        assert!(!w.dock_tab(T2, 25), "already docked");
+    }
+
+    #[test]
+    fn placement_is_stamped_on_change_and_a_reopen_forgets_the_window() {
+        let mut w = Workspace::default();
+        w.open_tab(T1, 10);
+        w.detach_tab(T1, 11);
+        let size = Size { w: 5000, h: 5000 };
+        let pos = Pos {
+            monitor: 0,
+            x: 10,
+            y: 20,
+        };
+        assert!(w.set_placement(T1, size, Some(pos), 12));
+        assert!(w.set_window_state(T1, WinState::Maximized, 12));
+        // Same values later: stamps stay; no position known: it stays.
+        w.set_placement(T1, size, None, 30);
+        w.set_window_state(T1, WinState::Maximized, 30);
+        let t = &w.tabs[T1];
+        assert_eq!((t.size_at, t.pos_at, t.state_at), (12, 12, 12));
+        assert_eq!(t.pos, Some(pos));
+        w.close_tab(T1, 40);
+        assert!(!w.set_placement(T1, size, None, 41), "closed");
+        w.open_tab(T1, 50);
+        let t = &w.tabs[T1];
+        assert!(!t.detached && t.size.is_none() && t.pos.is_none());
+        assert_eq!(t.state, WinState::Normal);
+        assert_eq!(
+            (t.detached_at, t.size_at, t.pos_at, t.state_at),
+            (50, 50, 50, 50)
+        );
     }
 
     #[test]
@@ -1002,6 +1233,7 @@ mod tests {
             order_at: 1,
             opened_at: opened,
             closed_at: closed,
+            ..SyncTab::default()
         };
         ws.tabs
             .insert(X.into(), tab(1, now - crate::sync::CLOSED_TAB_TTL_MS - 1));

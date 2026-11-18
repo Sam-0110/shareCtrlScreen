@@ -51,6 +51,7 @@ mod displays;
 #[cfg(test)]
 mod golden_tests;
 pub mod gpu;
+mod winwatch;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -207,6 +208,21 @@ impl Platform for WindowsPlatform {
 
     fn create_shortcut_hook(&self) -> Option<Box<dyn ShortcutHook>> {
         Some(Box::new(adapters::LowLevelKeyHook::default()))
+    }
+
+    fn watch_window(
+        &self,
+        window: RawWindowHandle,
+        _display: RawDisplayHandle,
+        on_change: platform_api::WindowActivityFn,
+    ) -> Result<Box<dyn platform_api::WindowWatch>, SurfaceError> {
+        let RawWindowHandle::Win32(h) = window else {
+            return Err(SurfaceError::UnsupportedHandle);
+        };
+        Ok(Box::new(winwatch::ActivationWatch::install(
+            h.hwnd.get(),
+            on_change,
+        )?))
     }
 
     fn create_clipboard(&self) -> Box<dyn Clipboard> {

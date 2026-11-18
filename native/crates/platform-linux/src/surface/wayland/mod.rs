@@ -432,7 +432,7 @@ pub(crate) struct WaylandSurface {
     handles: Option<KeptHandles>,
 }
 
-fn wl_surface_of(window: &gdk::Window) -> Option<NonNull<c_void>> {
+pub(super) fn wl_surface_of(window: &gdk::Window) -> Option<NonNull<c_void>> {
     let ptr: *mut gdk::ffi::GdkWindow = window.to_glib_none().0;
     // SAFETY: a live GdkWindow of the Wayland backend (`create` checked the
     // display); returns its wl_surface or NULL while it has none (unmapped).

@@ -24,8 +24,11 @@ mod gtk_host;
 mod keys;
 mod presenter;
 mod wayland;
+mod winwatch;
 mod x11;
 mod xdnd;
+
+pub(crate) use winwatch::watch as watch_window;
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 

@@ -16,6 +16,8 @@ executed **in one go**, in parallel lanes — see [05-TASKS.md](05-TASKS.md).
 | [07-CODEBASE-SEAMS.md](07-CODEBASE-SEAMS.md) | File-by-file: what is Windows-bound, what is portable, known bugs to fix in the split |
 | [08-MULTI-SESSION-TABS.md](08-MULTI-SESSION-TABS.md) | Viewer tabs (several remotes at once), nameable tabs saved and synced per account, synced preferences: design, step S + phases P0–P8, decisions |
 | [08a-STRUCTURE-AND-FLOWS.md](08a-STRUCTURE-AND-FLOWS.md) | How tabs are built: layering, file layout, types, commands/events, state machines, every flow, invariants |
+| [09-DETACHABLE-TABS.md](09-DETACHABLE-TABS.md) | Detachable tab windows (several remotes live at once, each in its own window), placement synced per account: design, phases W1–W5 + Final, decisions, design review |
+| [09a-STRUCTURE-AND-FLOWS.md](09a-STRUCTURE-AND-FLOWS.md) | How detached windows are built: ownership, sync schema, engine and platform API, state machines, flows, invariants J1–J10 |
 | [appendix-codemap/](appendix-codemap/) | The raw per-subsystem maps from the 20-reader code sweep (line-level) |
 | [../.claude/skills/orchestrate/SKILL.md](../.claude/skills/orchestrate/SKILL.md) | **How planned work is run** (`/orchestrate`): design review, builder and reviewer briefs, the build lane, the merge gate, releasing, hardware hand-off |
 | [checklists/](checklists/) | Tester checklists for hardware-verified tasks |

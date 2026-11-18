@@ -20,7 +20,16 @@ import { reloadConfig, syncNameField, wireConnect } from './connect.js';
 import { wireHost } from './host.js';
 import { wireSession } from './session.js';
 import { applyPlatformInfo, checkForUpdates, preflight, wireSettings } from './settings.js';
-import { S, overlaysReset, render, setBanner, setState, setStatus, toast } from './state.js';
+import {
+  S,
+  overlaysReset,
+  render,
+  setBanner,
+  setState,
+  setStatus,
+  toast,
+  windowRemote
+} from './state.js';
 import { loadTabs, wireTabs } from './tabs.js';
 
 // The server link is up: green dot, no banner, and an offline app becomes ready.
@@ -29,6 +38,9 @@ function serverConnected() {
   setBanner('');
   if (S.state === 'OFFLINE') setState('READY');
 }
+
+// A detached tab window (plans/09): the same page, showing one tab.
+if (windowRemote) document.body.classList.add('window-mode');
 
 wireAccounts();
 wireSettings();
@@ -52,7 +64,10 @@ api.on('server-status', (e) => {
   }
 });
 
-api.on('toast', (e) => toast(e.payload.message || '', 'error'));
+// The computer's own messages show in the main window only.
+api.on('toast', (e) => {
+  if (!windowRemote) toast(e.payload.message || '', 'error');
+});
 
 // ---- boot ------------------------------------------------------------------
 (async () => {
@@ -77,6 +92,8 @@ api.on('toast', (e) => toast(e.payload.message || '', 'error'));
   } catch (_) {
     /* command unavailable (older engine) — the event path still covers it */
   }
+  // The rest is the main window's (a detached window shows one tab).
+  if (windowRemote) return;
   // Before the first host session: sharing the screen needs the OS grant, and
   // a connection arriving later is better met with it already in place.
   if (!S.hostPreflightDone) {
