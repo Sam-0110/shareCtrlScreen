@@ -412,9 +412,46 @@ impl Encoder {
     }
 
     /// Pull one compressed sample via `ProcessOutput` and copy its bytes out.
-    /// When the MFT does not provide its own output samples (software encoders),
-    /// hand it one sized from `GetOutputStreamInfo`.
+    ///
+    /// An encoder may change its own output format once it has seen real
+    /// input (several Intel/AMD hardware H.264 MFTs do, on the first frames):
+    /// `ProcessOutput` then fails with `MF_E_TRANSFORM_STREAM_CHANGE` and
+    /// produces nothing until the client accepts the new type. Treating that
+    /// as an error left the async MFT waiting on an output nobody collected —
+    /// it never raised another event, so the host sent no video at all (a
+    /// black screen on the viewer, field logs 2026-11-18). Per Microsoft's
+    /// "Handling Stream Changes" contract: take the type it now offers
+    /// (`GetOutputAvailableType`), set it, and call `ProcessOutput` again.
     fn drain_output(&self) -> Result<Option<EncodedFrame>, Error> {
+        // One renegotiation per call is all the contract needs; a second
+        // stream change in a row means the encoder is broken — report it.
+        for attempt in 0..2 {
+            match self.process_output_once() {
+                Err(Error::Win(e)) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE && attempt == 0 => {
+                    self.accept_new_output_type()?;
+                }
+                other => return other,
+            }
+        }
+        unreachable!("the loop returns on its second pass")
+    }
+
+    /// The encoder changed its output format (`MF_E_TRANSFORM_STREAM_CHANGE`):
+    /// adopt the type it now offers.
+    fn accept_new_output_type(&self) -> Result<(), Error> {
+        // SAFETY: configured transform; the type it offers is set back on it.
+        unsafe {
+            let mt = self.transform.GetOutputAvailableType(self.output_id, 0)?;
+            self.transform.SetOutputType(self.output_id, &mt, 0)?;
+        }
+        tracing::info!("encoder: the encoder changed its output format — accepted, continuing");
+        Ok(())
+    }
+
+    /// One `ProcessOutput` call. When the MFT does not provide its own output
+    /// samples (software encoders), hand it one sized from
+    /// `GetOutputStreamInfo`.
+    fn process_output_once(&self) -> Result<Option<EncodedFrame>, Error> {
         // SAFETY: stream-info query + optional sample/buffer construction.
         let provided: Option<IMFSample> = unsafe {
             let info = self.transform.GetOutputStreamInfo(self.output_id)?;
@@ -458,6 +495,10 @@ impl Encoder {
             // MF_E_TRANSFORM_NEED_MORE_INPUT is normal — no output yet.
             if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT {
                 return Ok(None);
+            }
+            // Handled by the caller (`drain_output`); not worth a warning.
+            if e.code() == MF_E_TRANSFORM_STREAM_CHANGE {
+                return Err(Error::Win(e));
             }
             tracing::warn!(
                 "encoder: ProcessOutput failed hr={:#010x} status={:#x}",
