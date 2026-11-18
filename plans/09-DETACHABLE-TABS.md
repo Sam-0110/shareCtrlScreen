@@ -204,13 +204,16 @@ The owner's first Mac → Windows run on 2.3.0 (Mac and Windows app.logs, 2026-1
   does not expect; unconfirmed until the host logs it. Not a plan-09 regression: AV1 between
   machines had never run on devices. Fix:
   the host puts every AV1 temporal unit in the sized low-overhead form, converting Annex B and
-  unsized OBUs (`engine/src/media/av1.rs`) and logging which form the encoder gave; viewers log
+  unsized OBUs (`engine/src/media/av1.rs`; the form is decided once, on a key frame or a unit of
+  128 bytes or more, so small units are never misread; a key frame without a sequence header gets
+  the last one) and logs the form and its first key frame's bytes; viewers log
   the first bytes of an access unit no decoder takes. Device-pending: the next Mac → Windows run.
 * **Strip and session bar not clickable on the Mac** while no picture was ever drawn — the
   video view sat over the page (M14). Fix: the view never takes clicks in the band the top
   inset leaves to the page; the native Tabs menu gains Move Tab to New Window / to Main Window
   (the session bar sits under the video on macOS). Mac → Linux worked, so the band is the
-  suspect, not the layout. Device-pending.
+  suspect, not the layout; the view logs its first strip-band click for the next report.
+  Device-pending.
 
 ## 5. Decisions (owner, 2026-11-18)
 

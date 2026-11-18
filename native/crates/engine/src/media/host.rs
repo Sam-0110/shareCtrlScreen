@@ -420,9 +420,9 @@ pub(crate) fn host_media_loop(
     };
     // Encoder shares the capture device (§5c zero-copy).
     let mut encoder = codecs.new_encoder(cap.device(), cfg)?;
-    // AV1: what form the encoder's temporal units come in, logged once (and
-    // again if it changes), as they are put in the form RTP expects.
-    let mut av1_form: Option<media_av1::Form> = None;
+    // AV1: the encoder's temporal units in the form RTP expects (decided
+    // once, logged; see media/av1.rs).
+    let mut av1 = media_av1::Normalizer::default();
     tracing::info!(
         "host: capture+encoder ready ({}x{} @{}fps, {}, {} kbps)",
         cfg.width,
@@ -515,6 +515,8 @@ pub(crate) fn host_media_loop(
                                     // Encoder first: it may hold a reference into
                                     // the old capture's device.
                                     encoder = e;
+                                    // A new encoder (new size): its own sequence header comes next.
+                                    av1.encoder_changed();
                                     cap = new_cap;
                                     cfg = new_cfg;
                                     (cap_w, cap_h) = (w, h);
@@ -607,6 +609,8 @@ pub(crate) fn host_media_loop(
             match codecs.new_encoder(cap.device(), cfg) {
                 Ok(e) => {
                     encoder = e;
+                    // A new encoder (new size): its own sequence header comes next.
+                    av1.encoder_changed();
                     encoder.force_keyframe(); // new SPS/PPS — restart the decoder
                     applied_bitrate = cfg.bitrate_bps;
                     encoder_size = want;
@@ -764,21 +768,7 @@ pub(crate) fn host_media_loop(
                                 );
                             }
                             let data = if codec == Codec::Av1 {
-                                let (data, form) = media_av1::normalize(u.data);
-                                if av1_form != Some(form) {
-                                    av1_form = Some(form);
-                                    match form {
-                                        media_av1::Form::Unknown => tracing::warn!(
-                                            "host: AV1 encoder output is neither low-overhead \
-                                             nor Annex B; sent as is (first bytes: {})",
-                                            media_av1::hex_prefix(&data)
-                                        ),
-                                        other => {
-                                            tracing::info!("host: AV1 encoder output: {other:?}")
-                                        }
-                                    }
-                                }
-                                data
+                                av1.normalize(u.data, u.keyframe)
                             } else {
                                 u.data
                             };

@@ -126,6 +126,8 @@ pub(crate) struct ViewIvars {
     /// A pointer event reached the view since it was last shown or hidden
     /// (for the one-time "events arrive" debug line).
     pointer_seen: Cell<bool>,
+    /// The first click-test in the strip band was logged (M14 diagnostics).
+    band_hit_logged: Cell<bool>,
     /// Task M15: a fully transparent cursor. While this viewer controls, it is
     /// set over the whole video rect (`resetCursorRects`) so the OS pointer is
     /// invisible there and only the drawn D10 sprite shows. AppKit scopes it to
@@ -173,6 +175,14 @@ define_class!(
         #[unsafe(method(hitTest:))]
         fn hit_test(&self, point: NSPoint) -> Option<Retained<NSView>> {
             if self.in_page_band(point) {
+                if !self.ivars().band_hit_logged.replace(true) {
+                    tracing::debug!(
+                        "video view: a click in the strip band ({:.0},{:.0}) goes to the page (view frame {:?})",
+                        point.x,
+                        point.y,
+                        self.frame()
+                    );
+                }
                 return None;
             }
             // SAFETY: forwarding the same selector to NSView.
@@ -541,6 +551,7 @@ impl VideoView {
             layer: layer.clone(),
             reveal: Cell::new(Reveal::default()),
             pointer_seen: Cell::new(false),
+            band_hit_logged: Cell::new(false),
             wheel: Cell::new(WheelAccumulator::default()),
             blank_cursor: blank_cursor(),
         });

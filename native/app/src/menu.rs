@@ -243,9 +243,10 @@ pub(crate) fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::Menu
         "menu-tab-detach" => {
             if let Some(tabs) = tabs_of(app) {
                 if let (None, Some(remote)) = (tabs.window_in_use(), tabs.shown_remote()) {
+                    let app = app.clone();
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = tabs.detach(&remote).await {
-                            tracing::info!("menu detach: {e}");
+                            let _ = app.emit("toast", serde_json::json!({ "message": e }));
                         }
                     });
                 }
@@ -254,9 +255,10 @@ pub(crate) fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::Menu
         "menu-tab-dock" => {
             if let Some(tabs) = tabs_of(app) {
                 if let Some((_, remote)) = tabs.window_in_use() {
+                    let app = app.clone();
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = tabs.dock(&remote).await {
-                            tracing::info!("menu dock: {e}");
+                            let _ = app.emit("toast", serde_json::json!({ "message": e }));
                         }
                     });
                 }

@@ -225,7 +225,10 @@ pub(crate) fn viewer_media_loop(
                     // AV1 MFT) can stall on nonsense timestamps like 1,2,3….
                     ts += 166_667;
                     match decoder.decode(&au, keyframe, ts) {
-                        Ok(Some(_)) => note_decoded(&mut rendered, &mut undecoded_streak, skipped),
+                        Ok(Some(_)) => {
+                            note_decoded(&mut rendered, &mut undecoded_streak, skipped);
+                            decode_errors = 0;
+                        }
                         Ok(None) => {
                             on_no_picture(&mut undecoded_streak, &mut last_kf_req, &ctl_tx, slot)
                         }
