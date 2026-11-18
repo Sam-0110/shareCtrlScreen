@@ -173,7 +173,9 @@ define_class!(
         /// 2.3.0 Mac report had the strip visible but not clickable while
         /// the video showed nothing (M14).
         #[unsafe(method(hitTest:))]
-        fn hit_test(&self, point: NSPoint) -> Option<Retained<NSView>> {
+        // A raw pointer: `define_class!` methods return encodable types, and
+        // `hitTest:` returns its view unretained (+0), as NSView's does.
+        fn hit_test(&self, point: NSPoint) -> *mut NSView {
             if self.in_page_band(point) {
                 if !self.ivars().band_hit_logged.replace(true) {
                     tracing::debug!(
@@ -183,9 +185,10 @@ define_class!(
                         self.frame()
                     );
                 }
-                return None;
+                return std::ptr::null_mut();
             }
-            // SAFETY: forwarding the same selector to NSView.
+            // SAFETY: forwarding the same selector to NSView, which returns an
+            // unretained view (or nil) that we hand on as it is.
             unsafe { msg_send![super(self), hitTest: point] }
         }
 

@@ -192,7 +192,7 @@ Wayland: size and state only, documented. macOS: minimise / restore and focus ev
 `Resized`), key window vs first responder for the focused session. Windows: placement across
 mixed-DPI monitors (`ScaleFactorChanged`). Device checklists `checklists/DETACH-W*.md`.
 
-### Device findings (2.3.1)
+### Device findings (2.3.1; released as 2.3.2 — 2.3.1's macOS build failed to compile)
 
 The owner's first Mac → Windows run on 2.3.0 (Mac and Windows app.logs, 2026-11-18):
 
