@@ -585,15 +585,23 @@ impl VideoSurface for ChildWindowSurface {
         let hwnd = self
             .live()
             .ok_or_else(|| SurfaceError::Backend("the video window was destroyed".into()))?;
-        let dev = create_render_device()?;
-        let renderer = render::Renderer::new(&dev, HWND(hwnd as *mut _), 1920, 1080)
-            .map_err(|e| SurfaceError::Backend(format!("renderer: {e}")))?;
-        Ok(Box::new(D3dPresenter {
-            renderer,
-            hwnd,
-            device: D3d11Device(dev),
-            upload: crate::cpu::Nv12Upload::default(),
-        }))
+        d3d_presenter(hwnd, create_render_device()?)
+    }
+    /// The decoder's own D3D11 device (plans/09 W2): its output textures can
+    /// only be drawn by a swap chain on that device. One device then serves
+    /// every window the session was in; the decoder and the presenter use its
+    /// immediate context from the one media thread only.
+    fn create_presenter_on(
+        &self,
+        device: Option<&dyn Any>,
+    ) -> Result<Box<dyn Presenter>, SurfaceError> {
+        let hwnd = self
+            .live()
+            .ok_or_else(|| SurfaceError::Backend("the video window was destroyed".into()))?;
+        let dev = device
+            .and_then(|d| d.downcast_ref::<D3d11Device>())
+            .ok_or_else(|| SurfaceError::Backend("not a D3D11 device".into()))?;
+        d3d_presenter(hwnd, dev.0.clone())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -621,6 +629,21 @@ impl VideoSurface for ChildWindowSurface {
             render::window::destroy(self.hwnd);
         }
     }
+}
+
+/// A presenter drawing into `hwnd` with device `dev`.
+fn d3d_presenter(
+    hwnd: isize,
+    dev: windows::Win32::Graphics::Direct3D11::ID3D11Device,
+) -> Result<Box<dyn Presenter>, SurfaceError> {
+    let renderer = render::Renderer::new(&dev, HWND(hwnd as *mut _), 1920, 1080)
+        .map_err(|e| SurfaceError::Backend(format!("renderer: {e}")))?;
+    Ok(Box::new(D3dPresenter {
+        renderer,
+        hwnd,
+        device: D3d11Device(dev),
+        upload: crate::cpu::Nv12Upload::default(),
+    }))
 }
 
 struct D3dPresenter {

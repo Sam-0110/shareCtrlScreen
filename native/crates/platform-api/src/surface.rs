@@ -107,6 +107,26 @@ pub trait VideoSurface: Send + Sync {
     fn set_drop_sink(&self, sink: Option<Sender<FileDrop>>);
     /// Create the presenter for this surface. Called on the viewer media thread.
     fn create_presenter(&self) -> Result<Box<dyn Presenter>, SurfaceError>;
+    /// Create a presenter for this surface that draws the frames of a decoder
+    /// made for `device` (another presenter's [`Presenter::device`]). A
+    /// session moving to another window keeps its decoder (plans/09 W2): a
+    /// new decoder would need a keyframe, and an idle host sends none until
+    /// its screen changes. Called on the viewer media thread.
+    ///
+    /// Default: `None` (a presenter that shares no device; the decoder hands
+    /// it frames any presenter can draw) makes an ordinary presenter; a device
+    /// this backend cannot draw from is refused.
+    fn create_presenter_on(
+        &self,
+        device: Option<&dyn Any>,
+    ) -> Result<Box<dyn Presenter>, SurfaceError> {
+        match device {
+            None => self.create_presenter(),
+            Some(_) => Err(SurfaceError::Backend(
+                "this video view cannot draw another view's decoded frames".into(),
+            )),
+        }
+    }
     /// Backend escape hatch (e.g. the Windows shortcut hook needs the HWND).
     fn as_any(&self) -> &dyn Any;
     /// Native handles for window-level backends (see [`SurfaceHandles`]).

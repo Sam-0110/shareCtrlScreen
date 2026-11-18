@@ -587,6 +587,11 @@ pub struct SurfaceState {
     /// Task D10: the latest [`VideoSurface::set_cursor_control`] value, so a
     /// test can assert the OS cursor would be hidden / restored.
     pub cursor_control: bool,
+    /// Tests set it to make presenter creation fail (a window that could
+    /// not get a swap chain), e.g. to exercise a failed handover.
+    pub refuse_presenter: bool,
+    /// Whether an input sink is installed (input is being captured).
+    pub has_input_sink: bool,
 }
 
 /// Recording [`VideoSurface`]; tests drive "user input" with
@@ -696,12 +701,16 @@ impl VideoSurface for MockSurface {
                 }
             }
         }
+        s.has_input_sink = sink.is_some();
         s.input_sink = sink;
     }
     fn set_drop_sink(&self, sink: Option<Sender<FileDrop>>) {
         lock(&self.state).drop_sink = sink;
     }
     fn create_presenter(&self) -> Result<Box<dyn Presenter>, SurfaceError> {
+        if lock(&self.state).refuse_presenter {
+            return Err(SurfaceError::Backend("mock: no presenter".into()));
+        }
         Ok(Box::new(MockPresenter {
             state: self.state.clone(),
             sprite: None,

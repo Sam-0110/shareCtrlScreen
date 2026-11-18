@@ -126,8 +126,9 @@ pub(super) struct Driver {
     pub(super) stop: Arc<AtomicBool>,
     /// OS services: the host creates its injector and clipboard from this.
     pub(super) platform: Arc<dyn Platform>,
-    /// Viewer: the video surface (hidden on link trouble / death).
-    pub(super) surface: Option<Arc<dyn VideoSurface>>,
+    /// Viewer: the session's current surface (plans/09 W2), let go when
+    /// the link dies.
+    pub(super) surface: Option<Arc<super::current::SurfaceCell>>,
     /// Viewer: the main video's gate. The link-trouble hide and the restore
     /// go through it, never straight to the surface (B4).
     pub(super) view: Option<Arc<super::active::SessionView>>,
@@ -220,13 +221,13 @@ pub(super) fn transport_driver(d: Driver) {
                 // last decoded frame while the app thinks it is idle — the
                 // "it just froze instead of disconnecting" report. Input capture
                 // goes with it so a dead session can't still grab keystrokes.
-                if let Some(s) = &surface {
+                if let Some(cell) = &surface {
                     // Through the gate, so it is ordered after any show it queued.
                     if let Some(v) = &view {
                         v.retire();
                     }
-                    s.set_input_sink(None);
-                    s.set_drop_sink(None);
+                    // No more moves; input and drops stop.
+                    cell.retire();
                 }
                 for s in popout_surfaces(&shared) {
                     s.hide();
@@ -898,8 +899,8 @@ pub(super) fn transport_driver(d: Driver) {
                                 Ok(protocol::ControlMsg::Perm { value }) if !host_side => {
                                     let control = value == protocol::Permission::Control;
                                     shared.control.store(control, Ordering::SeqCst);
-                                    if let Some(s) = &surface {
-                                        s.set_cursor_control(control);
+                                    if let Some(cell) = &surface {
+                                        cell.set_cursor_control(control);
                                     }
                                     for p in shared.popouts.lock().values() {
                                         p.shared.control.store(control, Ordering::SeqCst);

@@ -12,6 +12,7 @@
 pub(crate) mod active;
 mod clipboard;
 mod ctl_queue;
+pub(crate) mod current;
 mod driver;
 mod files;
 mod ice;
@@ -306,6 +307,9 @@ struct HookInputs {
     focused: bool,
     on_screen: bool,
     stopped: bool,
+    /// A move asked for the hook to come down and go up again on the new
+    /// window; cleared by the shortcut thread once its hook is down.
+    rebind: bool,
     /// The last decision.
     wanted: bool,
 }
@@ -370,7 +374,25 @@ impl Activity {
             self.generation.fetch_add(1, Ordering::SeqCst);
         }
         h.wanted = wanted;
-        self.hook_quit.store(!wanted, Ordering::SeqCst);
+        // A pending re-install holds the hook down until the shortcut thread
+        // has seen it (a quick re-decision must not hide it from that thread).
+        self.hook_quit.store(!wanted || h.rebind, Ordering::SeqCst);
+    }
+
+    /// The session moved to another surface (plans/09 W2): a hook installed
+    /// on the old one's window comes down and the shortcut thread installs it
+    /// again on the new one ([`take_rebind`](Self::take_rebind)).
+    pub(crate) fn rebind(&self, view: &active::SessionView) {
+        self.decide(view, |h| h.rebind = true);
+    }
+
+    /// The shortcut thread, before it claims: a move asked for a re-install,
+    /// and the hook it ran (if any) is down — decide again without it.
+    fn take_rebind(&self, view: &active::SessionView) {
+        let pending = self.hook.lock().rebind;
+        if pending {
+            self.decide(view, |h| h.rebind = false);
+        }
     }
 
     /// Whether the shortcut hook is wanted right now.
@@ -670,7 +692,8 @@ pub(crate) fn begin_host(
 /// What a viewer session needs from its registry slot to start.
 pub(crate) struct ViewerStart {
     pub(crate) peer: String,
-    pub(crate) surface: Option<Arc<dyn platform_api::VideoSurface>>,
+    /// Its current surface (plans/09 W2).
+    pub(crate) surface: Option<Arc<current::SurfaceCell>>,
     pub(crate) codec: platform_api::Codec,
     pub(crate) host_os: OsFamily,
     /// The host pauses a background tab's video on request (P6).
@@ -698,11 +721,14 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
     // session while it is being built.
     #[cfg(feature = "test-hooks")]
     std::thread::sleep(engine.test_viewer_start_delay());
-    let Some(surface) = surface else {
+    let Some(cell) = surface else {
         tracing::error!("viewer: no video surface on this platform");
         engine.fail_session(id, "this computer cannot display the remote screen yet");
         return;
     };
+    // Moves wait while the session is starting (`Busy`), so this is the
+    // surface it starts on; a move later goes through the cell.
+    let surface = cell.current();
     let ui = engine.session_ui(id, &peer, false);
     let platform = engine.platform();
     let prefs = engine.prefs();
@@ -762,6 +788,7 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
         engine.overlays(),
         engine.view_ops(),
     );
+    view.set_window(cell.window());
     let (activity, clip_wake) = Activity::new(prefs.clipboard_sync, false);
     let activity = Arc::new(activity);
     engine.attach_gate(
@@ -798,7 +825,7 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
             KeyTranslator::new(viewer_os, host_os, engine.translate_modifiers_handle())
                 .with_tab_shortcuts(
                     Box::new(move |step| {
-                        let _ = ui.send(crate::UiEvent::TabShortcut(step));
+                        let _ = ui.send(crate::UiEvent::TabShortcut { step, session: id });
                     }),
                     engine.tab_chord_keys(),
                 ),
@@ -845,7 +872,7 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
         turn: turn_alloc,
         stop: stop.clone(),
         platform: platform.clone(),
-        surface: Some(surface.clone()),
+        surface: Some(cell.clone()),
         view: Some(view.clone()),
         shared: shared.clone(),
         downloads_dir: platform.paths().downloads_dir,
@@ -865,14 +892,25 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
             shared: shared.clone(),
             slot: 0,
             view: Some(view.clone()),
+            moves: Some(crate::media::viewer::Moves {
+                cell: cell.clone(),
+                ui: ui.clone(),
+            }),
         };
-        let (ctl, stop_r, ui) = (ctl_tx.clone(), stop.clone(), ui.clone());
+        let (ctl, stop_r, ui, cell) = (ctl_tx.clone(), stop.clone(), ui.clone(), cell.clone());
         spawn_or_abort!(engine, id, stop, threads, "viewer-media", move || {
             if let Err(e) = viewer_media_loop(media, video_rx, ctl, stop_r) {
                 tracing::warn!("viewer media loop ended: {e}");
                 ui.send(SessionEvent::Toast(format!(
                     "Cannot display the remote screen: {e}"
                 )));
+            }
+            // Moves from now on are carried out by their caller; one this
+            // thread had not reached is carried out here.
+            if let Some(old) = cell.media_gone() {
+                ui.send(SessionEvent::SurfaceReleased {
+                    surface: crate::SurfaceTag::of(&old),
+                });
             }
         });
     }
@@ -886,7 +924,7 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
     if prefs.capture_shortcuts {
         let (platform, surface, ctl, keys, stop_k, hook_input, activity, owner) = (
             platform.clone(),
-            surface.clone(),
+            cell.clone(),
             ctl_tx.clone(),
             keys.clone(),
             stop.clone(),
@@ -894,12 +932,14 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
             activity.clone(),
             engine.hook_owner(),
         );
+        let hook_view = view.clone();
         spawn_or_abort!(engine, id, stop, threads, "shortcuts", move || {
             shortcut_loop(
                 id,
                 platform.as_ref(),
-                surface.as_ref(),
+                &surface,
                 &activity,
+                &hook_view,
                 &owner,
                 &stop_k,
                 || hook_forwarder(hook_input.clone(), keys.clone(), ctl.clone()),
@@ -907,11 +947,20 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
         });
     }
 
-    surface.set_drop_sink(Some(drop_tx));
-    surface.set_input_sink(Some(input_tx));
-    // Hide the OS cursor over the video while controlling (task D10); a
-    // view-only session leaves it shown. Mirrors `shared.control`.
-    surface.set_cursor_control(has_control);
+    // The sinks, and the OS cursor hidden over the video while controlling
+    // (task D10; a view-only session leaves it shown, mirroring
+    // `shared.control`), on the current surface — and moved with it. The
+    // media thread was started, so it carries out moves.
+    cell.bind(
+        current::Bound {
+            input: input_tx,
+            drops: drop_tx,
+            shared: shared.clone(),
+            view: view.clone(),
+            activity: activity.clone(),
+        },
+        true,
+    );
     let session = Session {
         peer: peer.clone(),
         stop,
@@ -957,14 +1006,17 @@ fn send_input(ctl: &Sender<Vec<u8>>, msg: &InputMsg) {
 fn shortcut_loop(
     id: SessionId,
     platform: &dyn platform_api::Platform,
-    surface: &dyn platform_api::VideoSurface,
+    surface: &current::SurfaceCell,
     activity: &Activity,
+    view: &active::SessionView,
     owner: &Mutex<Option<SessionId>>,
     stop: &AtomicBool,
     forwarder: impl Fn() -> KeyForwarder,
 ) {
     const TICK: Duration = Duration::from_millis(50);
     while !stop.load(Ordering::SeqCst) {
+        // A move brought the hook down: up again, on the new window.
+        activity.take_rebind(view);
         // Only while focused, on screen and not under a web dialog (its keys
         // are this computer's): see Activity.
         let claimed = activity.hook_wanted() && {
@@ -985,7 +1037,8 @@ fn shortcut_loop(
         let generation = activity.generation.load(Ordering::SeqCst);
         match platform.create_shortcut_hook() {
             Some(mut hook) => {
-                if hook.install(surface, forwarder()) {
+                // The surface now: a move since the last install changed it.
+                if hook.install(surface.current().as_ref(), forwarder()) {
                     hook.run(&activity.hook_quit);
                 } else {
                     tracing::info!("shortcut capture could not be installed");
@@ -1212,17 +1265,6 @@ impl Session {
     }
 }
 
-/// A viewer session's surface as it ends: input and drops stop at once (held
-/// keys are released first, by the surface contract) and the OS cursor is
-/// restored (task D10). Synchronous, so a session that ends never keeps
-/// capturing input while its threads are being joined. Hiding it is the
-/// gate's (`SessionView::retire`), in order with its other operations.
-pub(crate) fn detach_surface(s: &dyn platform_api::VideoSurface) {
-    s.set_input_sink(None);
-    s.set_drop_sink(None);
-    s.set_cursor_control(false);
-}
-
 /// Viewer: no stream known — the next positional input from any window sends
 /// `InputTarget` again (after a pop-out opens or closes, a slot may be reused
 /// by another monitor; the host may also have mapped input elsewhere).
@@ -1312,6 +1354,7 @@ pub(crate) fn open_viewer_popout(
             slot,
             // A pop-out shows itself: the gate decides the main video only.
             view: None,
+            moves: None,
         };
         let (ctl, stop_r) = (ctl_tx.clone(), loop_stop.clone());
         let media_thread = spawn(&format!("popout-{slot}-media"), move || {

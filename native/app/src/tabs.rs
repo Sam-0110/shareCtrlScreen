@@ -585,6 +585,10 @@ impl TabManager {
                     out.push(("tab-toast", json!({ "remoteId": peer, "message": message })));
                 }
                 SessionEvent::Released => {}
+                // Follows only a `move_session`, which this app does not call
+                // before detached windows (plans/09 W3): nothing it holds is
+                // named.
+                SessionEvent::SurfaceReleased { .. } => {}
             }
             if forget {
                 inner.live.remove(peer);

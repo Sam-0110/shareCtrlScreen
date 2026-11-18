@@ -57,7 +57,9 @@ fn translate(
             tabs.on_workspace_changed();
             vec![("workspace-changed", json!({}))]
         }
-        UiEvent::TabShortcut(step) => {
+        // Every session is in the main window until detached windows exist
+        // (plans/09 W3 ignores chords from those, Decision 2).
+        UiEvent::TabShortcut { step, session: _ } => {
             tabs.step(step);
             Vec::new()
         }
@@ -142,6 +144,8 @@ fn host_session(
                 displays_json(&list, &current, can_switch, &popouts),
             )]
         }
-        SessionEvent::Phase(_) | SessionEvent::Released => Vec::new(),
+        SessionEvent::Phase(_) | SessionEvent::Released | SessionEvent::SurfaceReleased { .. } => {
+            Vec::new()
+        }
     }
 }

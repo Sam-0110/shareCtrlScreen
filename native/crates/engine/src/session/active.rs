@@ -93,8 +93,9 @@ fn perform(op: ViewOp) {
     }
 }
 
-#[derive(Default)]
 struct ViewState {
+    /// The surface it shows on (swapped by a move).
+    surface: Arc<dyn VideoSurface>,
     on_screen: bool,
     focused: bool,
     ready: bool,
@@ -109,7 +110,6 @@ struct ViewState {
 
 /// One viewer session's main video, as the gate sees it.
 pub(crate) struct SessionView {
-    surface: Arc<dyn VideoSurface>,
     shared: Arc<Shared>,
     /// Which windows have a web dialog open; this view is covered when its
     /// own window has one.
@@ -133,12 +133,20 @@ impl SessionView {
         ops: ViewOps,
     ) -> Arc<Self> {
         Arc::new(SessionView {
-            surface,
             shared,
             overlays,
             window: AtomicU32::new(WindowId::MAIN.0),
             ops,
-            state: Mutex::new(ViewState::default()),
+            state: Mutex::new(ViewState {
+                surface,
+                on_screen: false,
+                focused: false,
+                ready: false,
+                trouble: false,
+                gone: false,
+                shown: false,
+                focus_owed: false,
+            }),
             shown: AtomicBool::new(false),
         })
     }
@@ -151,6 +159,12 @@ impl SessionView {
     /// The window its video is in.
     pub(crate) fn window(&self) -> WindowId {
         WindowId(self.window.load(Ordering::SeqCst))
+    }
+
+    /// The window it starts in (before anything is shown; a move later
+    /// goes through [`rebind`](Self::rebind)).
+    pub(crate) fn set_window(&self, window: WindowId) {
+        self.window.store(window.0, Ordering::SeqCst);
     }
 
     /// A web dialog is open over its window.
@@ -186,10 +200,29 @@ impl SessionView {
         }
         if s.shown {
             // Under the view's lock, like every op of this view: ordered.
-            self.queue(ViewOp::Focus(self.surface.clone()));
+            self.queue(ViewOp::Focus(s.surface.clone()));
         } else {
             s.focus_owed = true;
         }
+    }
+
+    /// The session moved to `surface` in `window` (plans/09 W2; its
+    /// presenter there exists already): hide the old surface, then show the
+    /// new one if the session should be shown — in that order, through the
+    /// applier like every other operation. A focused session's keyboard
+    /// follows it to the new window.
+    pub(crate) fn rebind(&self, surface: Arc<dyn VideoSurface>, window: WindowId) {
+        let mut s = self.state.lock();
+        if s.shown {
+            s.shown = false;
+            self.shown.store(false, Ordering::SeqCst);
+            self.queue(ViewOp::Hide(s.surface.clone()));
+        }
+        s.surface = surface;
+        // Before deciding: whether it is covered depends on its window.
+        self.window.store(window.0, Ordering::SeqCst);
+        s.focus_owed = s.focused;
+        self.decide(&mut s);
     }
 
     /// A web dialog opened or closed (the overlay set changed already).
@@ -200,15 +233,23 @@ impl SessionView {
     /// The session ended: hide now (after anything queued before) and never
     /// show again.
     pub(crate) fn retire(&self) {
-        self.update(|s| s.gone = true);
+        let mut s = self.state.lock();
+        s.gone = true;
+        s.shown = false;
+        self.shown.store(false, Ordering::SeqCst);
         // Queued even when it was never shown, after everything queued
         // before: the surface is hidden for certain once the session is over.
-        self.queue(ViewOp::Hide(self.surface.clone()));
+        self.queue(ViewOp::Hide(s.surface.clone()));
     }
 
     fn update(&self, change: impl FnOnce(&mut ViewState)) {
         let mut s = self.state.lock();
         change(&mut s);
+        self.decide(&mut s);
+    }
+
+    /// Show or hide to match the state; called under the view's lock.
+    fn decide(&self, s: &mut ViewState) {
         let want = !s.gone && s.on_screen && s.ready && !s.trouble && !self.covered();
         if want == s.shown {
             return;
@@ -217,12 +258,12 @@ impl SessionView {
         self.shown.store(want, Ordering::SeqCst);
         let op = if want {
             ViewOp::Show {
-                surface: self.surface.clone(),
+                surface: s.surface.clone(),
                 shared: self.shared.clone(),
                 focus: std::mem::take(&mut s.focus_owed),
             }
         } else {
-            ViewOp::Hide(self.surface.clone())
+            ViewOp::Hide(s.surface.clone())
         };
         // Queued under the view's lock so this view's operations keep the
         // order they were decided in; sending never blocks.

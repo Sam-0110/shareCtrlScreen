@@ -344,6 +344,7 @@ fn event_kind(ev: &SessionEvent) -> String {
         SessionEvent::Displays { .. } => "displays".into(),
         SessionEvent::Toast(_) => "toast".into(),
         SessionEvent::Released => "released".into(),
+        SessionEvent::SurfaceReleased { surface } => format!("surface-released:{surface:?}"),
     }
 }
 /// The one viewer session of `p` (the tests start at most one per engine,
@@ -2152,6 +2153,198 @@ async fn several_sessions_on_screen_one_focused() {
     })
     .await;
     eventually("C presents", t, || presented(&surfaces[2]) > 3).await;
+    viewer.engine.end_all_and_wait(Duration::from_secs(3)).await;
+}
+
+/// The session-log entry for "the engine let go of `surface`" (plans/09 W2).
+fn released_entry(surface: &Arc<platform_api::mock::MockSurface>) -> String {
+    let s: Arc<dyn platform_api::VideoSurface> = surface.clone();
+    format!("surface-released:{:?}", engine::SurfaceTag::of(&s))
+}
+
+/// How often session `id` of `p` logged `what`.
+fn logged(p: &Peer, id: SessionId, what: &str) -> usize {
+    p.session_log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(i, k)| *i == id && k == what)
+        .count()
+}
+
+/// plans/09 W2: a live session moves between two surfaces twenty times with
+/// no reconnect — the same session and one host session throughout. Each time
+/// pictures reach the new surface, nothing is presented on the old one after
+/// it is let go, and a key held on the old one is released on the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_session_moves_between_surfaces() {
+    let relay = start_relay().await;
+    let host = start_peer("move-host", &relay);
+    let viewer = start_peer("move-viewer", &relay);
+    let t = Duration::from_secs(20);
+    eventually("registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    let a = platform_api::mock::MockSurface::new((640, 360));
+    let b = platform_api::mock::MockSurface::new((640, 360));
+    let id = viewer
+        .engine
+        .connect(&host.uuid, a.clone())
+        .expect("not hosting");
+    viewer.engine.set_screen(&[id], Some(id));
+    eventually("presenting on the first surface", t, || {
+        a.state().presented.len() > 5
+    })
+    .await;
+    let key_ups = |p: &Peer| {
+        injected(p)
+            .iter()
+            .filter(|m| matches!(m, InputMsg::KeyUp { code } if code == "KeyQ"))
+            .count()
+    };
+    let (mut from, mut to) = (a, b);
+    for round in 0..20u32 {
+        assert!(
+            from.user_input(VideoInput::Key {
+                code: "KeyQ",
+                down: true
+            }),
+            "round {round}: the current surface takes input"
+        );
+        let ups = key_ups(&host);
+        let entry = released_entry(&from);
+        let before = logged(&viewer, id, &entry);
+        viewer
+            .engine
+            .move_session(id, to.clone(), engine::WindowId(1 + round % 2))
+            .expect("move accepted");
+        eventually("the old surface let go", t, || {
+            logged(&viewer, id, &entry) > before
+        })
+        .await;
+        let left = from.state().presented.len();
+        let shown = to.state().presented.len();
+        eventually(
+            "pictures on the new surface",
+            Duration::from_secs(5),
+            || to.state().presented.len() > shown && to.state().visible,
+        )
+        .await;
+        eventually("the key held on the old surface released", t, || {
+            key_ups(&host) > ups
+        })
+        .await;
+        {
+            let old = from.state();
+            assert_eq!(
+                old.presented.len(),
+                left,
+                "round {round}: drawn after release"
+            );
+            assert!(!old.visible, "round {round}: the old surface is hidden");
+            assert!(
+                !old.has_input_sink,
+                "round {round}: the old surface takes no input"
+            );
+        }
+        std::mem::swap(&mut from, &mut to);
+    }
+    assert_eq!(viewer.engine.viewer_sessions(), vec![id]);
+    let negotiations = |p: &Peer| {
+        p.session_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, k)| k == "negotiating")
+            .count()
+    };
+    assert_eq!(negotiations(&host), 1, "one host session: no reconnect");
+    assert_eq!(negotiations(&viewer), 1);
+    viewer.engine.end_all_and_wait(Duration::from_secs(3)).await;
+}
+
+/// A move whose new surface cannot get a presenter leaves the session where
+/// it was, still presenting, and lets go of the surface it was moving to.
+/// A move before the session is live only swaps: it goes live there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_move_stays_and_an_early_move_goes_live_there() {
+    let relay = start_relay().await;
+    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let host = start_peer_full(
+        "move-held-host",
+        &relay,
+        |_| {},
+        Arc::new(HeldApproval {
+            asked: asked.clone(),
+            release: release.clone(),
+        }),
+    );
+    let viewer = start_peer("move-early-viewer", &relay);
+    let t = Duration::from_secs(20);
+    eventually("registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    let first = platform_api::mock::MockSurface::new((640, 360));
+    let early = platform_api::mock::MockSurface::new((640, 360));
+    let id = viewer
+        .engine
+        .connect(&host.uuid, first.clone())
+        .expect("not hosting");
+    viewer.engine.set_screen(&[id], Some(id));
+    eventually("the host is asking", t, || {
+        asked.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    // Still requesting: the move is a swap, released at once.
+    viewer
+        .engine
+        .move_session(id, early.clone(), engine::WindowId(4))
+        .expect("an early move");
+    eventually("the first surface let go", t, || {
+        logged(&viewer, id, &released_entry(&first)) == 1
+    })
+    .await;
+    assert_eq!(
+        viewer
+            .engine
+            .move_session(id, early.clone(), engine::WindowId(4)),
+        Err(engine::MoveError::SurfaceInUse)
+    );
+    release.add_permits(1);
+    eventually("live on the surface it moved to", t, || {
+        early.state().presented.len() > 5
+    })
+    .await;
+    assert!(
+        first.state().presented.is_empty(),
+        "never drawn on the first"
+    );
+
+    let broken = platform_api::mock::MockSurface::new((640, 360));
+    broken.state().refuse_presenter = true;
+    viewer
+        .engine
+        .move_session(id, broken.clone(), engine::WindowId(5))
+        .expect("accepted; it fails on the media thread");
+    eventually("the broken surface let go", t, || {
+        logged(&viewer, id, &released_entry(&broken)) == 1
+    })
+    .await;
+    let n = early.state().presented.len();
+    eventually("still presenting where it was", t, || {
+        early.state().presented.len() > n
+    })
+    .await;
+    assert!(early.state().has_input_sink, "input stays with it");
+    assert!(viewer
+        .toasts
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|m| m.starts_with("Could not move the remote screen")));
     viewer.engine.end_all_and_wait(Duration::from_secs(3)).await;
 }
 

@@ -26,7 +26,7 @@ use crate::events::{
 };
 use crate::handshake::{self, ApprovalDecision};
 use crate::session::registry::{HostSlot, PendingLogin, ViewerPhase, ViewerSlot, REQUEST_TIMEOUT};
-use crate::{modifiers, session, ConnectError, Engine, Role, SECRET_PROMPT_TIMEOUT};
+use crate::{modifiers, session, ConnectError, Engine, MoveError, Role, SECRET_PROMPT_TIMEOUT};
 
 /// Holds `Registry::admitting` for one peer and clears it when dropped, so an
 /// admission that ends any way (accepted, denied, a wrong password, a panic)
@@ -364,6 +364,17 @@ impl Engine {
         host_uuid: &str,
         surface: Arc<dyn VideoSurface>,
     ) -> Result<SessionId, ConnectError> {
+        self.connect_in(host_uuid, surface, WindowId::MAIN)
+    }
+
+    /// [`connect`](Self::connect) with the video in `window` (plans/09: a
+    /// detached window's card reconnects in that window).
+    pub fn connect_in(
+        &self,
+        host_uuid: &str,
+        surface: Arc<dyn VideoSurface>,
+        window: WindowId,
+    ) -> Result<SessionId, ConnectError> {
         let host_uuid = host_uuid.trim().to_lowercase();
         if !protocol::is_valid_uuid_v4(&host_uuid) {
             return Err(ConnectError::InvalidId);
@@ -405,7 +416,8 @@ impl Engine {
             }
             let id = reg.reserve();
             let started_in = ws.sel.workspace_key().map(|k| (k.to_string(), ws.epoch));
-            let mut slot = ViewerSlot::requesting(host_uuid.clone(), Some(surface));
+            let cell = session::current::SurfaceCell::new(surface, window);
+            let mut slot = ViewerSlot::requesting(host_uuid.clone(), Some(cell));
             slot.workspace = started_in.clone();
             reg.viewers.insert(id, slot);
             // Queued (not awaited) inside the section, so a switch's
@@ -880,6 +892,70 @@ impl Engine {
         }
     }
 
+    /// Hand viewer session `id` to `surface` in `window` (plans/09 W2, 09a
+    /// §3.2 and §4.2): in any phase before it ends, without a reconnect —
+    /// the same session, the same host session. Never blocks: a live
+    /// session's media thread builds a presenter there on its decoder's
+    /// device and swaps (the input and drop sinks, cursor control, the view
+    /// and the shortcut hook follow, "hide the old" before "show the new").
+    /// `SessionEvent::SurfaceReleased` then names the surface the engine let
+    /// go of: the old one when the move went through, `surface` when it
+    /// failed (the session stays where it was; a toast says why).
+    ///
+    /// Refused while the session is being started or another move of it is
+    /// under way (`Busy`), when `surface` belongs to a session already, and
+    /// for a session that is gone or ending.
+    pub fn move_session(
+        &self,
+        id: SessionId,
+        surface: Arc<dyn VideoSurface>,
+        window: WindowId,
+    ) -> Result<(), MoveError> {
+        use session::current::{Carrier, Target};
+        // Checked and accepted under `reg`, like a connect's surface claim,
+        // so no connect can take the surface in between.
+        let (cell, peer, carrier) = {
+            let reg = self.reg.lock();
+            let Some(v) = reg.viewers.get(&id) else {
+                return Err(if reg.reaping.contains_key(&id) {
+                    MoveError::Ended
+                } else {
+                    MoveError::NotFound
+                });
+            };
+            if v.starting {
+                return Err(MoveError::Busy);
+            }
+            if reg.surface_in_use(&surface).is_some() {
+                return Err(MoveError::SurfaceInUse);
+            }
+            // Every viewer slot made by `connect` has a cell.
+            let Some(cell) = v.surface.clone() else {
+                return Err(MoveError::NotFound);
+            };
+            let carrier = cell.request(Target { surface, window })?;
+            (cell, v.peer.clone(), carrier)
+        };
+        let released = match carrier {
+            Carrier::Swapped(old) => Some(old),
+            Carrier::Media => None,
+            // Its media thread is gone (its decoder failed): nothing draws,
+            // so the sinks and the view move here, at once.
+            Carrier::Caller => cell.complete(),
+        };
+        if let Some(old) = released {
+            self.emit(
+                id,
+                &peer,
+                false,
+                SessionEvent::SurfaceReleased {
+                    surface: crate::SurfaceTag::of(&old),
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Put viewer session `id`'s [`session::TabGate`] in its slot and apply
     /// whether it is on screen and focused now — under `reg`, like every
     /// switch, so no switch can fall between the two.
@@ -1097,8 +1173,9 @@ impl Engine {
         if let Some(v) = session.as_ref().and_then(|s| s.view()) {
             v.retire();
         }
-        if let Some(s) = &surface {
-            session::detach_surface(s.as_ref());
+        // No more moves; input and drops stop, the OS cursor comes back.
+        if let Some(cell) = &surface {
+            cell.retire();
         }
         tracing::info!("session {id} with {peer} ended: {reason:?}");
         self.emit(
@@ -1120,7 +1197,7 @@ impl Engine {
         peer: &str,
         host: bool,
         session: Option<session::Session>,
-        surface: Option<Arc<dyn VideoSurface>>,
+        surface: Option<Arc<session::current::SurfaceCell>>,
     ) {
         let ui = self.session_ui(id, peer, host);
         let reg = Arc::clone(&self.reg);
@@ -1134,7 +1211,7 @@ impl Engine {
             // view (nothing showed its surface): hide it directly.
             match (&view, &surface) {
                 (Some(v), _) => v.retire(),
-                (None, Some(s)) => s.hide(),
+                (None, Some(cell)) => cell.current().hide(),
                 (None, None) => {}
             }
             reg.lock().reaping.remove(&id);
