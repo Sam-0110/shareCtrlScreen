@@ -3,7 +3,6 @@
 // requesting / password-prompt modals.
 
 import * as api from './api.js';
-import { scheduleSync } from './accounts.js';
 import { preflight } from './settings.js';
 import {
   $,
@@ -45,7 +44,6 @@ async function saveRemoteName(id, name) {
     return;
   }
   renderRecents();
-  scheduleSync();
 }
 
 export function renderRecents() {
@@ -121,7 +119,6 @@ async function confirmClearRecents() {
     S.config.recentIds = [];
   }
   renderRecents();
-  scheduleSync();
 }
 
 // ---- the remote ID and its name -----------------------------------------------
@@ -164,7 +161,6 @@ async function connect() {
     toast(errorText(err), 'error');
     return;
   }
-  scheduleSync(3000); // connect_to added it to the recents
 }
 
 // ---- password prompt (viewer) ---------------------------------------------------
@@ -248,9 +244,8 @@ export function wireConnect() {
     S.passwordFrom = e.payload.from;
     stopCountdown();
     $('password-input').value = '';
-    // Default the checkbox to whatever auto-login is currently set to, so ticking
-    // it once in Settings makes every later prompt remember by default.
-    $('password-remember').checked = !!(S.config && S.config.autoLogin);
+    // Passwords are remembered by default (D7): typed once per host.
+    $('password-remember').checked = true;
     setState('PASSWORD_PROMPT');
     $('password-input').focus();
   });

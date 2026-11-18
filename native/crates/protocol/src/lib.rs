@@ -17,11 +17,14 @@ pub mod signaling;
 pub mod sync;
 pub mod transfer;
 
-pub use config::{Account, Config, IceServer, IdStamp, Mode, Permission};
+pub use config::{
+    account_key, AccountRef, Config, IceServer, IdStamp, Loaded, Mode, Permission, Prefs,
+    Workspace, LOCAL_WORKSPACE,
+};
 pub use control::{ControlMsg, PopoutStream, RemoteDisplay};
 pub use input::{Button, InputMsg};
 pub use signaling::{IceCandidate, IceServers, SignalData, SignalMsg};
-pub use sync::{SyncDoc, SyncEntry};
+pub use sync::{Stamper, SyncDoc, SyncEntry};
 pub use transfer::{BulkFrame, FileMeta};
 
 /// Protocol version carried in the `register` message (`v`), always `1`.

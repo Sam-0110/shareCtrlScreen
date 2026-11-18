@@ -44,6 +44,8 @@ impl AppDecider {
 /// Shared Tauri state.
 pub(crate) struct AppState {
     pub(crate) engine: Arc<Engine>,
+    /// The accounts on this computer and their sync (accounts.rs).
+    pub(crate) accounts: Arc<crate::accounts::AccountManager>,
     pub(crate) decider: Arc<AppDecider>,
     /// The Cisco OpenH264 software codec (Settings → Advanced).
     pub(crate) openh264: Arc<OpenH264>,

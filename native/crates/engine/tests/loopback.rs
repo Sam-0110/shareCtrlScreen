@@ -952,9 +952,7 @@ async fn mac_viewer_keys_mean_the_same_on_a_windows_host() {
     // A Cmd held while the setting is switched off is released as the Ctrl it
     // was sent as; the next Cmd is literal.
     press(&viewer, &host, &["+MetaLeft"], &["+ControlLeft"]).await;
-    viewer
-        .engine
-        .update_config(|c| c.translate_modifiers = false);
+    viewer.engine.set_pref("translateModifiers", false);
     press(&viewer, &host, &["-MetaLeft"], &["-ControlLeft"]).await;
     press(
         &viewer,
@@ -964,9 +962,7 @@ async fn mac_viewer_keys_mean_the_same_on_a_windows_host() {
     )
     .await;
     // And back on: translated again, and nothing is left held on the host.
-    viewer
-        .engine
-        .update_config(|c| c.translate_modifiers = true);
+    viewer.engine.set_pref("translateModifiers", true);
     press(
         &viewer,
         &host,
@@ -1618,6 +1614,133 @@ async fn popout_window_streams_a_second_monitor_with_its_own_input() {
     viewer.engine.end_session();
     eventually("both idle", t, || {
         host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
+    })
+    .await;
+}
+
+/// The workspace store (plans/08 P1): each account sees only its own data, a
+/// signed-out account's data is unreachable and connecting is refused (I13),
+/// sign-up adopts the local workspace and "Add" merges it, and switching away
+/// from a viewer session ends it (D6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accounts_keep_their_own_workspaces() {
+    use engine::{ConnectError, WorkspaceSel};
+    const X: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    const Y: &str = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+    let relay = start_relay().await;
+    let me = start_peer("workspaces", &relay);
+    let e = &me.engine;
+    assert_eq!(e.workspace_sel(), WorkspaceSel::Local);
+
+    // Local data, then sign-up adopts it.
+    e.set_remote_name(X, "Office");
+    assert!(e.set_pref("clipboardSync", false));
+    let a = e.upsert_account("https://s.example", "ann");
+    e.store_token(&a, "token-a".into(), true)
+        .await
+        .expect("the mock secret store seals");
+    e.adopt_local_into(&a);
+    e.switch_workspace(WorkspaceSel::Account(a.clone()), false)
+        .await;
+    let ws = e.workspace().expect("signed in");
+    assert_eq!(ws.remote_name(X), Some("Office"));
+    assert!(!e.prefs().clipboard_sync);
+    assert!(e.config().account(&a).unwrap().token_ref.is_some());
+
+    // Another account starts empty and never sees ann's data.
+    let b = e.upsert_account("https://s.example", "bob");
+    e.store_token(&b, "token-b".into(), false).await.unwrap();
+    e.switch_workspace(WorkspaceSel::Account(b.clone()), true)
+        .await;
+    assert!(e.workspace().unwrap().remote_names.is_empty());
+    assert!(e.prefs().clipboard_sync, "bob has the defaults");
+    e.set_remote_name(Y, "Bob's");
+
+    // Signed out: nothing is reachable, connecting is refused.
+    e.forget_token(&b);
+    e.switch_workspace(WorkspaceSel::Locked(b.clone()), true)
+        .await;
+    assert!(e.workspace().is_none());
+    assert!(e.set_remote_name(X, "nope").is_empty());
+    assert_eq!(e.connect_to(X.into()), Err(ConnectError::SignedOut));
+
+    // ann's token comes back from the secret store; her data is intact.
+    assert_eq!(e.account_token(&a).await.as_deref(), Some("token-a"));
+    e.switch_workspace(WorkspaceSel::Account(a.clone()), true)
+        .await;
+    assert_eq!(e.workspace().unwrap().remote_name(X), Some("Office"));
+    assert_eq!(e.workspace().unwrap().remote_name(Y), None);
+
+    // "Add": local names join the account; the account's own win.
+    e.switch_workspace(WorkspaceSel::Local, true).await;
+    assert!(
+        e.workspace().unwrap().remote_names.is_empty(),
+        "adopted on sign-up"
+    );
+    e.set_remote_name(Y, "Laptop");
+    assert_eq!(e.local_data(), Some((0, 1)));
+    e.merge_local_into(&a);
+    e.switch_workspace(WorkspaceSel::Account(a.clone()), false)
+        .await;
+    let ws = e.workspace().unwrap();
+    assert_eq!(ws.remote_name(X), Some("Office"));
+    assert_eq!(ws.remote_name(Y), Some("Laptop"));
+    assert_eq!(e.local_data(), None);
+
+    // A sync answer from before a switch is not applied.
+    let epoch = e.workspace_epoch();
+    let doc = e.sync_doc(&a, true, true).unwrap();
+    e.switch_workspace(WorkspaceSel::Account(a.clone()), false)
+        .await;
+    assert!(!e.apply_sync(&a, epoch, &doc, true, true));
+    assert!(e.apply_sync(&a, e.workspace_epoch(), &doc, true, true));
+
+    // Removing an account deletes its workspace.
+    e.switch_workspace(WorkspaceSel::Local, true).await;
+    e.remove_account(&b);
+    assert!(e.config().account(&b).is_none());
+    assert!(!e.config().workspaces.contains_key(&b));
+}
+
+/// Switching accounts ends a viewer session (D6); hosting is the computer's
+/// and goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn switching_accounts_ends_the_viewer_session() {
+    use engine::WorkspaceSel;
+    let relay = start_relay().await;
+    let host = start_peer("ws-host", &relay);
+    let viewer = start_peer("ws-viewer", &relay);
+    let t = Duration::from_secs(15);
+    eventually("both registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    viewer
+        .engine
+        .connect_to(host.uuid.clone())
+        .expect("not hosting");
+    eventually("connected", t, || {
+        matches!(viewer.engine.role(), Role::Viewer { .. })
+            && matches!(host.engine.role(), Role::Host { .. })
+    })
+    .await;
+    let a = viewer.engine.upsert_account("https://s.example", "ann");
+    viewer
+        .engine
+        .store_token(&a, "t".into(), false)
+        .await
+        .unwrap();
+    viewer
+        .engine
+        .switch_workspace(WorkspaceSel::Account(a), true)
+        .await;
+    eventually("the viewer session ended", t, || {
+        matches!(viewer.engine.role(), Role::Idle)
+    })
+    .await;
+    // The host side saw it end too (end-session reached it).
+    eventually("the host session ended", t, || {
+        matches!(host.engine.role(), Role::Idle)
     })
     .await;
 }

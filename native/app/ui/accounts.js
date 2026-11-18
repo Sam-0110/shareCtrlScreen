@@ -1,69 +1,25 @@
-// Optional account that keeps remote IDs, their names and the recents the same
-// on every computer signed in to it. Rust does the HTTP and the merging
-// (account.rs, protocol::sync); this only decides when to sync and shows it.
+// Accounts (plans/08 P1): the switcher, signing in / up / out, the locked form
+// of a signed-out account, "bring this computer's tabs and names in?", and
+// the account status line. Rust does everything that matters (src/accounts.rs:
+// HTTP, when to sync; the engine: the data, the merge, the tokens); this page
+// shows the state Rust reports in `account-state` and sends the user's
+// choices back.
+//
+// Account states: `local` (no account), `signedIn`, `locked` (selected but
+// signed out: only its sign-in form is shown, none of its data), `resolving`
+// (just signed in; waiting for the bring-in answer).
 
 import * as api from './api.js';
-import { nameOf, reloadConfig, renderRecents } from './connect.js';
-import { $, S, errorText, toast } from './state.js';
+import { nameOf, peerLabel, reloadConfig } from './connect.js';
+import { $, S, errorText, render, toast } from './state.js';
 
-const SYNC_EVERY_MS = 5 * 60 * 1000;
-const SYNC_ON_FOCUS_AFTER_MS = 60 * 1000;
-let syncing = null; // the sync in flight, if any
-let syncAgain = false; // something changed while it was in flight
-let syncTimer = null;
-let lastSyncAttempt = 0;
+const LOCAL = 'local';
 
-const signedIn = () => !!(S.config && S.config.account);
+const view = () => (S.config && S.config.account) || { state: LOCAL, accounts: [] };
 
-// Redraw from a sync / sign-in / sign-out answer.
-function applyAccountResult(r) {
-  S.config.account = r.account;
-  S.config.recentIds = r.recentIds;
-  S.config.remoteNames = r.remoteNames;
-  renderRecents();
-  // A name synced from elsewhere shows at once, unless the user is typing one.
-  if (S.nameFieldFor && document.activeElement !== $('remote-name')) {
-    $('remote-name').value = nameOf(S.nameFieldFor);
-  }
-  renderAccount();
-}
-
-export async function syncNow(manual) {
-  if (!signedIn()) return;
-  if (syncing) {
-    syncAgain = true;
-    return syncing;
-  }
-  syncing = (async () => {
-    try {
-      applyAccountResult(await api.accountSync());
-      if (manual) setAccountStatus('Synced.');
-    } catch (err) {
-      const msg = errorText(err);
-      const wasSignedIn = signedIn();
-      await reloadConfig();
-      renderAccount();
-      // Background failures (offline, server down) stay quiet and retry
-      // later; being signed out, or a sync the user asked for, is reported.
-      if (manual) setAccountStatus(msg, true);
-      else if (wasSignedIn && !signedIn()) toast(msg, 'error');
-    } finally {
-      lastSyncAttempt = Date.now();
-      syncing = null;
-      if (syncAgain) {
-        syncAgain = false;
-        scheduleSync();
-      }
-    }
-  })();
-  return syncing;
-}
-
-// Sync shortly after a local change, coalescing a burst of them.
-export function scheduleSync(delayMs) {
-  if (!signedIn()) return;
-  clearTimeout(syncTimer);
-  syncTimer = setTimeout(() => syncNow(false), delayMs === undefined ? 1500 : delayMs);
+/** Whether this computer is viewing (or connecting to) another one. */
+function viewerBusy() {
+  return S.state === 'VIEW_ACTIVE' || S.state === 'REQUESTING' || S.state === 'PASSWORD_PROMPT';
 }
 
 function ago(ms) {
@@ -85,64 +41,210 @@ export function setAccountStatus(text, error) {
 }
 
 export function renderAccount() {
-  const a = S.config && S.config.account;
-  $('account-signed-out').classList.toggle('hidden', !!a);
-  $('account-signed-in').classList.toggle('hidden', !a);
-  if (a) {
-    $('account-name').textContent = a.username;
-    $('account-last-sync').textContent = ago(a.lastSync);
+  const v = view();
+  const signedIn = v.state === 'signedIn' || v.state === 'resolving';
+  const locked = v.state === 'locked';
+
+  // The switcher: this computer alone, then each account used on it.
+  const select = $('account-switch');
+  select.textContent = '';
+  const local = document.createElement('option');
+  local.value = LOCAL;
+  local.textContent = 'This computer only (no account)';
+  select.appendChild(local);
+  for (const a of v.accounts || []) {
+    const o = document.createElement('option');
+    o.value = a.key;
+    o.textContent = a.username;
+    o.title = a.server;
+    select.appendChild(o);
+  }
+  select.value = (v.active && v.active.key) || LOCAL;
+  $('account-switch-row').classList.toggle('hidden', !(v.accounts && v.accounts.length));
+
+  $('account-signed-out').classList.toggle('hidden', signedIn);
+  $('account-signed-in').classList.toggle('hidden', !signedIn);
+  $('account-intro-local').classList.toggle('hidden', locked);
+  $('account-intro-locked').classList.toggle('hidden', !locked);
+  $('btn-account-create').classList.toggle('hidden', locked);
+  $('btn-account-use-local').classList.toggle('hidden', !locked);
+  const user = $('account-username');
+  user.readOnly = locked;
+  if (locked && v.active) {
+    user.value = v.active.username;
+    $('account-locked-name').textContent = v.active.username;
+  } else if (!locked && user.readOnly === false && signedIn) {
+    user.value = '';
+  }
+  if (signedIn && v.active) {
+    $('account-name').textContent = v.active.username;
+    $('account-last-sync').textContent = ago(v.active.lastSync);
+  }
+
+  // Home screen: a signed-out account's computers are not shown (I13).
+  $('account-locked-note').classList.toggle('hidden', !locked);
+  if (locked && v.active) $('account-locked-note-name').textContent = v.active.username;
+}
+
+/** Show a new account state from Rust. */
+function applyAccountState(v) {
+  if (!S.config) return;
+  S.config.account = v;
+  renderAccount();
+  if (v.error && v.state === 'signedIn') setAccountStatus(v.error, true);
+  render();
+}
+
+/** Reload what the active workspace holds (names, recents, settings). */
+async function reloadWorkspace() {
+  await reloadConfig();
+  // A name synced from elsewhere shows at once, unless the user is typing one.
+  if (S.nameFieldFor && document.activeElement !== $('remote-name')) {
+    $('remote-name').value = nameOf(S.nameFieldFor);
+  }
+  renderAccount();
+  render();
+}
+
+// ---- confirm an account change that ends the session (D6) --------------------
+let confirmResolve = null;
+
+/**
+ * Ask before an account change. `detail` explains it; when this computer is
+ * viewing another one, the session it ends is named too. Resolves to whether
+ * the user went ahead. Nothing to say → no question.
+ */
+function confirmAccountChange(title, detail) {
+  const ending = viewerBusy();
+  if (!ending && !detail) return Promise.resolve(true);
+  $('account-confirm-title').textContent = title;
+  $('account-confirm-detail').textContent = detail || '';
+  $('account-confirm-detail').classList.toggle('hidden', !detail);
+  $('account-confirm-session').classList.toggle('hidden', !ending);
+  $('account-confirm-peer').textContent = $('view-peer').textContent || peerLabel('');
+  $('modal-account-confirm').classList.remove('hidden');
+  $('btn-account-confirm-cancel').focus();
+  return new Promise((resolve) => {
+    confirmResolve = resolve;
+  });
+}
+
+function answerConfirm(ok) {
+  $('modal-account-confirm').classList.add('hidden');
+  const resolve = confirmResolve;
+  confirmResolve = null;
+  if (resolve) resolve(ok);
+}
+
+// ---- actions ------------------------------------------------------------------
+async function run(busyText, call, doneText) {
+  setAccountStatus(busyText);
+  try {
+    const v = await call();
+    applyAccountState(v);
+    await reloadWorkspace();
+    if (v && v.syncError) setAccountStatus('Signed in, but the first sync failed: ' + v.syncError, true);
+    else setAccountStatus(doneText || '');
+    return true;
+  } catch (err) {
+    setAccountStatus(errorText(err), true);
+    return false;
   }
 }
 
 async function accountSignIn(create) {
+  const v = view();
+  const locked = v.state === 'locked';
   const username = $('account-username').value.trim();
   const password = $('account-password').value;
   if (!username || !password) {
     setAccountStatus('Enter a username and a password.', true);
     return;
   }
+  const keep = $('account-keep').checked;
+  // Signing in to another account from a signed-in one is a switch (D6).
+  if (v.state === 'signedIn' && !(await confirmAccountChange('Sign in to ' + username + '?'))) {
+    return;
+  }
   const buttons = [$('btn-account-sign-in'), $('btn-account-create')];
   buttons.forEach((b) => (b.disabled = true));
-  setAccountStatus(create ? 'Creating the account…' : 'Signing in…');
-  try {
-    const r = await api.accountSignIn(username, password, create);
-    $('account-password').value = '';
-    applyAccountResult(r);
-    lastSyncAttempt = Date.now();
-    if (r.syncError) {
-      setAccountStatus('Signed in, but the first sync failed: ' + r.syncError, true);
-    } else {
-      setAccountStatus(
-        create ? 'Account created. This computer\'s IDs are saved to it.' : 'Signed in and synced.'
-      );
-    }
-  } catch (err) {
-    setAccountStatus(errorText(err), true);
-  } finally {
-    buttons.forEach((b) => (b.disabled = false));
-  }
+  const ok = await run(
+    create ? 'Creating the account…' : 'Signing in…',
+    () =>
+      create
+        ? api.accountSignUp(username, password, keep)
+        : api.accountSignIn(username, password, keep, locked && v.active ? v.active.key : null),
+    create ? 'Account created. This computer\'s IDs and names are in it now.' : 'Signed in and synced.'
+  );
+  if (ok) $('account-password').value = '';
+  buttons.forEach((b) => (b.disabled = false));
 }
 
 async function accountSignOut() {
-  clearTimeout(syncTimer);
-  try {
-    applyAccountResult(await api.accountSignOut());
-    setAccountStatus('Signed out. The IDs stay on this computer.');
-  } catch (err) {
-    setAccountStatus(errorText(err), true);
+  const v = view();
+  const who = (v.active && v.active.username) || 'this account';
+  if (!(await confirmAccountChange('Sign out of ' + who + '?'))) return;
+  await run('Signing out…', () => api.accountSignOut(), 'Signed out. ' + who + "'s data stays on this computer, locked.");
+}
+
+async function accountRemove() {
+  const v = view();
+  if (!v.active) return;
+  const who = v.active.username;
+  const ok = await confirmAccountChange(
+    'Remove ' + who + ' from this computer?',
+    "Its names, recents and saved passwords on this computer are deleted. The account itself stays; sign in again to get its names back."
+  );
+  if (!ok) return;
+  await run('Removing…', () => api.accountRemove(v.active.key), who + ' was removed from this computer.');
+}
+
+async function accountSwitch(target) {
+  const v = view();
+  const current = (v.active && v.active.key) || LOCAL;
+  if (target === current) return;
+  const label =
+    target === LOCAL
+      ? 'this computer only'
+      : ((v.accounts || []).find((a) => a.key === target) || { username: target }).username;
+  if (!(await confirmAccountChange('Switch to ' + label + '?'))) {
+    renderAccount(); // put the switcher back
+    return;
   }
+  await run('Switching…', () => api.accountSwitch(target), '');
+}
+
+async function answerBringIn(choice) {
+  $('modal-bring-in').classList.add('hidden');
+  await run('Signing in…', () => api.accountResolveLocal(choice), 'Signed in and synced.');
+}
+
+function showBringIn(p) {
+  $('bring-in-account').textContent = p.account;
+  const parts = [];
+  if (p.tabs) parts.push(p.tabs + ' open tab' + (p.tabs === 1 ? '' : 's'));
+  if (p.names) parts.push(p.names + ' named computer' + (p.names === 1 ? '' : 's'));
+  $('bring-in-detail').textContent = parts.length
+    ? 'This computer has ' + parts.join(' and ') + ', and its recent connections.'
+    : 'This computer has recent connections of its own.';
+  $('modal-bring-in').classList.remove('hidden');
+  $('btn-bring-in-add').focus();
+}
+
+async function syncNowButton() {
+  $('btn-account-sync').disabled = true;
+  await run('Syncing…', () => api.accountSync(), 'Synced.');
+  $('btn-account-sync').disabled = false;
 }
 
 export function wireAccounts() {
   $('btn-account-sign-in').addEventListener('click', () => accountSignIn(false));
   $('btn-account-create').addEventListener('click', () => accountSignIn(true));
   $('btn-account-sign-out').addEventListener('click', accountSignOut);
-  $('btn-account-sync').addEventListener('click', async () => {
-    $('btn-account-sync').disabled = true;
-    setAccountStatus('Syncing…');
-    await syncNow(true);
-    $('btn-account-sync').disabled = false;
-  });
+  $('btn-account-remove').addEventListener('click', accountRemove);
+  $('btn-account-use-local').addEventListener('click', () => accountSwitch(LOCAL));
+  $('btn-account-sync').addEventListener('click', syncNowButton);
+  $('account-switch').addEventListener('change', (e) => accountSwitch(e.target.value));
   $('account-password').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
@@ -150,10 +252,28 @@ export function wireAccounts() {
     }
   });
 
-  // Pick up changes made on other computers: when the window comes back to the
-  // front, and every few minutes.
-  window.addEventListener('focus', () => {
-    if (Date.now() - lastSyncAttempt > SYNC_ON_FOCUS_AFTER_MS) syncNow(false);
+  $('btn-account-confirm-cancel').addEventListener('click', () => answerConfirm(false));
+  $('btn-account-confirm-ok').addEventListener('click', () => answerConfirm(true));
+  $('modal-account-confirm').addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') answerConfirm(false);
   });
-  setInterval(() => syncNow(false), SYNC_EVERY_MS);
+
+  // Closing the question any way but "Add" keeps the data separate.
+  $('btn-bring-in-add').addEventListener('click', () => answerBringIn('add'));
+  $('btn-bring-in-separate').addEventListener('click', () => answerBringIn('separate'));
+  $('modal-bring-in').addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') answerBringIn('separate');
+  });
+
+  api.on('account-state', (e) => applyAccountState(e.payload));
+  api.on('account-bring-in', (e) => showBringIn(e.payload || {}));
+  // A sync merged changes from another computer, or the account changed.
+  api.on('workspace-changed', () => {
+    reloadWorkspace().catch((err) => toast(errorText(err), 'error'));
+  });
+
+  // Coming back to the window picks up changes made on other computers.
+  window.addEventListener('focus', () => {
+    api.accountWindowFocused().catch(() => {});
+  });
 }

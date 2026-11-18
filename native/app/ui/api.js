@@ -18,11 +18,19 @@ export const clearRecents = () => invoke('clear_recents');
 export const getPlatformInfo = () => invoke('get_platform_info');
 export const getServerStatus = () => invoke('get_server_status');
 
-// ---- account ----------------------------------------------------------------
-export const accountSignIn = (username, password, create) =>
-  invoke('account_sign_in', { username, password, create });
+// ---- accounts (src/accounts.rs) ----------------------------------------------
+// `account` (a key) signs in to that known account on its own server (the
+// locked form); null uses the server in Settings.
+export const accountSignIn = (username, password, keepSignedIn, account) =>
+  invoke('account_sign_in', { username, password, keepSignedIn, account });
+export const accountSignUp = (username, password, keepSignedIn) =>
+  invoke('account_sign_up', { username, password, keepSignedIn });
+export const accountResolveLocal = (choice) => invoke('account_resolve_local', { choice });
+export const accountSwitch = (account) => invoke('account_switch', { account });
 export const accountSignOut = () => invoke('account_sign_out');
+export const accountRemove = (account) => invoke('account_remove', { account });
 export const accountSync = () => invoke('account_sync');
+export const accountWindowFocused = () => invoke('account_window_focused');
 
 // ---- connecting and answering -------------------------------------------------
 export const connectTo = (id) => invoke('connect_to', { id });

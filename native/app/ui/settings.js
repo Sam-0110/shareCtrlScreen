@@ -46,7 +46,6 @@ function openSettings() {
   $('set-password-perm').value = config.passwordPermission;
   $('set-share-audio').checked = config.shareAudio !== false;
   $('set-share-display').value = config.shareDisplayId || '';
-  $('set-auto-login').checked = !!config.autoLogin;
   $('set-clipboard-sync').checked = config.clipboardSync !== false;
   $('set-paste-dropped').checked = config.pasteDroppedFiles !== false;
   $('set-start-with-windows').checked = !!config.startWithWindows;
@@ -90,7 +89,6 @@ async function saveSettings() {
     passwordPermission: $('set-password-perm').value,
     shareAudio: $('set-share-audio').checked,
     shareDisplayId: $('set-share-display').value || null,
-    autoLogin: $('set-auto-login').checked,
     clipboardSync: $('set-clipboard-sync').checked,
     pasteDroppedFiles: $('set-paste-dropped').checked,
     startWithWindows: $('set-start-with-windows').checked,
@@ -434,6 +432,8 @@ export function wireSettings() {
   $('btn-settings-permissions').addEventListener('click', () => openPermissions(''));
   $('btn-permissions-close').addEventListener('click', closePermissions);
   $('btn-settings').addEventListener('click', openSettings);
+  // Home screen, signed-out account: its sign-in form is in Settings.
+  $('btn-locked-sign-in').addEventListener('click', openSettings);
   $('btn-settings-cancel').addEventListener('click', closeSettings);
   $('btn-settings-save').addEventListener('click', saveSettings);
 

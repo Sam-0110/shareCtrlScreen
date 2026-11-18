@@ -16,7 +16,7 @@
 // On Windows release builds, don't spawn a console window.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-mod account;
+mod accounts;
 mod bridge;
 mod commands;
 mod menu;
@@ -211,8 +211,10 @@ fn main() {
     // The saved choice, before any session can create a codec.
     openh264.set_enabled(engine.config().use_openh264);
 
+    let account_manager = accounts::AccountManager::new(engine.clone());
     let state = AppState {
         engine: engine.clone(),
+        accounts: account_manager.clone(),
         decider,
         openh264,
         h264_problem,
@@ -254,9 +256,14 @@ fn main() {
             commands::get_platform_info,
             commands::clear_recents,
             commands::set_remote_name,
-            account::account_sign_in,
-            account::account_sync,
-            account::account_sign_out,
+            accounts::account_sign_in,
+            accounts::account_sign_up,
+            accounts::account_resolve_local,
+            accounts::account_switch,
+            accounts::account_remove,
+            accounts::account_window_focused,
+            accounts::account_sync,
+            accounts::account_sign_out,
             commands::get_server_status,
             commands::get_role,
             commands::connect_to,
@@ -306,6 +313,9 @@ fn main() {
             }
 
             // Bridge engine UiEvents → WebView2 events (replaces ipcRenderer.on).
+            // Accounts: finish signing the selected one in, then keep it synced.
+            account_manager.start(handle.clone());
+
             bridge::spawn(handle, engine.clone(), ui_rx);
 
             // Drive the signaling event loop into the engine. The loop only

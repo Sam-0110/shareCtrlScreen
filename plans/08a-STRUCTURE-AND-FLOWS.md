@@ -329,6 +329,22 @@ Locked(a) ──password──▶ SignedIn(a);   Locked(a) ──"use locally"�
 names and saved host passwords are reachable only while that account is signed in (M16). The
 local workspace is always reachable.
 
+As built in P1 (engine `workspace.rs`, app `accounts.rs`):
+- The engine's selection is `WorkspaceSel::{Local, Account(key), Locked(key)}`; `resolving` is
+  the AccountManager's (it holds new connections with `hold_connects` while it asks).
+- `with_workspace(|ws, stamper| ..) -> Option<R>`: `None` while Locked, so a signed-out account's
+  data cannot be read or written by any path (I13); the closure takes its stamps from the
+  engine's `Stamper`.
+- `switch_workspace(to, end_viewer)`: `end_viewer = false` only where the same data changes
+  owner (sign-up adopting local, "Add", launch); every other switch ends the viewer session.
+- `ConnectError` gains `SignedOut` (connect while Locked) next to `Hosting` and `Switching`.
+- If the app quits while the bring-in question is open, the account stays listed (its token
+  kept if asked) but the computer starts on the local workspace; the account is one switch
+  away. Nothing is merged without an answer.
+- Sync scheduling runs in Rust (the AccountManager's loop: workspace change + 1.5 s, 5 min,
+  window focus after 60 s, sign-in/switch, "Sync now"); the UI only reacts to
+  `account-state` and `workspace-changed`.
+
 ## 6. Flows
 
 Notation: **[UI]** web view, **[TM]** TabManager, **[AM]** AccountManager, **[E]** engine,

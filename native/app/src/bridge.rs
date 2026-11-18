@@ -55,6 +55,7 @@ pub(crate) fn spawn(
                     ("link-trouble", serde_json::json!({ "secsLeft": secs_left }))
                 }
                 UiEvent::LinkRestored => ("link-restored", serde_json::json!({})),
+                UiEvent::WorkspaceChanged => ("workspace-changed", serde_json::json!({})),
                 UiEvent::Displays {
                     list,
                     current,

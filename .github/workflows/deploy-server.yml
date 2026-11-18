@@ -20,6 +20,7 @@ on:
     branches: [main]
     paths:
       - "server/**"
+      - "native/crates/protocol/testdata/sync-vectors.json"
       - ".github/workflows/deploy-server.yml"
   workflow_dispatch:
 

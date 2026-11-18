@@ -3,7 +3,6 @@
 // P4 (plans/08) replaces the viewer half with per-tab session views in tabs.js.
 
 import * as api from './api.js';
-import { scheduleSync } from './accounts.js';
 import { peerLabel, reloadConfig } from './connect.js';
 import { $, S, setState, stopCountdown, toast } from './state.js';
 
@@ -109,7 +108,6 @@ export function wireSession() {
     // Whatever happens next (reconnected, or dropped back to the home screen),
     // the "connection lost" panel is stale.
     $('modal-link').classList.add('hidden');
-    if (p.role !== 'idle') scheduleSync(); // the peer is now a recent
     if (p.role === 'host') {
       $('host-peer').textContent = peerLabel(p.peer);
       $('host-perm').value = p.permission;

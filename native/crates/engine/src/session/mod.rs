@@ -237,6 +237,9 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, 
     teardown(engine);
     let platform = engine.platform();
     let cfg = engine.config();
+    // The person's synced settings (clipboard, dropped files) come from the
+    // active workspace (plans/08 D5); the defaults while signed out.
+    let prefs = engine.prefs();
     let codec = engine.negotiated_codec();
     let shared = Arc::new(Shared::default());
     let stop = Arc::new(AtomicBool::new(false));
@@ -326,7 +329,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, 
     // peer must not read this machine's clipboard (it can hold a password that
     // was never on screen) or write to it.
     let clip_on = Arc::new(AtomicBool::new(
-        cfg.clipboard_sync && permission == Permission::Control,
+        prefs.clipboard_sync && permission == Permission::Control,
     ));
     let (clip_tx, clip_rx) = std::sync::mpsc::channel::<String>();
     let mut threads = Vec::new();
@@ -368,7 +371,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, 
         surface: None,
         shared: shared.clone(),
         downloads_dir: platform.paths().downloads_dir,
-        paste_dropped: cfg.paste_dropped_files,
+        paste_dropped: prefs.paste_dropped_files,
         target_rect: target_rect_for(engine, cfg.share_display_id.as_deref()),
         host: Some(host_ctx.clone()),
     };
@@ -412,7 +415,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, 
         ctl_tx,
         control,
         clip_on,
-        clipboard_setting: cfg.clipboard_sync,
+        clipboard_setting: prefs.clipboard_sync,
         shared: host_shared,
         viewer: None,
         threads,
@@ -469,7 +472,7 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
         return;
     };
     let platform = engine.platform();
-    let cfg = engine.config();
+    let prefs = engine.prefs();
     let codec = engine.negotiated_codec();
     let shared = Arc::new(Shared::default());
     // Viewer control state (task D10): drives the local-pointer cursor
@@ -523,7 +526,7 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
 
     // Clipboard sync. The host applies its own permission gate; here the user's
     // setting governs.
-    let clip_on = Arc::new(AtomicBool::new(cfg.clipboard_sync));
+    let clip_on = Arc::new(AtomicBool::new(prefs.clipboard_sync));
     let (clip_tx, clip_rx) = std::sync::mpsc::channel::<String>();
     {
         let (platform, ctl, gate, stop_c) = (
@@ -620,7 +623,7 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
     }
 
     // OS shortcut capture (Win/Alt+Tab, Cmd+Tab, Super), when the user enabled it.
-    if cfg.capture_shortcuts {
+    if prefs.capture_shortcuts {
         let (platform, surface, ctl, keys, stop_k, hook_input) = (
             platform.clone(),
             surface.clone(),
@@ -656,7 +659,7 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
         ctl_tx,
         control: Arc::new(AtomicBool::new(false)),
         clip_on,
-        clipboard_setting: cfg.clipboard_sync,
+        clipboard_setting: prefs.clipboard_sync,
         shared,
         viewer: Some(ViewerCtx {
             platform: platform.clone(),

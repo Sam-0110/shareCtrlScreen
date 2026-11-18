@@ -67,7 +67,9 @@ export function render() {
   }
 
   // Connect is only possible from a fully idle, registered app.
-  $('btn-connect').disabled = state !== 'READY' || !validUuid($('remote-id').value.trim());
+  // Nor while the selected account is signed out (its computers are hidden).
+  const locked = !!(S.config && S.config.account && S.config.account.state === 'locked');
+  $('btn-connect').disabled = state !== 'READY' || locked || !validUuid($('remote-id').value.trim());
 }
 
 // ---- status / banner / toasts ----------------------------------------------

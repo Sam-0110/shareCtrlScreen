@@ -1,22 +1,20 @@
 name: Server tests
 
-# The signaling/accounts server's own tests. Runs on every change to server/ and is
-# called by deploy-server.yml, so nothing reaches Cloudflare untested.
+# The signaling/accounts server's own tests. Runs on every pull request that changes
+# server/; on main, deploy-server.yml calls it before deploying (so it runs once per
+# push there, not twice), and nothing reaches Cloudflare untested.
 #
 # The accounts smoke test (server/test/accounts-smoke.mjs) drives the real Worker
 # through `wrangler dev`, which runs it locally in workerd with local Durable Object
 # storage — no Cloudflare account and no secrets are needed.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "server/**"
-      - ".github/workflows/server-tests.yml"
   pull_request:
     paths:
       - "server/**"
+      - "native/crates/protocol/testdata/sync-vectors.json"
       - ".github/workflows/server-tests.yml"
   workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -42,6 +40,11 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # The merge cases shared with the app (native/crates/protocol/testdata/
+      # sync-vectors.json): the server's merge must agree with the Rust one.
+      - name: Shared sync merge cases
+        run: npm run test:vectors
 
       - name: Start the Worker locally (wrangler dev)
         shell: bash

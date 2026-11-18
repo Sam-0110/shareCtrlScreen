@@ -16,6 +16,7 @@ mod session;
 pub mod transfer;
 mod tuning;
 pub mod turn;
+mod workspace;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,11 +29,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use handshake::{ApprovalDecision, Decider};
+pub use workspace::WorkspaceSel;
 
 /// How long auto-login waits for the OS secret store to open a saved password
 /// before asking the user instead. Long enough to answer a keyring unlock
 /// prompt, short enough that a wedged store does not leave the connect hanging.
-const SECRET_PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const SECRET_PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Which side of a session this instance is currently playing. A machine
 /// supports one active session at a time (contract §1 v1 simplification).
@@ -77,6 +79,9 @@ pub enum UiEvent {
     },
     /// The peer answered again — the session continues normally.
     LinkRestored,
+    /// The active workspace changed underneath the UI (a sync merged changes
+    /// from another computer, or the account was switched): reload it.
+    WorkspaceChanged,
     /// The host's monitors and the one being shared, for the monitor picker.
     /// On the host it comes from its own capture thread (at session start and
     /// after each switch); on the viewer from the host's `displays` message,
@@ -155,6 +160,11 @@ impl Outbound {
 pub enum ConnectError {
     /// This computer is hosting, or letting a viewer in (D1).
     Hosting,
+    /// The account is being switched (I10).
+    Switching,
+    /// The selected account is signed out: its computers are not reachable
+    /// until its password is entered (I13).
+    SignedOut,
 }
 
 impl std::fmt::Display for ConnectError {
@@ -163,11 +173,25 @@ impl std::fmt::Display for ConnectError {
             ConnectError::Hosting => {
                 "Someone is connected or connecting to this computer: end that first"
             }
+            ConnectError::Switching => "The account is being switched: try again in a moment",
+            ConnectError::SignedOut => "Sign in to the account first",
         })
     }
 }
 
 impl std::error::Error for ConnectError {}
+
+/// A password the viewer just submitted, held until the host accepts it: only
+/// then is it worth saving, and a rejected guess is never persisted.
+struct PendingLogin {
+    host: String,
+    plaintext: String,
+    /// "Remember" was ticked (the default, D7).
+    remember: bool,
+    /// The workspace that was active when it was typed, where it is saved;
+    /// `None` if none was reachable.
+    workspace: Option<String>,
+}
 
 /// Holds [`Engine::admitting`] for one peer and clears it when dropped, so an
 /// admission that ends any way (accepted, denied, a wrong password, a panic)
@@ -190,6 +214,15 @@ impl Drop for Admission<'_> {
 pub struct Engine {
     config_path: PathBuf,
     config: Arc<Mutex<Config>>,
+    /// False when the config must not be written back this run (see
+    /// [`protocol::Loaded::writable`]): every save is skipped, so the user's
+    /// file is never overwritten from a state that could lose data.
+    writable: AtomicBool,
+    /// The workspace store's state: which workspace is reachable, the stamper,
+    /// the switch epoch, live tokens (workspace.rs). Locked before `config`.
+    ws: Mutex<workspace::WsState>,
+    /// Woken after each change to the active workspace (account sync).
+    ws_changed: Arc<tokio::sync::Notify>,
     signaling: SignalingClient,
     role: Arc<Mutex<Role>>,
     /// Whether the signaling socket is currently registered with the server. The
@@ -211,8 +244,8 @@ pub struct Engine {
     turn_servers: Arc<Mutex<Vec<protocol::IceServer>>>,
     /// Viewer: the password just submitted, held until the host accepts it.
     /// Only then is it worth saving — a rejected guess must never be persisted.
-    /// `(host, plaintext, remember)`.
-    pending_login: Arc<Mutex<Option<(String, String, bool)>>>,
+    /// See [`PendingLogin`].
+    pending_login: Arc<Mutex<Option<PendingLogin>>>,
     /// Viewer: the host we last auto-submitted a saved password to. If that host
     /// challenges us again, the saved credential is stale — drop it and fall back
     /// to prompting, instead of looping on a password that no longer works.
@@ -268,14 +301,30 @@ impl Engine {
         tokio::sync::mpsc::UnboundedReceiver<SigEvent>,
     ) {
         let config_path = platform.paths().config_dir.join("config.json");
-        let config = Config::load(&config_path);
+        let loaded = Config::load(&config_path);
+        for note in &loaded.notes {
+            tracing::warn!("{note}");
+        }
+        let config = loaded.config;
         let (signaling, sig_rx) =
             SignalingClient::spawn(config.server_url.clone(), config.uuid.clone());
         let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
-        let translate_modifiers = Arc::new(AtomicBool::new(config.translate_modifiers));
+        let ws = workspace::WsState::at_launch(&config, loaded.legacy_token);
+        // The selected workspace's setting; the default while an account is
+        // still signed out (it opens later, through `switch_workspace`).
+        let prefs = ws
+            .sel
+            .workspace_key()
+            .and_then(|k| config.workspaces.get(k))
+            .map(|w| w.prefs)
+            .unwrap_or_default();
+        let translate_modifiers = Arc::new(AtomicBool::new(prefs.translate_modifiers));
         let engine = Arc::new(Self {
             config_path,
             config: Arc::new(Mutex::new(config)),
+            writable: AtomicBool::new(loaded.writable),
+            ws: Mutex::new(ws),
+            ws_changed: Arc::new(tokio::sync::Notify::new()),
             signaling,
             role: Arc::new(Mutex::new(Role::Idle)),
             connected: Arc::new(AtomicBool::new(false)),
@@ -298,6 +347,9 @@ impl Engine {
             session: Mutex::new(None),
             ice_policy: Mutex::new(IcePolicy::Full),
         });
+        // Host passwords the migration did not carry over (automatic sign-in
+        // was off): their OS secret-store items go too.
+        engine.forget_sealed(loaded.forget_sealed);
         (engine, ui_rx, sig_rx)
     }
 
@@ -315,13 +367,26 @@ impl Engine {
         self.connected.load(Ordering::Relaxed)
     }
 
-    /// Persist a config mutation (settings changes from the UI).
+    /// Persist a change to this computer's own settings (Settings → device
+    /// fields). The person's data goes through [`Engine::with_workspace`].
     pub fn update_config(&self, f: impl FnOnce(&mut Config)) {
         let mut cfg = self.config.lock();
         f(&mut cfg);
-        self.translate_modifiers
-            .store(cfg.translate_modifiers, Ordering::Relaxed);
-        let _ = cfg.persist(&self.config_path);
+        self.save(&cfg);
+    }
+
+    /// Write `cfg` to disk, unless this run must not (see `writable`). A
+    /// failed write is logged; the in-memory value stays authoritative.
+    pub(crate) fn save(&self, cfg: &Config) {
+        if !self.writable.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Err(e) = cfg.persist(&self.config_path) {
+            tracing::warn!(
+                "config: could not save {} ({e})",
+                self.config_path.display()
+            );
+        }
     }
 
     /// Dispatch one inbound signaling event without waiting for it to be handled.
@@ -711,8 +776,7 @@ impl Engine {
                 .map(String::from),
         });
         let _ = self.ui.send(UiEvent::RoleChanged(self.role.lock().clone()));
-        // Persist, not just mutate in memory, so recents survive a restart.
-        self.update_config(|c| c.add_recent(&peer));
+        self.add_recent(&peer);
         let popouts = self.popout_peers.lock().remove(&peer);
         session::begin_host(self, peer, permission, popouts);
     }
@@ -726,6 +790,10 @@ impl Engine {
     /// under the same locks as an incoming request's admission (role →
     /// admitting → outbound), so the two cannot both get through.
     pub fn connect_to(&self, host_uuid: String) -> Result<(), ConnectError> {
+        // Not mid-switch, nor while the selected account is signed out.
+        if let Some(e) = self.connect_blocked() {
+            return Err(e);
+        }
         {
             let role = self.role.lock();
             let admitting = self.admitting.lock();
@@ -753,13 +821,16 @@ impl Engine {
                 popout: true,
             }),
         });
-        self.update_config(|c| c.add_recent(&host_uuid));
+        self.add_recent(&host_uuid);
         Ok(())
     }
 
     /// UI action: clear the recent-ids list. Returns the (now empty) list.
     pub fn clear_recents(&self) -> Vec<String> {
-        self.update_config(|c| c.clear_recents());
+        self.with_workspace(|w, s| {
+            let now = s.now();
+            w.clear_recents(now);
+        });
         Vec::new()
     }
 
@@ -770,12 +841,21 @@ impl Engine {
         id: &str,
         name: &str,
     ) -> std::collections::BTreeMap<String, String> {
-        let mut names = None;
-        self.update_config(|c| {
-            c.set_remote_name(id, name);
-            names = Some(c.remote_names.clone());
+        self.with_workspace(|w, s| {
+            let now = s.now();
+            w.set_remote_name(id, name, now);
+            w.remote_names.clone()
+        })
+        .unwrap_or_default()
+    }
+
+    /// Record a connection to `peer` in the recents of the active workspace
+    /// (none while signed out). Persisted, so recents survive a restart.
+    fn add_recent(&self, peer: &str) {
+        self.with_workspace(|w, s| {
+            let now = s.now();
+            w.add_recent(peer, now);
         });
-        names.unwrap_or_default()
     }
 
     async fn on_password_required(&self, from: String, nonce: String) {
@@ -817,21 +897,18 @@ impl Engine {
         let _ = self.ui.send(UiEvent::PasswordRequired { from: host });
     }
 
-    /// The stored password for `host`, if auto-login is on and we can decrypt it.
+    /// The saved password for `host` in the active workspace, if one is saved
+    /// and the secret store opens it. Saved passwords are used whenever
+    /// present (D7: typed once per host, remembered by default).
     ///
     /// `open` runs off the runtime and is bounded: a locked OS keyring shows an
-    /// unlock prompt and waits for the user, and this is called from the
-    /// signaling loop, which must keep serving (the host side of this same
-    /// process, TURN, further requests). No answer in time means "no saved
-    /// password" and the user is asked normally.
+    /// unlock prompt and waits for the user, and this runs on the host's
+    /// signaling task, which other work for that host waits behind. No answer
+    /// in time means "no saved password" and the user is asked normally.
     async fn saved_login(&self, host: &str) -> Option<String> {
-        let sealed = {
-            let cfg = self.config.lock();
-            if !cfg.auto_login {
-                return None;
-            }
-            cfg.saved_logins.get(host)?.clone()
-        };
+        let sealed = self
+            .with_workspace_read(|w| w.saved_logins.get(host).cloned())
+            .flatten()?;
         let store = self.platform.secrets();
         let open = tokio::task::spawn_blocking(move || store.open(&sealed));
         match tokio::time::timeout(SECRET_PROMPT_TIMEOUT, open).await {
@@ -851,16 +928,18 @@ impl Engine {
         }
     }
 
-    /// Remove `host`'s saved password and let the OS store drop its copy.
+    /// Remove `host`'s saved password from the active workspace and let the
+    /// OS store drop its copy.
     fn forget_saved_login(&self, host: &str) {
-        let mut removed = None;
-        self.update_config(|c| removed = c.saved_logins.remove(host));
+        let removed = self
+            .with_workspace(|w, _| w.saved_logins.remove(host))
+            .flatten();
         self.forget_sealed(removed.into_iter().collect());
     }
 
     /// Hand sealed values whose config entries are gone to the store's `forget`,
     /// off the runtime (a keyring may prompt); nothing waits for it.
-    fn forget_sealed(&self, sealed: Vec<String>) {
+    pub(crate) fn forget_sealed(&self, sealed: Vec<String>) {
         if sealed.is_empty() {
             return;
         }
@@ -872,14 +951,17 @@ impl Engine {
         });
     }
 
-    /// Seal `plaintext` and save it for `host`, detached from the caller: the
-    /// host has just accepted the password, and `seal` may sit behind an OS
-    /// unlock prompt that must not stall the signaling loop. Reported through
-    /// the log and a toast, as before.
-    fn save_login(&self, host: String, plaintext: String) {
+    /// Seal `plaintext` and save it for `host` in `workspace` — the one that
+    /// was active when the password was typed, so a password never lands in
+    /// another account's workspace (I13). Detached from the caller: the host
+    /// has just accepted the password, and `seal` may sit behind an OS unlock
+    /// prompt that must not stall signaling. Reported through the log and a
+    /// toast.
+    fn save_login(&self, workspace: String, host: String, plaintext: String) {
         let store = self.platform.secrets();
         let config = Arc::clone(&self.config);
         let config_path = self.config_path.clone();
+        let writable = self.writable.load(Ordering::Relaxed);
         let ui = self.ui.clone();
         tokio::spawn(async move {
             let seal = {
@@ -903,30 +985,44 @@ impl Engine {
                     return;
                 }
             };
-            let replaced = {
+            // Released: the entry this one replaced, or this one if its
+            // workspace is gone (its account was removed meanwhile).
+            let release = {
                 let mut cfg = config.lock();
-                cfg.auto_login = true;
-                let old = cfg.saved_logins.insert(host.clone(), sealed);
-                let _ = cfg.persist(&config_path);
-                old
+                let release = match cfg.workspaces.get_mut(&workspace) {
+                    None => Some(sealed),
+                    Some(w) => {
+                        tracing::info!("auto-login: saved password for {host}");
+                        w.saved_logins.insert(host, sealed)
+                    }
+                };
+                if writable {
+                    if let Err(e) = cfg.persist(&config_path) {
+                        tracing::warn!("config: could not save ({e})");
+                    }
+                }
+                release
             };
-            tracing::info!("auto-login: saved password for {host}");
-            // The previous entry for this host is unreachable now; let the OS
-            // store release it too.
-            if let Some(old) = replaced {
+            if let Some(old) = release {
                 tokio::task::spawn_blocking(move || store.forget(&old));
             }
         });
     }
 
     /// UI action: answer a `password-required` prompt (viewer side). `remember`
-    /// asks to save the password for auto-login — but only once the host has
-    /// actually accepted it (see `on_connect_response`).
+    /// asks to save the password — but only once the host has actually
+    /// accepted it (see `on_connect_response`).
     pub fn submit_password(&self, host: String, plaintext: String, remember: bool) {
         let nonce = self.pending_nonce.lock().remove(&host).unwrap_or_default();
         // proof = SHA256( SHA256(plaintext) + ":" + nonce ).
         let proof = handshake::compute_proof(&plaintext, &nonce);
-        *self.pending_login.lock() = Some((host.clone(), plaintext, remember));
+        let workspace = self.workspace_sel().workspace_key().map(String::from);
+        *self.pending_login.lock() = Some(PendingLogin {
+            host: host.clone(),
+            plaintext,
+            remember,
+            workspace,
+        });
         // Waiting on the network again: the answer timeout starts over.
         if let Some(o) = self.outbound.lock().as_mut() {
             if o.host == host {
@@ -941,12 +1037,12 @@ impl Engine {
         });
     }
 
-    /// UI action: forget every saved auto-login password.
+    /// UI action: forget every saved host password of the active workspace
+    /// (other accounts' are untouched).
     pub fn clear_saved_logins(&self) {
-        let mut all = Vec::new();
-        self.update_config(|c| {
-            all = std::mem::take(&mut c.saved_logins).into_values().collect();
-        });
+        let all = self
+            .with_workspace(|w, _| std::mem::take(&mut w.saved_logins).into_values().collect())
+            .unwrap_or_default();
         self.forget_sealed(all);
     }
 
@@ -1031,9 +1127,9 @@ impl Engine {
         // Taken into a local first: the lock must not be held across the save
         // (`submit_password` on the UI thread takes it too).
         let pending = self.pending_login.lock().take();
-        if let Some((host, plaintext, remember)) = pending {
-            if remember && host == from {
-                self.save_login(host, plaintext);
+        if let Some(p) = pending {
+            if let (true, true, Some(workspace)) = (p.remember, p.host == from, p.workspace) {
+                self.save_login(workspace, p.host, p.plaintext);
             }
         }
         // The host told us which codec it will stream; decode with the same (§3).

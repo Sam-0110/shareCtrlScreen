@@ -7,15 +7,20 @@ use engine::Role;
 use platform_api::{OsPermission, PermissionReport, PermissionState, Platform};
 use protocol::Permission;
 
-use crate::account;
 use crate::state::AppState;
 
 /// UI-shaped config (camelCase, as the ported renderer expects). Deliberately
 /// omits `passwordHash` — the webview never needs it — and exposes a
 /// `hasPassword` boolean instead, which is all the settings modal uses.
+///
+/// The person's data (recents, names, synced preferences, saved-password
+/// count) comes from the active workspace; while the selected account is
+/// signed out none is reachable (I13) and those read as empty and default.
 #[tauri::command]
 pub fn get_config(state: tauri::State<'_, AppState>) -> serde_json::Value {
     let c = state.engine.config();
+    let ws = state.engine.workspace().unwrap_or_default();
+    let p = ws.prefs;
     serde_json::json!({
         "uuid": c.uuid,
         "serverUrl": c.server_url,
@@ -24,19 +29,18 @@ pub fn get_config(state: tauri::State<'_, AppState>) -> serde_json::Value {
         "passwordPermission": c.password_permission.as_str(),
         "shareAudio": c.share_audio,
         "shareDisplayId": c.share_display_id,
-        "recentIds": c.recent_ids,
-        "remoteNames": c.remote_names,
-        // Signed-in account for ID sync (username/server/lastSync; no token).
-        "account": account::account_json(&c),
-        "captureShortcuts": c.capture_shortcuts,
-        "autoLogin": c.auto_login,
-        "clipboardSync": c.clipboard_sync,
-        "pasteDroppedFiles": c.paste_dropped_files,
+        "recentIds": ws.recent_ids,
+        "remoteNames": ws.remote_names,
+        // Accounts on this computer and the selected one's state (no tokens).
+        "account": state.accounts.view(),
+        "captureShortcuts": p.capture_shortcuts,
+        "clipboardSync": p.clipboard_sync,
+        "pasteDroppedFiles": p.paste_dropped_files,
         "startWithWindows": c.start_with_windows,
         "useOpenH264": c.use_openh264,
-        "translateModifiers": c.translate_modifiers,
+        "translateModifiers": p.translate_modifiers,
         // Count only — the saved passwords themselves never reach the WebView.
-        "savedLoginCount": c.saved_logins.len(),
+        "savedLoginCount": ws.saved_logins.len(),
     })
 }
 
@@ -262,20 +266,8 @@ pub fn save_settings(
         if let Some(b) = patch.get("shareAudio").and_then(|v| v.as_bool()) {
             cfg.share_audio = b;
         }
-        if let Some(b) = patch.get("captureShortcuts").and_then(|v| v.as_bool()) {
-            cfg.capture_shortcuts = b;
-        }
         if let Some(v) = patch.get("shareDisplayId") {
             cfg.share_display_id = v.as_str().filter(|s| !s.is_empty()).map(String::from);
-        }
-        if let Some(b) = patch.get("autoLogin").and_then(|v| v.as_bool()) {
-            cfg.auto_login = b;
-        }
-        if let Some(b) = patch.get("clipboardSync").and_then(|v| v.as_bool()) {
-            cfg.clipboard_sync = b;
-        }
-        if let Some(b) = patch.get("pasteDroppedFiles").and_then(|v| v.as_bool()) {
-            cfg.paste_dropped_files = b;
         }
         if let Some(b) = patch.get("startWithWindows").and_then(|v| v.as_bool()) {
             cfg.start_with_windows = b;
@@ -283,12 +275,18 @@ pub fn save_settings(
         if let Some(b) = patch.get("useOpenH264").and_then(|v| v.as_bool()) {
             cfg.use_openh264 = b;
         }
-        // Read by the running session's key translator on its next key event
-        // (`Engine::update_config` publishes it); held keys release as sent.
-        if let Some(b) = patch.get("translateModifiers").and_then(|v| v.as_bool()) {
-            cfg.translate_modifiers = b;
-        }
     });
+    // The settings that follow the account (D5) live in the active workspace.
+    // Save sends every field, so each is stamped only if its value changed —
+    // otherwise this computer's stale values would beat newer changes made on
+    // another one (08a §6.12 step 7). A change wakes the account sync. The
+    // translator of a running session reads `translateModifiers` on its next
+    // key event; held keys release as sent.
+    for key in protocol::sync::SYNCED_PREFS {
+        if let Some(b) = patch.get(key).and_then(|v| v.as_bool()) {
+            state.engine.set_pref(key, b);
+        }
+    }
     // Explicit "forget everything" from the settings modal. Through the engine,
     // not by clearing the map here: the sealed values are only handles (a
     // Keychain / Secret Service item id on macOS and Linux), so dropping them from
