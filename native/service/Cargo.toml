@@ -13,6 +13,11 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+# build.rs: link the VC runtime statically (no VCRUNTIME140.dll needed on the
+# target machine). Same crate and version tauri-build uses for the app.
+[build-dependencies]
+static_vcruntime = "3.0"
+
 [dependencies]
 elevation = { path = "../crates/elevation" }
 tracing.workspace = true

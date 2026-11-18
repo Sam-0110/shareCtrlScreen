@@ -2,12 +2,12 @@
 //! active user session (Plan 04 §8b). Runs in the LocalSystem service context.
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, CREATE_UNICODE_ENVIRONMENT, NORMAL_PRIORITY_CLASS, PROCESS_INFORMATION,
-    STARTUPINFOW,
+    CreateProcessAsUserW, GetExitCodeProcess, WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT,
+    NORMAL_PRIORITY_CLASS, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 use crate::uiaccess::{primary_token_with_uiaccess, UiAccessError};
@@ -47,6 +47,8 @@ pub fn user_token(session_id: u32) -> Result<HANDLE, SessionError> {
 #[derive(Debug)]
 pub struct Launched {
     pub pid: u32,
+    /// The host's process, so the service can tell when it exits.
+    pub process: HostProcess,
     /// `Ok` when the host was started with the UIAccess token flag; otherwise
     /// why not. The host was started either way.
     pub ui_access: Result<(), UiAccessError>,
@@ -55,7 +57,8 @@ pub struct Launched {
 /// Launch `exe_path` (with `args`) into the user's session on
 /// `winsta0\\default`, inheriting the user's environment (§8b
 /// `CreateProcessAsUser` hand-off). The service calls this to start the engine
-/// and re-calls it whenever the active session changes. `token` stays owned by
+/// and re-calls it whenever the active session changes or the host it started
+/// dies ([`Launched::process`]). `token` stays owned by
 /// the caller and is not modified.
 ///
 /// The process is created from a duplicate of `token` carrying the UIAccess
@@ -116,14 +119,48 @@ pub fn launch_in_session(
     }
     result?;
 
-    // Close the handles we don't keep; the process runs independently.
-    // SAFETY: valid handles from a successful CreateProcessAsUserW.
+    // The thread handle is not needed. The process handle is kept so the
+    // service can see the host exit; it does not tie the process's lifetime.
+    // SAFETY: valid handle from a successful CreateProcessAsUserW.
     unsafe {
         let _ = CloseHandle(pi.hThread);
-        let _ = CloseHandle(pi.hProcess);
     }
     Ok(Launched {
         pid: pi.dwProcessId,
+        process: HostProcess(pi.hProcess),
         ui_access,
     })
+}
+
+/// An owned handle to a launched host's process, closed on drop. Holding it
+/// keeps the exit code readable after the process ends; closing it does not
+/// affect the process.
+#[derive(Debug)]
+pub struct HostProcess(HANDLE);
+
+// SAFETY: a process handle is a process-wide kernel handle, valid from any
+// thread; the wait/query calls used on it are thread-safe.
+unsafe impl Send for HostProcess {}
+
+impl HostProcess {
+    /// `None` while the process runs; its exit code once it has exited. A
+    /// failed query counts as running (the next poll asks again).
+    pub fn exit_code(&self) -> Option<u32> {
+        // SAFETY: our handle, opened by CreateProcessAsUserW with full access;
+        // a zero timeout only polls.
+        if unsafe { WaitForSingleObject(self.0, 0) } != WAIT_OBJECT_0 {
+            return None;
+        }
+        let mut code = 0u32;
+        // SAFETY: valid handle; out param initialized.
+        unsafe { GetExitCodeProcess(self.0, &mut code) }.ok()?;
+        Some(code)
+    }
+}
+
+impl Drop for HostProcess {
+    fn drop(&mut self) {
+        // SAFETY: our handle, closed exactly once.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
 }

@@ -94,6 +94,12 @@
             </select>
           </div>
 
+          <div id="host-display-row" class="row hidden">
+            <label for="host-display">Monitor</label>
+            <select id="host-display" class="input"></select>
+          </div>
+          <div id="host-popouts" class="hint hidden"></div>
+
           <div class="row">
             <button id="btn-host-end" class="btn btn-danger">End session</button>
           </div>
@@ -113,6 +119,8 @@
         <span id="view-peer" class="mono small">&hellip;</span>
         <span id="view-badge" class="badge badge-view">VIEW ONLY</span>
         <div class="spacer"></div>
+        <select id="view-display" class="input input-sm hidden" title="Monitor to show"></select>
+        <select id="view-popout" class="input input-sm hidden" title="Show another monitor in a separate window"></select>
         <button id="btn-view-refresh" class="btn btn-sm" title="Request a fresh keyframe (fixes artifacts)">Refresh</button>
         <button id="btn-view-settings" class="btn btn-ghost btn-sm" title="Settings">&#9881;</button>
         <button id="btn-view-end" class="btn btn-danger btn-sm">Disconnect</button>
@@ -202,6 +210,55 @@
           <span>Server URL</span>
           <input id="set-server" class="input mono" type="text" spellcheck="false" />
         </label>
+
+        <!-- ACCOUNT — optional; syncs remote IDs, their names and the recents
+             between this user's computers (account.rs, server/src/accounts.js).
+             Its buttons act at once; Save/Cancel do not apply to it. -->
+        <fieldset class="field" id="account-section">
+          <legend>Account</legend>
+          <div id="account-signed-out">
+            <div class="hint account-intro">
+              Sign in on each of your computers to keep your remote IDs, their names and
+              your recent connections the same on all of them. Optional &mdash; connecting
+              never needs an account.
+            </div>
+            <div class="row account-row">
+              <input
+                id="account-username"
+                class="input"
+                type="text"
+                placeholder="Username"
+                autocomplete="username"
+                spellcheck="false"
+                maxlength="32"
+              />
+              <input
+                id="account-password"
+                class="input"
+                type="password"
+                placeholder="Password"
+                autocomplete="current-password"
+                maxlength="256"
+              />
+            </div>
+            <div class="row">
+              <button id="btn-account-sign-in" type="button" class="btn btn-sm btn-primary">Sign in</button>
+              <button id="btn-account-create" type="button" class="btn btn-sm">Create account</button>
+            </div>
+          </div>
+          <div id="account-signed-in" class="hidden">
+            <div class="hint account-intro">
+              Signed in as <b id="account-name"></b>. Remote IDs you connect to or name
+              sync with your other computers. Last synced: <span id="account-last-sync"></span>.
+            </div>
+            <div class="row">
+              <button id="btn-account-sync" type="button" class="btn btn-sm">Sync now</button>
+              <button id="btn-account-sign-out" type="button" class="btn btn-sm btn-ghost">Sign out</button>
+            </div>
+            <div class="hint">Signing out keeps the IDs already on this computer.</div>
+          </div>
+          <div id="account-status" class="hint hidden"></div>
+        </fieldset>
 
         <fieldset class="field">
           <legend>Incoming connections</legend>

@@ -115,6 +115,8 @@ dependencies = [
  "platform-windows",
  "protocol",
  "raw-window-handle",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tauri",
@@ -5073,6 +5075,7 @@ version = "2.1.15"
 dependencies = [
  "elevation",
  "platform-api",
+ "static_vcruntime",
  "tracing",
  "tracing-subscriber",
  "windows",

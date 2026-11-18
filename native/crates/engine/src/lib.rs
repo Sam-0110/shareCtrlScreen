@@ -77,6 +77,21 @@ pub enum UiEvent {
     },
     /// The peer answered again — the session continues normally.
     LinkRestored,
+    /// The host's monitors and the one being shared, for the monitor picker.
+    /// On the host it comes from its own capture thread (at session start and
+    /// after each switch); on the viewer from the host's `displays` message,
+    /// and again whenever the viewer's control permission changes.
+    /// `can_switch`: whether this side may switch right now (always on the
+    /// host; only with control on the viewer).
+    Displays {
+        list: Vec<protocol::RemoteDisplay>,
+        current: String,
+        can_switch: bool,
+        /// Monitors also streamed to pop-out windows (D14). The viewer's app
+        /// opens a window per entry ([`Engine::attach_popout`]) and closes
+        /// those no longer listed ([`Engine::close_popout`]).
+        popouts: Vec<protocol::PopoutStream>,
+    },
 }
 
 /// How a session finds a network path to the peer.
@@ -106,6 +121,9 @@ pub struct Engine {
     pending_nonce: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// Viewer decode capabilities per requesting peer, for codec negotiation (§3).
     pending_caps: Arc<Mutex<std::collections::HashMap<String, Vec<String>>>>,
+    /// Requesting peers that advertised pop-out support (D14); consumed at
+    /// accept time like `pending_caps`.
+    popout_peers: Arc<Mutex<std::collections::HashSet<String>>>,
     /// TURN relay servers minted by the signaling server (Cloudflare TURN),
     /// expanded to one `IceServer` per URL. Fetched on register and cached; the
     /// pipeline reads them when gathering the relayed candidate.
@@ -173,6 +191,7 @@ impl Engine {
             ui: ui_tx,
             pending_nonce: Arc::new(Mutex::new(Default::default())),
             pending_caps: Arc::new(Mutex::new(Default::default())),
+            popout_peers: Arc::new(Mutex::new(Default::default())),
             turn_servers: Arc::new(Mutex::new(Vec::new())),
             pending_login: Arc::new(Mutex::new(None)),
             auto_attempted: Arc::new(Mutex::new(None)),
@@ -244,6 +263,16 @@ impl Engine {
                 caps,
                 ..
             } => {
+                // Only a first attempt carries caps (a password retry sends
+                // none, and keeps what the first said); each first attempt
+                // replaces what an earlier, possibly declined one said.
+                if let Some(c) = &caps {
+                    if c.popout {
+                        self.popout_peers.lock().insert(from.clone());
+                    } else {
+                        self.popout_peers.lock().remove(&from);
+                    }
+                }
                 let decode = caps.map(|c| c.decode).unwrap_or_default();
                 self.on_connect_request(from, password, decode).await;
             }
@@ -457,7 +486,8 @@ impl Engine {
         let _ = self.ui.send(UiEvent::RoleChanged(self.role.lock().clone()));
         // Persist, not just mutate in memory, so recents survive a restart.
         self.update_config(|c| c.add_recent(&peer));
-        session::begin_host(self, peer, permission);
+        let popouts = self.popout_peers.lock().remove(&peer);
+        session::begin_host(self, peer, permission, popouts);
     }
 
     // ---- Viewer side (contract §3.2) -------------------------------------
@@ -479,14 +509,17 @@ impl Engine {
             to: Some(host_uuid.clone()),
             from: None,
             password: None,
-            caps: Some(protocol::signaling::Caps { decode }),
+            caps: Some(protocol::signaling::Caps {
+                decode,
+                popout: true,
+            }),
         });
         self.update_config(|c| c.add_recent(&host_uuid));
     }
 
     /// UI action: clear the recent-ids list. Returns the (now empty) list.
     pub fn clear_recents(&self) -> Vec<String> {
-        self.update_config(|c| c.recent_ids.clear());
+        self.update_config(|c| c.clear_recents());
         Vec::new()
     }
 
@@ -759,8 +792,65 @@ impl Engine {
     /// to clear residual smear after packet loss).
     pub fn request_refresh(&self) {
         if matches!(&*self.role.lock(), Role::Viewer { .. }) {
-            session::send_ctl(self, &ControlMsg::KeyframeRequest);
+            session::send_ctl(self, &ControlMsg::KeyframeRequest { s: 0 });
         }
+    }
+
+    /// Switch the shared monitor mid-session. On the host this takes effect
+    /// directly; on the viewer it asks the host, which honours it only while
+    /// this viewer has control. The new state comes back as
+    /// [`UiEvent::Displays`]. Not saved: the host's "Monitor to share" setting
+    /// stays the default for the next session.
+    pub fn select_display(&self, id: String) {
+        let role = self.role.lock().clone();
+        match role {
+            Role::Host { .. } => session::request_display(self, id),
+            Role::Viewer { .. } => session::send_ctl(self, &ControlMsg::SelectDisplay { id }),
+            Role::Idle => {}
+        }
+    }
+
+    /// Viewer (D14): ask the host to ALSO stream monitor `id`, for a separate
+    /// window. Needs control. When the host agrees, a [`UiEvent::Displays`]
+    /// lists it under `popouts`; the app then opens the window and calls
+    /// [`Engine::attach_popout`].
+    pub fn popout_display(&self, id: String) {
+        if matches!(&*self.role.lock(), Role::Viewer { .. }) {
+            session::send_ctl(self, &ControlMsg::Popout { id });
+        }
+    }
+
+    /// Viewer (D14): the app opened the window for pop-out stream `slot` and
+    /// created `surface` in it (on the UI thread). Starts decoding and
+    /// presenting that stream there, and sends its input. Returns the
+    /// attachment's generation, which [`Engine::close_popout`] /
+    /// [`Engine::detach_popout`] take; `None` when there is no viewer session
+    /// or that slot is already attached (see [`Engine::popout_attached`]).
+    pub fn attach_popout(&self, slot: u8, surface: Arc<dyn VideoSurface>) -> Option<u64> {
+        session::open_viewer_popout(self, slot, surface)
+    }
+
+    /// Viewer (D14): whether pop-out stream `slot` has a window attached (an
+    /// old window for a reused slot may still be closing).
+    pub fn popout_attached(&self, slot: u8) -> bool {
+        session::viewer_popout_attached(self, slot)
+    }
+
+    /// Viewer (D14): stop presenting pop-out stream `slot` and take its
+    /// surface down, then tell the host to stop streaming it. Blocks until the
+    /// window's threads are gone, so the app can destroy the window after it.
+    /// Call it off the UI thread (a presenter may wait on that thread).
+    /// `gen` is what [`Engine::attach_popout`] returned (`None` if the window
+    /// never attached: only the host is told).
+    pub fn close_popout(&self, slot: u8, gen: Option<u64>) {
+        session::close_viewer_popout(self, slot, gen, true);
+    }
+
+    /// Viewer (D14): like [`Engine::close_popout`] but without telling the
+    /// host — for a window the host itself stopped streaming (it is no longer
+    /// listed), or one left over from an ended session.
+    pub fn detach_popout(&self, slot: u8, gen: Option<u64>) {
+        session::close_viewer_popout(self, slot, gen, false);
     }
 
     /// End the session locally and tell the peer (best-effort, contract §3.2 s5).

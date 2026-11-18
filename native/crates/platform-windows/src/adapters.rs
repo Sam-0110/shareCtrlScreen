@@ -545,14 +545,14 @@ impl VideoSurface for ChildWindowSurface {
     }
     fn set_input_sink(&self, sink: Option<Sender<VideoInput>>) {
         match sink {
-            Some(tx) => render::window::set_input_sink(tx),
-            None => render::window::clear_input_sink(),
+            Some(tx) => render::window::set_input_sink(self.hwnd, tx),
+            None => render::window::clear_input_sink(self.hwnd),
         }
     }
     fn set_drop_sink(&self, sink: Option<Sender<FileDrop>>) {
         match sink {
-            Some(tx) => render::window::set_file_drop_sink(tx),
-            None => render::window::clear_file_drop_sink(),
+            Some(tx) => render::window::set_file_drop_sink(self.hwnd, tx),
+            None => render::window::clear_file_drop_sink(self.hwnd),
         }
     }
     fn create_presenter(&self) -> Result<Box<dyn Presenter>, SurfaceError> {
@@ -569,10 +569,10 @@ impl VideoSurface for ChildWindowSurface {
         self
     }
     fn local_pointer(&self) -> Option<(f64, f64)> {
-        render::window::local_pointer()
+        render::window::local_pointer(self.hwnd)
     }
     fn set_cursor_control(&self, active: bool) {
-        render::window::set_cursor_control(active);
+        render::window::set_cursor_control(self.hwnd, active);
     }
 }
 

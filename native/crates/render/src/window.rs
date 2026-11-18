@@ -7,10 +7,16 @@
 //!
 //! The window is created on the caller's thread (the app's UI thread, which owns
 //! the message pump) so `WM_SIZE`/paint are serviced by the parent's loop.
+//!
+//! There can be several (task D14: each pop-out window has its own), so all
+//! per-window state — input and drop sinks, letterbox size, hover reveal, held
+//! keys/buttons, cursor hiding — lives in a [`WinState`] per HWND, never in a
+//! process-wide static. Every public function names the window it acts on.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -25,8 +31,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, SetCursor, ShowWindow, CS_HREDRAW, CS_VREDRAW, HMENU, HTCLIENT, IDC_ARROW,
     SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_APP, WM_DROPFILES, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
+    WM_MOUSEWHEEL, WM_NCDESTROY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
 };
 
 const CLASS_NAME: PCWSTR = w!("ShareCtrlVideoWindow");
@@ -34,49 +40,114 @@ static REGISTER: std::sync::Once = std::sync::Once::new();
 
 pub use platform_api::{FileDrop, VideoInput};
 
-/// The engine installs a sink while a viewer session with control is active; the
-/// wndproc forwards captured input to it. `None` ⇒ input is dropped (view-only
-/// or no session), so we never capture when we shouldn't.
-static INPUT_SINK: Mutex<Option<Sender<VideoInput>>> = Mutex::new(None);
+/// Everything one video window tracks.
+struct WinState {
+    /// The engine installs a sink while a viewer session with control is
+    /// active; the wndproc forwards captured input to it. `None` ⇒ input is
+    /// dropped (view-only or no session), so we never capture when we shouldn't.
+    input_sink: Mutex<Option<Sender<VideoInput>>>,
+    /// Files dropped onto the video surface, for push-to-host transfer.
+    /// Installed by the viewer session; `None` ⇒ drops are ignored.
+    drop_sink: Mutex<Option<Sender<FileDrop>>>,
+    /// The rendered video's pixel size (`w<<32 | h`), published by the renderer
+    /// each frame. Input normalization MUST use it: the video is drawn in an
+    /// aspect-preserving letterbox rect inside the window, so a click's position
+    /// has to be normalized over that rect — not the whole window — or it lands
+    /// offset by the black-bar size (the "clicks 1cm off" bug). 0 ⇒ not yet
+    /// known (full window).
+    video_dims: AtomicU64,
+    /// Hover-reveal clip (see [`set_reveal`]): 0 = bar hidden (video
+    /// unclipped); >0 = top strip clipped by that many px.
+    reveal_offset: AtomicI32,
+    /// Keys/buttons currently held down inside the video window, so a focus
+    /// loss (Alt+Tab away, Win key, app switch) can synthesize the matching
+    /// releases. Without this the host receives `Alt down` but never `Alt up` —
+    /// the classic remote-desktop stuck-modifier: Windows takes the focus
+    /// mid-combo and the key-up lands in some other window, never reaching our
+    /// wndproc.
+    held_keys: Mutex<Vec<(u16, bool)>>,
+    held_buttons: Mutex<Vec<u8>>,
+    /// Last normalized cursor position (for synthesized button releases, and
+    /// the task-D10 local-pointer prediction).
+    last_pos: Mutex<(f64, f64)>,
+    /// Task D10: whether this viewer currently has control. While set (and the
+    /// window is focused and the pointer is over the client area) the OS cursor
+    /// is hidden so only the drawn sprite shows; otherwise the normal arrow.
+    cursor_control: AtomicBool,
+    /// Task D10: whether the pointer is currently over the video client area,
+    /// so [`local_pointer`] predicts the sprite only while it is. Maintained by
+    /// `WM_MOUSEMOVE` / `WM_MOUSELEAVE`.
+    pointer_inside: AtomicBool,
+    /// Task D10: whether the video window currently has the keyboard focus.
+    /// The hide is gated on it (like the macOS view): an Alt+Tab to another app
+    /// must bring the OS cursor back over the video even though the pointer is
+    /// still inside our client area. Maintained by `WM_SETFOCUS` /
+    /// `WM_KILLFOCUS`.
+    focused: AtomicBool,
+    /// Whether a `TME_LEAVE` request is outstanding, so one is asked for per
+    /// entry (Windows cancels leave-tracking after it fires the one
+    /// `WM_MOUSELEAVE`).
+    leave_tracked: AtomicBool,
+}
 
-/// Files dropped onto the video surface, for push-to-host transfer. Installed by
-/// the viewer session; `None` ⇒ drops are ignored.
-static FILE_DROP_SINK: Mutex<Option<Sender<FileDrop>>> = Mutex::new(None);
+impl Default for WinState {
+    fn default() -> Self {
+        Self {
+            input_sink: Mutex::new(None),
+            drop_sink: Mutex::new(None),
+            video_dims: AtomicU64::new(0),
+            reveal_offset: AtomicI32::new(0),
+            held_keys: Mutex::new(Vec::new()),
+            held_buttons: Mutex::new(Vec::new()),
+            last_pos: Mutex::new((0.5, 0.5)),
+            cursor_control: AtomicBool::new(false),
+            pointer_inside: AtomicBool::new(false),
+            focused: AtomicBool::new(false),
+            leave_tracked: AtomicBool::new(false),
+        }
+    }
+}
 
-/// Start accepting dropped files on the video window and route them to `tx`.
-pub fn set_file_drop_sink(tx: Sender<FileDrop>) {
-    if let Ok(mut g) = FILE_DROP_SINK.lock() {
+/// Every live video window's state, by HWND.
+fn registry() -> &'static Mutex<HashMap<isize, Arc<WinState>>> {
+    static WINDOWS: OnceLock<Mutex<HashMap<isize, Arc<WinState>>>> = OnceLock::new();
+    WINDOWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The state of video window `hwnd` (created on first use).
+fn state(hwnd: isize) -> Arc<WinState> {
+    let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(hwnd).or_default().clone()
+}
+
+/// Forget window `hwnd` (destroyed with its parent).
+fn forget(hwnd: isize) {
+    registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&hwnd);
+}
+
+/// Start accepting dropped files on video window `hwnd_raw`; route them to `tx`.
+pub fn set_file_drop_sink(hwnd_raw: isize, tx: Sender<FileDrop>) {
+    if let Ok(mut g) = state(hwnd_raw).drop_sink.lock() {
         *g = Some(tx);
     }
-    let hwnd_raw = crate::window::drop_target_hwnd();
-    if hwnd_raw != 0 {
-        // SAFETY: valid child HWND owned by this process.
-        unsafe {
-            windows::Win32::UI::Shell::DragAcceptFiles(HWND(hwnd_raw as *mut _), true);
-        }
+    // SAFETY: valid child HWND owned by this process.
+    unsafe {
+        windows::Win32::UI::Shell::DragAcceptFiles(HWND(hwnd_raw as *mut _), true);
     }
 }
 
-/// Stop accepting dropped files (session end).
-pub fn clear_file_drop_sink() {
-    if let Ok(mut g) = FILE_DROP_SINK.lock() {
+/// Stop accepting dropped files on video window `hwnd_raw` (session end).
+pub fn clear_file_drop_sink(hwnd_raw: isize) {
+    if let Ok(mut g) = state(hwnd_raw).drop_sink.lock() {
         *g = None;
     }
-    let hwnd_raw = drop_target_hwnd();
-    if hwnd_raw != 0 {
-        // SAFETY: valid child HWND owned by this process.
-        unsafe {
-            windows::Win32::UI::Shell::DragAcceptFiles(HWND(hwnd_raw as *mut _), false);
-        }
+    // SAFETY: valid child HWND owned by this process.
+    unsafe {
+        windows::Win32::UI::Shell::DragAcceptFiles(HWND(hwnd_raw as *mut _), false);
     }
-}
-
-/// The video window that accepts drops — remembered at creation so the engine
-/// can enable drag-and-drop without threading the HWND through.
-static DROP_TARGET: AtomicU64 = AtomicU64::new(0);
-
-fn drop_target_hwnd() -> isize {
-    DROP_TARGET.load(Ordering::Relaxed) as isize
 }
 
 /// Pull the dropped paths out of a `WM_DROPFILES` handle and hand them to the
@@ -116,7 +187,7 @@ fn deliver_dropped_files(hwnd: HWND, wparam: WPARAM) {
     if paths.is_empty() {
         return;
     }
-    if let Ok(guard) = FILE_DROP_SINK.lock() {
+    if let Ok(guard) = state(hwnd.0 as isize).drop_sink.lock() {
         if let Some(tx) = guard.as_ref() {
             let _ = tx.send(FileDrop {
                 paths,
@@ -127,20 +198,16 @@ fn deliver_dropped_files(hwnd: HWND, wparam: WPARAM) {
     }
 }
 
-/// The rendered video's pixel size (`w<<32 | h`), published by the renderer each
-/// frame. Input normalization MUST use it: the video is drawn in an
-/// aspect-preserving letterbox rect inside the window, so a click's position has
-/// to be normalized over that rect — not the whole window — or it lands offset by
-/// the black-bar size (the "clicks 1cm off" bug). 0 ⇒ not yet known (full window).
-static VIDEO_DIMS: AtomicU64 = AtomicU64::new(0);
-
-/// Renderer publishes the current video size so input maps to the letterbox rect.
-pub fn set_video_size(w: u32, h: u32) {
-    VIDEO_DIMS.store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
+/// Renderer publishes the current video size of window `hwnd_raw` so input
+/// maps to the letterbox rect.
+pub fn set_video_size(hwnd_raw: isize, w: u32, h: u32) {
+    state(hwnd_raw)
+        .video_dims
+        .store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
 }
 
-fn video_dims() -> (f64, f64) {
-    let v = VIDEO_DIMS.load(Ordering::Relaxed);
+fn video_dims(st: &WinState) -> (f64, f64) {
+    let v = st.video_dims.load(Ordering::Relaxed);
     ((v >> 32) as u32 as f64, (v & 0xffff_ffff) as u32 as f64)
 }
 
@@ -154,7 +221,7 @@ fn normalize_client(hwnd: HWND, px: f64, py: f64) -> (f64, f64) {
     let _ = unsafe { GetClientRect(hwnd, &mut rc) };
     let cw = (rc.right - rc.left).max(1) as f64;
     let ch = (rc.bottom - rc.top).max(1) as f64;
-    let (vw, vh) = video_dims();
+    let (vw, vh) = video_dims(&state(hwnd.0 as isize));
     if vw <= 0.0 || vh <= 0.0 {
         return ((px / cw).clamp(0.0, 1.0), (py / ch).clamp(0.0, 1.0));
     }
@@ -179,8 +246,7 @@ fn normalize_client(hwnd: HWND, px: f64, py: f64) -> (f64, f64) {
 /// therefore constant, which matters twice over — the picture doesn't jump, and
 /// the viewer's reported display size (which drives the host's encode resolution)
 /// doesn't change every time the cursor brushes the top edge.
-/// 0 = bar hidden (video unclipped); >0 = top strip clipped by that many px.
-static REVEAL_OFFSET: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// The clip depth is `WinState::reveal_offset`.
 /// Session menu bar height in CSS px (the web `.view-bar`); scaled by DPI.
 const BAR_CSS_PX: i32 = 40;
 /// Cursor deeper than this many physical px into the video re-hides the bar.
@@ -195,10 +261,9 @@ fn bar_phys(hwnd: HWND) -> i32 {
 }
 
 /// Reveal the web session bar over the video, or hide it again.
-fn set_reveal(hwnd: HWND, reveal: bool) {
-    use std::sync::atomic::Ordering;
+fn set_reveal(st: &WinState, hwnd: HWND, reveal: bool) {
     let bar = if reveal { bar_phys(hwnd) } else { 0 };
-    if REVEAL_OFFSET.swap(bar, Ordering::SeqCst) == bar {
+    if st.reveal_offset.swap(bar, Ordering::SeqCst) == bar {
         return; // no change
     }
     apply_reveal_clip(hwnd, bar);
@@ -233,34 +298,6 @@ fn apply_reveal_clip(hwnd: HWND, bar: i32) {
     }
 }
 
-/// Keys/buttons currently held down inside the video window, so a focus loss
-/// (Alt+Tab away, Win key, app switch) can synthesize the matching releases.
-/// Without this the host receives `Alt down` but never `Alt up` — the classic
-/// remote-desktop stuck-modifier: Windows takes the focus mid-combo and the
-/// key-up lands in some other window, never reaching our wndproc.
-static HELD_KEYS: Mutex<Vec<(u16, bool)>> = Mutex::new(Vec::new());
-static HELD_BUTTONS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-/// Last normalized cursor position (for synthesized button releases, and the
-/// task-D10 local-pointer prediction).
-static LAST_POS: Mutex<(f64, f64)> = Mutex::new((0.5, 0.5));
-
-/// Task D10: whether this viewer currently has control. While set (and the
-/// window is focused and the pointer is over the client area) the OS cursor is
-/// hidden so only the drawn sprite shows; otherwise the normal arrow shows.
-static CURSOR_CONTROL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Task D10: whether the pointer is currently over the video client area, so
-/// [`local_pointer`] predicts the sprite only while it is. Maintained by
-/// `WM_MOUSEMOVE` / `WM_MOUSELEAVE`.
-static POINTER_INSIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Task D10: whether the video window currently has the keyboard focus. The
-/// hide is gated on it (like the macOS view): an Alt+Tab to another app must
-/// bring the OS cursor back over the video even though the pointer is still
-/// inside our client area. Maintained by `WM_SETFOCUS` / `WM_KILLFOCUS`.
-static FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Whether a `TME_LEAVE` request is outstanding, so one is asked for per entry
-/// (Windows cancels leave-tracking after it fires the one `WM_MOUSELEAVE`).
-static LEAVE_TRACKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// A private message posted from [`set_cursor_control`] so the OS cursor is
 /// refreshed on the UI thread at once (a `SetCursor` from another thread would
 /// not affect the window's cursor, and `WM_SETCURSOR` only fires on the next
@@ -271,52 +308,52 @@ const WM_REFRESH_CURSOR: u32 = WM_APP + 1;
 /// it. Stores the flag, drops the inside flag when turning off, and asks the
 /// UI thread to apply the change now (so a stationary pointer does not keep the
 /// old cursor until its next move).
-pub fn set_cursor_control(active: bool) {
-    CURSOR_CONTROL.store(active, Ordering::Relaxed);
+pub fn set_cursor_control(hwnd_raw: isize, active: bool) {
+    let st = state(hwnd_raw);
+    st.cursor_control.store(active, Ordering::Relaxed);
     if !active {
-        POINTER_INSIDE.store(false, Ordering::Relaxed);
+        st.pointer_inside.store(false, Ordering::Relaxed);
     }
-    let hwnd = drop_target_hwnd();
-    if hwnd != 0 {
-        // SAFETY: valid child HWND; posting a message is safe across threads.
-        unsafe {
-            let _ = PostMessageW(
-                Some(HWND(hwnd as *mut _)),
-                WM_REFRESH_CURSOR,
-                WPARAM(0),
-                LPARAM(0),
-            );
-        }
+    // SAFETY: valid child HWND; posting a message is safe across threads.
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(hwnd_raw as *mut _)),
+            WM_REFRESH_CURSOR,
+            WPARAM(0),
+            LPARAM(0),
+        );
     }
 }
 
-/// Task D10: the local pointer over the video (normalized over the letterbox,
-/// matching the input mapping), or `None` when it is not over the client area.
-pub fn local_pointer() -> Option<(f64, f64)> {
-    if !POINTER_INSIDE.load(Ordering::Relaxed) {
+/// Task D10: the local pointer over video window `hwnd_raw` (normalized over
+/// the letterbox, matching the input mapping), or `None` when it is not over
+/// the client area.
+pub fn local_pointer(hwnd_raw: isize) -> Option<(f64, f64)> {
+    let st = state(hwnd_raw);
+    if !st.pointer_inside.load(Ordering::Relaxed) {
         return None;
     }
-    LAST_POS.lock().ok().map(|p| *p)
+    st.last_pos.lock().ok().map(|p| *p)
 }
 
 /// Whether the OS cursor should be hidden right now: controlling, focused, and
 /// the pointer over the client area (task D10).
-fn cursor_should_hide() -> bool {
-    POINTER_INSIDE.load(Ordering::Relaxed)
-        && CURSOR_CONTROL.load(Ordering::Relaxed)
-        && FOCUSED.load(Ordering::Relaxed)
+fn cursor_should_hide(st: &WinState) -> bool {
+    st.pointer_inside.load(Ordering::Relaxed)
+        && st.cursor_control.load(Ordering::Relaxed)
+        && st.focused.load(Ordering::Relaxed)
 }
 
 /// Task D11: re-evaluate whether the OS pointer is physically over the video's
 /// client area and, if so, mark it inside and refresh the predicted position.
 ///
-/// `POINTER_INSIDE` is maintained by `WM_MOUSEMOVE` / `WM_MOUSELEAVE`, so after
+/// `pointer_inside` is maintained by `WM_MOUSEMOVE` / `WM_MOUSELEAVE`, so after
 /// a focus change or a control toggle with no mouse move since, it can be stuck
 /// `false` even though the pointer sits over the video — which drops the drawn
 /// sprite to the stale host position until the next move. Called on focus
 /// regain and when control turns on so the sprite tracks the local pointer at
 /// once. Only ever SETS inside (never clears it): leaving is `WM_MOUSELEAVE`'s job.
-fn reevaluate_pointer_inside(hwnd: HWND) {
+fn reevaluate_pointer_inside(st: &WinState, hwnd: HWND) {
     use windows::Win32::Foundation::POINT;
     // SAFETY: valid child HWND; GetCursorPos/ScreenToClient/GetClientRect read only.
     unsafe {
@@ -334,20 +371,20 @@ fn reevaluate_pointer_inside(hwnd: HWND) {
         }
         // Over the revealed toolbar strip the pointer belongs to the web view
         // (its mouse messages go to the sibling), so treat that as outside.
-        let bar = REVEAL_OFFSET.load(Ordering::SeqCst);
+        let bar = st.reveal_offset.load(Ordering::SeqCst);
         let inside =
             pt.x >= rc.left && pt.x < rc.right && pt.y >= bar.max(rc.top) && pt.y < rc.bottom;
         if !inside {
             return;
         }
         let (nx, ny) = normalize_client(hwnd, pt.x as f64, pt.y as f64);
-        if let Ok(mut p) = LAST_POS.lock() {
+        if let Ok(mut p) = st.last_pos.lock() {
             *p = (nx, ny);
         }
-        POINTER_INSIDE.store(true, Ordering::Relaxed);
+        st.pointer_inside.store(true, Ordering::Relaxed);
         // Ask for one WM_MOUSELEAVE so we still learn when it next leaves,
         // exactly as WM_MOUSEMOVE does on entry.
-        if !LEAVE_TRACKED.swap(true, Ordering::Relaxed) {
+        if !st.leave_tracked.swap(true, Ordering::Relaxed) {
             let mut tme = TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                 dwFlags: TME_LEAVE,
@@ -355,7 +392,7 @@ fn reevaluate_pointer_inside(hwnd: HWND) {
                 dwHoverTime: 0,
             };
             if TrackMouseEvent(&mut tme).is_err() {
-                LEAVE_TRACKED.store(false, Ordering::Relaxed);
+                st.leave_tracked.store(false, Ordering::Relaxed);
             }
         }
     }
@@ -377,19 +414,21 @@ fn apply_os_cursor(hidden: bool) {
 
 /// Synthesize key-up / button-up for everything currently held (focus loss or
 /// session end) so the host never keeps a stuck modifier.
-fn release_all_held() {
-    let keys: Vec<(u16, bool)> = HELD_KEYS
+fn release_all_held(st: &WinState) {
+    let keys: Vec<(u16, bool)> = st
+        .held_keys
         .lock()
         .map(|mut v| v.drain(..).collect())
         .unwrap_or_default();
-    let buttons: Vec<u8> = HELD_BUTTONS
+    let buttons: Vec<u8> = st
+        .held_buttons
         .lock()
         .map(|mut v| v.drain(..).collect())
         .unwrap_or_default();
     if keys.is_empty() && buttons.is_empty() {
         return;
     }
-    let (nx, ny) = LAST_POS.lock().map(|p| *p).unwrap_or((0.5, 0.5));
+    let (nx, ny) = st.last_pos.lock().map(|p| *p).unwrap_or((0.5, 0.5));
     tracing::debug!(
         "video window: focus lost — releasing {} held key(s), {} button(s)",
         keys.len(),
@@ -397,39 +436,43 @@ fn release_all_held() {
     );
     for (scancode, extended) in keys {
         if let Some(code) = input::scancode::code_for(scancode, extended) {
-            emit(VideoInput::Key { code, down: false });
+            emit(st, VideoInput::Key { code, down: false });
         }
     }
     for button in buttons {
-        emit(VideoInput::Button {
-            button,
-            down: false,
-            nx,
-            ny,
-        });
+        emit(
+            st,
+            VideoInput::Button {
+                button,
+                down: false,
+                nx,
+                ny,
+            },
+        );
     }
 }
 
-/// Install the input sink (viewer session start).
-pub fn set_input_sink(tx: Sender<VideoInput>) {
-    if let Ok(mut g) = INPUT_SINK.lock() {
+/// Install video window `hwnd_raw`'s input sink (viewer session start).
+pub fn set_input_sink(hwnd_raw: isize, tx: Sender<VideoInput>) {
+    if let Ok(mut g) = state(hwnd_raw).input_sink.lock() {
         *g = Some(tx);
     }
 }
 
-/// Remove the input sink (session end / view-only).
-pub fn clear_input_sink() {
+/// Remove video window `hwnd_raw`'s input sink (session end / view-only).
+pub fn clear_input_sink(hwnd_raw: isize) {
+    let st = state(hwnd_raw);
     // Release everything still held BEFORE dropping the sink, so the host never
     // keeps a key or button down after the session (or control) ends. This also
     // empties the held state, so nothing leaks into the next session.
-    release_all_held();
-    if let Ok(mut g) = INPUT_SINK.lock() {
+    release_all_held(&st);
+    if let Ok(mut g) = st.input_sink.lock() {
         *g = None;
-    }
+    };
 }
 
-fn emit(ev: VideoInput) {
-    if let Ok(guard) = INPUT_SINK.lock() {
+fn emit(st: &WinState, ev: VideoInput) {
+    if let Ok(guard) = st.input_sink.lock() {
         if let Some(tx) = guard.as_ref() {
             let _ = tx.send(ev);
         }
@@ -468,8 +511,11 @@ impl VideoWindow {
                 None,
             )?
         };
-        // Remember the surface so the engine can toggle drag-and-drop on it.
-        DROP_TARGET.store(hwnd.0 as u64, Ordering::Relaxed);
+        // Fresh state for this window (an old HWND value may be reused).
+        registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(hwnd.0 as isize, Arc::default());
         Ok(Self { hwnd, parent })
     }
 
@@ -498,7 +544,7 @@ impl VideoWindow {
 pub fn show(hwnd_raw: isize) {
     use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, HWND_TOP, SWP_SHOWWINDOW};
     let hwnd = HWND(hwnd_raw as *mut _);
-    REVEAL_OFFSET.store(0, std::sync::atomic::Ordering::SeqCst);
+    state(hwnd_raw).reveal_offset.store(0, Ordering::SeqCst);
     // SAFETY: valid child HWND created by `VideoWindow::create`.
     unsafe {
         let parent = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd);
@@ -525,7 +571,6 @@ pub fn show(hwnd_raw: isize) {
 /// window resizes track without a WM_SIZE hook into the Tauri parent; no-ops
 /// when the size already matches.
 pub fn fit(hwnd_raw: isize) {
-    use std::sync::atomic::Ordering;
     let hwnd = HWND(hwnd_raw as *mut _);
     // SAFETY: valid child HWND; reads two client rects and conditionally moves.
     unsafe {
@@ -545,7 +590,7 @@ pub fn fit(hwnd_raw: isize) {
         if cur_w != want_w || cur_h != want_h {
             let _ = MoveWindow(hwnd, 0, 0, want_w, want_h, true);
             // A resize invalidates the old region — re-clip if the bar is up.
-            let offset = REVEAL_OFFSET.load(Ordering::SeqCst);
+            let offset = state(hwnd_raw).reveal_offset.load(Ordering::SeqCst);
             if offset > 0 {
                 apply_reveal_clip(hwnd, offset);
             }
@@ -574,14 +619,15 @@ pub fn client_size(hwnd_raw: isize) -> (u32, u32) {
 /// Hide the video surface (back to the home screen / settings overlay).
 pub fn hide(hwnd_raw: isize) {
     let hwnd = HWND(hwnd_raw as *mut _);
-    REVEAL_OFFSET.store(0, std::sync::atomic::Ordering::SeqCst);
-    VIDEO_DIMS.store(0, Ordering::Relaxed); // avoid stale mapping next session
-                                            // Stop predicting the cursor from a stale position once the surface is gone
-                                            // (task D10). `set_cursor_control(false)` from teardown has usually run
-                                            // already; this covers the link-trouble hide too.
-    POINTER_INSIDE.store(false, Ordering::Relaxed);
-    LEAVE_TRACKED.store(false, Ordering::Relaxed);
-    FOCUSED.store(false, Ordering::Relaxed);
+    let st = state(hwnd_raw);
+    st.reveal_offset.store(0, Ordering::SeqCst);
+    st.video_dims.store(0, Ordering::Relaxed); // avoid stale mapping next session
+                                               // Stop predicting the cursor from a stale position once the surface is gone
+                                               // (task D10). `set_cursor_control(false)` from teardown has usually run
+                                               // already; this covers the link-trouble hide too.
+    st.pointer_inside.store(false, Ordering::Relaxed);
+    st.leave_tracked.store(false, Ordering::Relaxed);
+    st.focused.store(false, Ordering::Relaxed);
 
     // Clip the surface to NOTHING as well as hiding it.
     //
@@ -635,6 +681,14 @@ fn register_class() {
 // (§7) and forwards it to the engine, which relays it to the host. Capture is
 // gated by the sink being installed — only during a viewer session with control.
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Destroyed with its parent (a closed pop-out window, D14): drop its state.
+    if msg == WM_NCDESTROY {
+        forget(hwnd.0 as isize);
+        // SAFETY: default handling.
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    let st = state(hwnd.0 as isize);
+    let st = st.as_ref();
     // Normalized cursor position from lParam (signed 16-bit lo/hi), mapped over
     // the LETTERBOX rect (must match the renderer's letterbox exactly), so clicks
     // land where the cursor is on the remote — not offset by the black bars.
@@ -649,23 +703,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // Hover-reveal of the session menu bar (§7): top edge → slide the
             // video down to expose the web bar; deep re-entry → slide back up.
             {
-                use std::sync::atomic::Ordering;
                 let y_phys = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
-                let revealed = REVEAL_OFFSET.load(Ordering::SeqCst) > 0;
+                let revealed = st.reveal_offset.load(Ordering::SeqCst) > 0;
                 if !revealed && y_phys <= 2 {
-                    set_reveal(hwnd, true);
+                    set_reveal(st, hwnd, true);
                 } else if revealed && y_phys > UNREVEAL_DEPTH_PX {
-                    set_reveal(hwnd, false);
+                    set_reveal(st, hwnd, false);
                 }
             }
             let (nx, ny) = norm_pos(lparam);
-            if let Ok(mut p) = LAST_POS.lock() {
+            if let Ok(mut p) = st.last_pos.lock() {
                 *p = (nx, ny);
             }
             // Task D10: the pointer is over the video — predict the sprite here,
             // and ask for one WM_MOUSELEAVE so we learn when it leaves.
-            POINTER_INSIDE.store(true, Ordering::Relaxed);
-            if !LEAVE_TRACKED.swap(true, Ordering::Relaxed) {
+            st.pointer_inside.store(true, Ordering::Relaxed);
+            if !st.leave_tracked.swap(true, Ordering::Relaxed) {
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                     dwFlags: TME_LEAVE,
@@ -674,18 +727,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 };
                 // SAFETY: `tme` is fully initialized; `hwnd` is our window.
                 if unsafe { TrackMouseEvent(&mut tme) }.is_err() {
-                    LEAVE_TRACKED.store(false, Ordering::Relaxed);
+                    st.leave_tracked.store(false, Ordering::Relaxed);
                 }
             }
-            emit(VideoInput::Move { nx, ny });
+            emit(st, VideoInput::Move { nx, ny });
             return LRESULT(0);
         }
         // Task D10: the pointer left the video — stop predicting (the sprite
         // falls back to the host's out-of-band position) and let the window
         // under the pointer set its own cursor.
         WM_MOUSELEAVE => {
-            POINTER_INSIDE.store(false, Ordering::Relaxed);
-            LEAVE_TRACKED.store(false, Ordering::Relaxed);
+            st.pointer_inside.store(false, Ordering::Relaxed);
+            st.leave_tracked.store(false, Ordering::Relaxed);
             return LRESULT(0);
         }
         // Task D10: hide the OS cursor while controlling and the pointer is over
@@ -700,7 +753,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // with the pointer inside, matching the macOS view). Returning
                 // TRUE stops Windows from setting the class cursor afterwards.
                 let hide =
-                    CURSOR_CONTROL.load(Ordering::Relaxed) && FOCUSED.load(Ordering::Relaxed);
+                    st.cursor_control.load(Ordering::Relaxed) && st.focused.load(Ordering::Relaxed);
                 apply_os_cursor(hide);
                 return LRESULT(1);
             }
@@ -711,21 +764,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_REFRESH_CURSOR => {
             // Task D11: control may have just turned ON while the pointer was
             // already sitting over the video (no move since), so re-evaluate
-            // `POINTER_INSIDE` here or the sprite would stay at the host spot.
-            if CURSOR_CONTROL.load(Ordering::Relaxed) {
-                reevaluate_pointer_inside(hwnd);
+            // `pointer_inside` here or the sprite would stay at the host spot.
+            if st.cursor_control.load(Ordering::Relaxed) {
+                reevaluate_pointer_inside(st, hwnd);
             }
-            apply_os_cursor(cursor_should_hide());
+            apply_os_cursor(cursor_should_hide(st));
             return LRESULT(0);
         }
         // Task D10: regained focus — re-hide if still controlling over the video.
         WM_SETFOCUS => {
-            FOCUSED.store(true, Ordering::Relaxed);
+            st.focused.store(true, Ordering::Relaxed);
             // Task D11: on focus regain the pointer may already be over the video
-            // with no move since the focus loss, leaving `POINTER_INSIDE` stuck
+            // with no move since the focus loss, leaving `pointer_inside` stuck
             // `false`; re-evaluate so the sprite doesn't drop to the host spot.
-            reevaluate_pointer_inside(hwnd);
-            apply_os_cursor(cursor_should_hide());
+            reevaluate_pointer_inside(st, hwnd);
+            apply_os_cursor(cursor_should_hide(st));
             return LRESULT(0);
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
@@ -737,17 +790,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 WM_MBUTTONDOWN => 1,
                 _ => 2,
             };
-            if let Ok(mut held) = HELD_BUTTONS.lock() {
+            if let Ok(mut held) = st.held_buttons.lock() {
                 if !held.contains(&button) {
                     held.push(button);
                 }
             }
-            emit(VideoInput::Button {
-                button,
-                down: true,
-                nx,
-                ny,
-            });
+            emit(
+                st,
+                VideoInput::Button {
+                    button,
+                    down: true,
+                    nx,
+                    ny,
+                },
+            );
             return LRESULT(0);
         }
         WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP => {
@@ -757,32 +813,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 WM_MBUTTONUP => 1,
                 _ => 2,
             };
-            if let Ok(mut held) = HELD_BUTTONS.lock() {
+            if let Ok(mut held) = st.held_buttons.lock() {
                 held.retain(|&b| b != button);
             }
-            emit(VideoInput::Button {
-                button,
-                down: false,
-                nx,
-                ny,
-            });
+            emit(
+                st,
+                VideoInput::Button {
+                    button,
+                    down: false,
+                    nx,
+                    ny,
+                },
+            );
             return LRESULT(0);
         }
         WM_MOUSEWHEEL => {
             let dy = ((wparam.0 >> 16) & 0xffff) as i16 as i32;
-            emit(VideoInput::Wheel { dx: 0, dy });
+            emit(st, VideoInput::Wheel { dx: 0, dy });
             return LRESULT(0);
         }
         WM_MOUSEHWHEEL => {
             let dx = ((wparam.0 >> 16) & 0xffff) as i16 as i32;
-            emit(VideoInput::Wheel { dx, dy: 0 });
+            emit(st, VideoInput::Wheel { dx, dy: 0 });
             return LRESULT(0);
         }
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
             let scancode = ((lparam.0 >> 16) & 0xff) as u16;
             let extended = (lparam.0 & (1 << 24)) != 0;
             let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-            if let Ok(mut held) = HELD_KEYS.lock() {
+            if let Ok(mut held) = st.held_keys.lock() {
                 if down {
                     if !held.contains(&(scancode, extended)) {
                         held.push((scancode, extended));
@@ -793,7 +852,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             // Unmapped keys (media keys, Pause, Fn) are deliberately not sent.
             if let Some(code) = input::scancode::code_for(scancode, extended) {
-                emit(VideoInput::Key { code, down });
+                emit(st, VideoInput::Key { code, down });
             }
             return LRESULT(0);
         }
@@ -801,11 +860,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // switch): the key-ups will land elsewhere, so synthesize them NOW or
         // the host keeps a stuck modifier.
         WM_KILLFOCUS => {
-            release_all_held();
+            release_all_held(st);
             // Task D10: restore the OS cursor at once — an unfocused video
             // region must never be left cursor-less, even with the pointer
             // still inside it.
-            FOCUSED.store(false, Ordering::Relaxed);
+            st.focused.store(false, Ordering::Relaxed);
             apply_os_cursor(false);
             return LRESULT(0);
         }

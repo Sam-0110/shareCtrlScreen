@@ -31,7 +31,9 @@ pub mod session;
 pub mod uiaccess;
 
 pub use desktop::InputDesktopFollower;
-pub use session::{active_console_session, launch_in_session, user_token, Launched, SessionError};
+pub use session::{
+    active_console_session, launch_in_session, user_token, HostProcess, Launched, SessionError,
+};
 pub use uiaccess::{query_process_uiaccess, OwnedToken, UiAccessError};
 
 /// Passed by the service to the host it launches into the user session, so

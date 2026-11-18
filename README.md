@@ -34,6 +34,12 @@ Run the installer from the Releases page.
   registers and starts the `ShareCtrlScreenHost` service (one administrator consent). The
   service launches the host at every sign-in and reaches the lock screen and UAC prompts.
   Uninstalling removes the service.
+- The host the service starts lives in the notification area. **Closing its window does
+  not disconnect the machine**: it ends any live session and hides the window, and the
+  machine stays reachable. Click the tray icon to bring the window back, or right-click
+  it → **Quit** to stop the host. After Quit the host stays stopped until you sign in
+  again or start the app. If the host crashes or is ended from Task Manager, the service
+  starts it again within seconds.
 - Because the service already starts the host at sign-in, the installed app does **not**
   add its own "Start at sign-in" entry (one host, not two). The setting has no effect while
   the service is installed.
@@ -194,6 +200,29 @@ While a session is running, the host's session panel can switch the permission
 between `view` and `control` at any time — it takes effect immediately, without
 reconnecting — and can end the session.
 
+**Accounts: sync your remote IDs** (native app, ⚙ Settings → Account). Accounts
+are optional. Connecting never needs one. Create an account on one computer and
+sign in to it on the others. The remote IDs you name, the recent IDs you connect
+to, and **Clear** on the recents then stay the same on every signed-in computer.
+The app syncs at sign-in and at startup, shortly after any change, when the
+window comes to the front, and every 5 minutes. **Sync now** forces a sync.
+When the same ID is renamed on two computers, the newer name wins. Removing a
+name also syncs. Signing out keeps the IDs already on that computer.
+
+- The account lives on the signaling server in **Server URL** (`wss://host/ws` →
+  `https://host/api/...`; see `server/src/accounts.js`). The server stores a
+  PBKDF2 hash of the password, hashes of the sign-in tokens, and the ID list
+  (IDs, names, and last-connected times).
+- The sign-in token is kept in the app's `config.json`. It can only read and
+  replace the ID list. Connecting to a machine still needs that machine's approval
+  or password. Wrong passwords lock sign-in to the account for 15 minutes after
+  10 tries. With the `AUTH_LIMITER` binding, each IP address is also limited to 20
+  sign-in or sign-up attempts per minute.
+- Deploying this server version adds the `AccountStore` Durable Object (migration
+  `v2`) and the `AUTH_LIMITER` rate limit (`server/wrangler.jsonc`). Older apps
+  keep working unchanged. To check the API against `wrangler dev`, run
+  `npm run test:accounts` in `server/`.
+
 ## Updating
 
 ShareCtrlScreen updates itself. **⚙ Settings → Updates** shows the current version
@@ -273,6 +302,17 @@ publishes nothing. To build this machine's assets locally the same way, run
   sharing a non-primary monitor maps input through the Win32 virtual desktop
   (`VIRTUALDESK`, DPI-corrected). Capture and injection stay consistent for the
   chosen monitor. (One monitor at a time; no all-monitors view.)
+- **Switching monitors mid-session:** without reconnecting, the host can change the shared
+  monitor from its session card, and a viewer **with control** can switch from the session bar
+  (Windows) or the **Monitor** menu (macOS/Linux). A view-only viewer cannot. The switch lasts
+  for the session; "Monitor to share" stays the default. Linux Wayland hosts offer no list (the
+  portal picks the output).
+- **Pop-out windows (other monitors side by side):** a viewer **with control** can open more of
+  the host's monitors, each in its own window (session bar "Pop out…" on Windows, **Monitor →
+  Open in New Window** on macOS/Linux; up to 3). Each window has its own video stream and mouse
+  mapping; the bandwidth is shared between them. Closing a window stops its stream, and revoking
+  control closes them all. The host's session card lists them. Both sides need this version (an
+  older peer just doesn't offer it). File drop and shortcut capture work in the main window only.
 - **Elevated windows are not controllable (Windows).** A non-elevated host cannot inject
   into UAC prompts or apps running as administrator — this is the Windows UIPI
   security boundary, not a bug. Run the host as administrator if you need to

@@ -20,26 +20,264 @@
 //! * `crate::tuning`: the pure [`encoder_target`](crate::tuning::encoder_target)
 //!   bitrate policy.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-use platform_api::{CaptureError, Codec, EncoderConfig, Platform, ScreenCapture};
+use platform_api::{CaptureError, Codec, DisplayInfo, EncoderConfig, Platform, ScreenCapture};
 
 use crate::session::Shared;
 use crate::tuning::{MAX_FPS, MAX_FPS_INTERVAL};
 
-/// What the host media thread needs.
-pub(crate) struct HostMedia {
+/// What every host media thread of a session shares: the main stream's and
+/// each pop-out stream's (D14). The transport thread holds one too, to start
+/// pop-out streams.
+#[derive(Clone)]
+pub(crate) struct HostCtx {
     pub platform: Arc<dyn Platform>,
-    /// `DisplayInfo::id` to share; `None` = primary.
-    pub display: Option<String>,
     pub codec: Codec,
     pub shared: Arc<Shared>,
     /// The reliable control channel, for cursor images (D9): an image is sent
-    /// once, so it must not be lost the way a stale position may be.
+    /// once, so it must not be lost the way a stale position may be. Also
+    /// carries the monitor list to the viewer.
     pub ctl_tx: Sender<Vec<u8>>,
+    /// The host's own UI: the monitor list for its picker, and why a monitor
+    /// switch failed.
+    pub ui: tokio::sync::mpsc::UnboundedSender<crate::UiEvent>,
+    /// Encoded AUs to the transport, tagged with their video stream slot.
+    pub frame_tx: Sender<(u8, Vec<u8>, bool)>,
+    /// Cursor positions to the transport (unreliable-latest channel).
+    pub cursor_tx: Sender<Vec<u8>>,
+    /// The session's smoothed encoder target; split evenly across the live
+    /// streams (`Shared::live_streams`).
+    pub bitrate: Arc<AtomicU32>,
+    /// The session's stop flag.
+    pub stop: Arc<AtomicBool>,
 }
+
+/// One video stream of the host.
+pub(crate) struct StreamSpec {
+    /// 0 = the main window's stream (switchable, see `Shared::display_req`);
+    /// 1.. = a pop-out window's, pinned to `display`.
+    pub slot: u8,
+    /// `DisplayInfo::id` to share; `None` = primary (main stream only).
+    pub display: Option<String>,
+    /// Set to make this stream's encoder emit an IDR (rate-limited).
+    pub force_key: Arc<AtomicBool>,
+    /// The size the viewer shows this stream at, `w << 32 | h` (0 = unknown).
+    pub view_size: Arc<AtomicU64>,
+    /// Pop-out only: stops this stream alone (window closed, control revoked).
+    pub stream_stop: Option<Arc<AtomicBool>>,
+}
+
+/// Most pop-out windows a session offers (one spare video track each).
+pub(crate) const MAX_POPOUTS: u8 = 3;
+
+/// The host's video streams: which monitor the main window shows and which
+/// are streamed to pop-out windows (D14).
+#[derive(Default)]
+pub(crate) struct HostStreams {
+    /// The main stream's monitor id ("" until known / none listed).
+    pub current: String,
+    /// Spare video tracks in this session's offer: pop-out slots are
+    /// `1..=pop_slots`.
+    pub pop_slots: u8,
+    pub popouts: std::collections::BTreeMap<u8, HostPopout>,
+}
+
+/// A monitor streamed to a pop-out window.
+pub(crate) struct HostPopout {
+    pub id: String,
+    pub stop: Arc<AtomicBool>,
+    pub force_key: Arc<AtomicBool>,
+    pub view_size: Arc<AtomicU64>,
+}
+
+impl HostStreams {
+    /// Stop and forget the pop-out showing `id`, if any (e.g. the main window
+    /// switched to that monitor). Returns whether one was removed.
+    pub fn close_showing(&mut self, id: &str) -> bool {
+        let slot = self
+            .popouts
+            .iter()
+            .find(|(_, p)| p.id == id)
+            .map(|(s, _)| *s);
+        match slot.and_then(|s| self.popouts.remove(&s)) {
+            Some(p) => {
+                p.stop.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Stop and forget every pop-out. Returns whether there were any.
+    pub fn close_all(&mut self) -> bool {
+        let any = !self.popouts.is_empty();
+        for (_, p) in std::mem::take(&mut self.popouts) {
+            p.stop.store(true, Ordering::SeqCst);
+        }
+        any
+    }
+
+    /// A free pop-out slot, if any.
+    pub fn free_slot(&self) -> Option<u8> {
+        (1..=self.pop_slots).find(|s| !self.popouts.contains_key(s))
+    }
+}
+
+/// Keep `Shared::live_streams` (the bitrate divisor) in step with `streams`.
+fn update_live(shared: &Shared, streams: &HostStreams) {
+    shared
+        .live_streams
+        .store(1 + streams.popouts.len() as u32, Ordering::SeqCst);
+}
+
+/// The id of the display a capture opened with `display` actually shows:
+/// that id when it is listed, else the primary (what `create_capture(None)`
+/// shares), else the first listed. Empty when the platform lists none.
+fn resolve_display_id(displays: &[DisplayInfo], display: Option<&str>) -> String {
+    display
+        .and_then(|id| displays.iter().find(|d| d.id == id))
+        .or_else(|| displays.iter().find(|d| d.primary))
+        .or_else(|| displays.first())
+        .map(|d| d.id.clone())
+        .unwrap_or_default()
+}
+
+/// Tell the viewer (ctl) and the host UI which monitors exist, which one the
+/// main window shows and which are streamed to pop-out windows.
+pub(crate) fn announce(ctx: &HostCtx) {
+    let displays = ctx.platform.displays();
+    let (current, popouts) = {
+        let streams = ctx.shared.host_streams.lock();
+        update_live(&ctx.shared, &streams);
+        let popouts: Vec<protocol::PopoutStream> = streams
+            .popouts
+            .iter()
+            .map(|(s, p)| protocol::PopoutStream {
+                s: *s,
+                id: p.id.clone(),
+            })
+            .collect();
+        (streams.current.clone(), popouts)
+    };
+    announce_displays(&displays, &current, &popouts, &ctx.ctl_tx, &ctx.ui);
+}
+
+fn announce_displays(
+    displays: &[DisplayInfo],
+    current: &str,
+    popouts: &[protocol::PopoutStream],
+    ctl_tx: &Sender<Vec<u8>>,
+    ui: &tokio::sync::mpsc::UnboundedSender<crate::UiEvent>,
+) {
+    let list: Vec<protocol::RemoteDisplay> = displays
+        .iter()
+        .map(|d| protocol::RemoteDisplay {
+            id: d.id.clone(),
+            name: d.name.clone(),
+            width: d.width,
+            height: d.height,
+            primary: d.primary,
+        })
+        .collect();
+    let msg = protocol::ControlMsg::Displays {
+        list: list.clone(),
+        current: current.to_string(),
+        popouts: popouts.to_vec(),
+    };
+    let _ = ctl_tx.send(serde_json::to_vec(&msg).unwrap_or_default());
+    let _ = ui.send(crate::UiEvent::Displays {
+        list,
+        current: current.to_string(),
+        can_switch: true,
+        popouts: popouts.to_vec(),
+    });
+}
+
+/// Start streaming monitor `id` to a pop-out window, on a spare video track.
+/// Refused (logged, `false`) when it is not listed, is what the main window
+/// already shows, is already popped out, or no spare track is left. The
+/// caller announces the result either way.
+pub(crate) fn start_popout(ctx: &HostCtx, id: &str) -> bool {
+    if !ctx.platform.displays().iter().any(|d| d.id == id) {
+        tracing::warn!("host: pop-out of {id:?}: no such display");
+        return false;
+    }
+    let (slot, spec) = {
+        let mut streams = ctx.shared.host_streams.lock();
+        if streams.current == id || streams.popouts.values().any(|p| p.id == id) {
+            tracing::info!("host: pop-out of {id:?}: already shown");
+            return false;
+        }
+        let Some(slot) = streams.free_slot() else {
+            tracing::warn!(
+                "host: pop-out of {id:?}: all {} spare streams in use",
+                streams.pop_slots
+            );
+            return false;
+        };
+        let popout = HostPopout {
+            id: id.to_string(),
+            stop: Arc::new(AtomicBool::new(false)),
+            force_key: Arc::new(AtomicBool::new(false)),
+            view_size: Arc::default(),
+        };
+        let spec = StreamSpec {
+            slot,
+            display: Some(id.to_string()),
+            force_key: popout.force_key.clone(),
+            view_size: popout.view_size.clone(),
+            stream_stop: Some(popout.stop.clone()),
+        };
+        streams.popouts.insert(slot, popout);
+        update_live(&ctx.shared, &streams);
+        (slot, spec)
+    };
+    tracing::info!("host: streaming monitor {id:?} to pop-out window {slot}");
+    let thread_ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("sct-host-popout-{slot}"))
+        .spawn(move || {
+            let stream_stop = spec.stream_stop.clone();
+            if let Err(e) = host_media_loop(thread_ctx.clone(), spec) {
+                tracing::warn!("host pop-out stream {slot} ended: {e}");
+                let _ = thread_ctx.ui.send(crate::UiEvent::Toast(format!(
+                    "Could not show that monitor in a separate window: {e}"
+                )));
+            }
+            // Ended by itself (not closed): forget it and tell both sides, so
+            // the viewer closes the window instead of showing a frozen frame.
+            let mut streams = thread_ctx.shared.host_streams.lock();
+            let mine = streams.popouts.get(&slot).is_some_and(|p| {
+                stream_stop
+                    .as_ref()
+                    .is_some_and(|s| Arc::ptr_eq(s, &p.stop))
+            });
+            if mine && !thread_ctx.stop.load(Ordering::SeqCst) {
+                streams.popouts.remove(&slot);
+                drop(streams);
+                announce(&thread_ctx);
+            }
+        });
+    match spawned {
+        Ok(h) => {
+            ctx.shared.stream_threads.lock().push(h);
+            true
+        }
+        Err(e) => {
+            tracing::error!("could not start a pop-out stream thread: {e}");
+            let mut streams = ctx.shared.host_streams.lock();
+            streams.popouts.remove(&slot);
+            update_live(&ctx.shared, &streams);
+            false
+        }
+    }
+}
+
+/// A capture session and the display it shows (`None` = the primary).
+type OpenedCapture = (Box<dyn ScreenCapture>, Option<String>);
 
 /// Open the capture session, retrying the recoverable case instead of ending the
 /// session before it starts. A service-launched host can be briefly off the active
@@ -48,28 +286,32 @@ pub(crate) struct HostMedia {
 /// we retry with backoff until it returns or the session stops, so the loop
 /// self-recovers exactly as it does for a mid-session desktop switch. A missing
 /// saved display falls back to the primary; any other (terminal) error is returned.
+/// Also returns the display actually opened (`None` = the primary, including
+/// after that fallback).
 fn open_capture(
     platform: &dyn Platform,
     display: Option<&str>,
-    stop: &std::sync::atomic::AtomicBool,
-) -> Result<Box<dyn ScreenCapture>, Box<dyn std::error::Error>> {
+    fallback_to_primary: bool,
+    stop: &dyn Fn() -> bool,
+) -> Result<OpenedCapture, Box<dyn std::error::Error>> {
     let mut backoff = std::time::Duration::from_millis(100);
     let mut waited = false;
     loop {
-        if stop.load(Ordering::SeqCst) {
+        if stop() {
             return Err("session stopped before screen capture became available".into());
         }
         let attempt = match platform.create_capture(display) {
             // A saved display that no longer exists (unplugged, or an id from an
-            // older version): share the primary one rather than nothing.
-            Err(CaptureError::NoOutput) if display.is_some() => {
+            // older version): share the primary one rather than nothing. (Not
+            // for a pop-out: it would duplicate the main window.)
+            Err(CaptureError::NoOutput) if display.is_some() && fallback_to_primary => {
                 // Bind first: `display` as a bare arg to the tracing macro is
                 // parsed as its `display(...)` value formatter, not this variable.
                 let wanted = display.unwrap_or_default();
                 tracing::warn!("display {wanted:?} not found — sharing the primary display");
-                platform.create_capture(None)
+                platform.create_capture(None).map(|c| (c, None))
             }
-            other => other,
+            other => other.map(|c| (c, display.map(str::to_string))),
         };
         match attempt {
             Ok(c) => {
@@ -100,33 +342,65 @@ fn open_capture(
 /// Host capture → encode loop. Runs on its own thread; the capture session and
 /// encoder are created here (they may hold thread-bound GPU/OS objects).
 pub(crate) fn host_media_loop(
-    media: HostMedia,
-    frame_tx: Sender<(Vec<u8>, bool)>,
-    cursor_tx: Sender<Vec<u8>>,
-    bitrate: Arc<std::sync::atomic::AtomicU32>,
-    force_key: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
+    ctx: HostCtx,
+    spec: StreamSpec,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let HostMedia {
-        platform,
-        display,
+    let HostCtx {
+        ref platform,
         codec,
-        shared,
-        ctl_tx,
-    } = media;
+        ref shared,
+        ref ctl_tx,
+        ref ui,
+        ref frame_tx,
+        ref cursor_tx,
+        ref bitrate,
+        ..
+    } = ctx;
+    let StreamSpec {
+        slot,
+        display,
+        force_key,
+        view_size,
+        stream_stop,
+    } = spec;
+    let main = slot == 0;
+    let stopped = || {
+        ctx.stop.load(Ordering::SeqCst)
+            || stream_stop
+                .as_ref()
+                .is_some_and(|s| s.load(Ordering::SeqCst))
+    };
+    // The bitrate this stream may use: the session's target, split evenly
+    // across the live streams (main + pop-outs).
+    let my_bitrate = || {
+        let n = shared.live_streams.load(Ordering::SeqCst).max(1);
+        (bitrate.load(Ordering::SeqCst) / n).max(crate::tuning::MIN_BITRATE)
+    };
     // The host's cursor images (D9). Per session: a new session (including a
     // reconnect) starts empty, so the first shape the new capture reports is
-    // sent again even if an earlier session had sent it.
-    let mut cursor_images = super::cursor::HostCursor::default();
+    // sent again even if an earlier session had sent it. Every stream shares
+    // the record of what the viewer holds (one cache on the viewer).
+    let mut cursor_images = shared.host_cursor_root.sharing();
     let codecs = platform.codecs();
-    let mut cap = open_capture(platform.as_ref(), display.as_deref(), &stop)?;
+    let (mut cap, opened) = open_capture(platform.as_ref(), display.as_deref(), main, &stopped)?;
+    // The monitor being shared, as an id from `platform.displays()`, announced
+    // to both sides so either can offer a switch.
+    let mut current_display = {
+        let displays = platform.displays();
+        let current = resolve_display_id(&displays, opened.as_deref());
+        if main {
+            shared.host_streams.lock().current = current.clone();
+            announce(&ctx);
+        }
+        current
+    };
     // Encode at the screen's REAL size. Assuming 1920x1080 made the GPU
     // converter rescale every frame on any other monitor (soft picture, wrong
     // aspect) — the viewer adapts to whatever size actually arrives.
     let (mut cap_w, mut cap_h) = cap.dimensions();
     let mut cfg = EncoderConfig {
         codec,
-        bitrate_bps: bitrate.load(Ordering::SeqCst),
+        bitrate_bps: my_bitrate(),
         // Even dimensions: H.264 chroma is subsampled 2x2 and MFTs reject odd sizes.
         width: (cap_w & !1).max(2),
         height: (cap_h & !1).max(2),
@@ -148,10 +422,12 @@ pub(crate) fn host_media_loop(
     let mut applied_bitrate = cfg.bitrate_bps;
     let mut encoder_size = (cfg.width, cfg.height);
     #[cfg(feature = "test-hooks")]
-    shared.encode_dims.store(
-        (u64::from(encoder_size.0) << 32) | u64::from(encoder_size.1),
-        Ordering::SeqCst,
-    );
+    if main {
+        shared.encode_dims.store(
+            (u64::from(encoder_size.0) << 32) | u64::from(encoder_size.1),
+            Ordering::SeqCst,
+        );
+    }
     // A viewer size the encoder refused — don't retry it every frame.
     let mut rejected_size: Option<(u32, u32)> = None;
     let mut sent: u64 = 0;
@@ -170,7 +446,7 @@ pub(crate) fn host_media_loop(
     let mut deferred_keys: u32 = 0; // requests the rate limiter held back
     let mut last_key_log = std::time::Instant::now();
 
-    while !stop.load(Ordering::SeqCst) {
+    while !stopped() {
         // Frame-rate cap: always run at MAX_FPS and never encode faster than
         // MAX_FPS_INTERVAL. The pacing sleep only bites when we're running FASTER
         // than the cap (a busy screen); a slow software encoder or an idle screen
@@ -182,8 +458,106 @@ pub(crate) fn host_media_loop(
         }
         last_frame_at = std::time::Instant::now();
 
+        // A monitor switch (host UI, or a controlling viewer). The new capture
+        // is opened next to the old one and only replaces it once it AND an
+        // encoder on its device both exist, so a failed switch keeps sharing
+        // the current monitor. The encoder is always rebuilt: it lives on the
+        // capture's GPU device (§5c zero-copy), and each capture has its own.
+        let switch_to = if main {
+            shared.display_req.lock().take()
+        } else {
+            None
+        };
+        if let Some(want_id) = switch_to {
+            let displays = platform.displays();
+            match displays.iter().find(|d| d.id == want_id) {
+                None => {
+                    tracing::warn!("host: monitor switch to {want_id:?}: no such display");
+                    let _ = ui.send(crate::UiEvent::Toast(
+                        "That monitor is no longer connected".into(),
+                    ));
+                }
+                Some(d) if d.id == current_display => {}
+                Some(d) => {
+                    cap.release();
+                    match platform.create_capture(Some(&d.id)) {
+                        Ok(new_cap) => {
+                            let (w, h) = new_cap.dimensions();
+                            let want = match view_size.load(Ordering::SeqCst) {
+                                0 => fit_within((w, h), (w, h)),
+                                v => fit_within(((v >> 32) as u32, v as u32), (w, h)),
+                            };
+                            let mut new_cfg = cfg;
+                            new_cfg.width = want.0;
+                            new_cfg.height = want.1;
+                            match codecs.new_encoder(new_cap.device(), new_cfg) {
+                                Ok(e) => {
+                                    tracing::info!(
+                                        "host: switched to monitor {:?} ({w}x{h}, encoding {}x{})",
+                                        d.id,
+                                        want.0,
+                                        want.1
+                                    );
+                                    // Encoder first: it may hold a reference into
+                                    // the old capture's device.
+                                    encoder = e;
+                                    cap = new_cap;
+                                    cfg = new_cfg;
+                                    (cap_w, cap_h) = (w, h);
+                                    encoder_size = want;
+                                    applied_bitrate = cfg.bitrate_bps;
+                                    rejected_size = None;
+                                    capture_down_since = None;
+                                    #[cfg(feature = "test-hooks")]
+                                    shared.encode_dims.store(
+                                        (u64::from(encoder_size.0) << 32)
+                                            | u64::from(encoder_size.1),
+                                        Ordering::SeqCst,
+                                    );
+                                    // The main window now shows this monitor:
+                                    // a pop-out of it would only duplicate it.
+                                    {
+                                        let mut streams = shared.host_streams.lock();
+                                        streams.current = d.id.clone();
+                                        streams.close_showing(&d.id);
+                                    }
+                                    // A new picture: the viewer's decoder restarts
+                                    // here (new SPS/PPS, maybe a new size).
+                                    encoder.force_keyframe();
+                                    force_key.store(false, Ordering::SeqCst);
+                                    last_keyframe_at = std::time::Instant::now();
+                                    current_display = d.id.clone();
+                                    // Input follows the picture.
+                                    *shared.input_rect.lock() =
+                                        Some(crate::session::input_rect_for(d));
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "host: monitor switch to {:?}: no encoder ({e})",
+                                        d.id
+                                    );
+                                    let _ = ui.send(crate::UiEvent::Toast(format!(
+                                        "Could not switch monitors: {e}"
+                                    )));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("host: monitor switch to {:?}: {e}", d.id);
+                            let _ = ui.send(crate::UiEvent::Toast(format!(
+                                "Could not switch monitors: {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+            // Always answer, so a picker that optimistically showed the new
+            // choice snaps back when the switch did not happen.
+            announce(&ctx);
+        }
+
         // §6 adaptive bitrate: feed the current BWE target to the encoder.
-        let target = bitrate.load(Ordering::SeqCst);
+        let target = my_bitrate();
         if target != applied_bitrate {
             let _ = encoder.set_bitrate(target);
             applied_bitrate = target;
@@ -199,7 +573,7 @@ pub(crate) fn host_media_loop(
         // constrained link is absorbed by the bitrate, not the resolution.
         // Rebuild only on a material change; the viewer debounces, and every
         // rebuild costs a keyframe.
-        let want = match shared.view_size.load(Ordering::SeqCst) {
+        let want = match view_size.load(Ordering::SeqCst) {
             0 => (cap_w, cap_h),
             v => {
                 let (vw, vh) = ((v >> 32) as u32, v as u32);
@@ -224,10 +598,12 @@ pub(crate) fn host_media_loop(
                     encoder_size = want;
                     rejected_size = None;
                     #[cfg(feature = "test-hooks")]
-                    shared.encode_dims.store(
-                        (u64::from(encoder_size.0) << 32) | u64::from(encoder_size.1),
-                        Ordering::SeqCst,
-                    );
+                    if main {
+                        shared.encode_dims.store(
+                            (u64::from(encoder_size.0) << 32) | u64::from(encoder_size.1),
+                            Ordering::SeqCst,
+                        );
+                    }
                 }
                 Err(e) => {
                     // Keep streaming at the working size; remember the bad one so
@@ -269,8 +645,13 @@ pub(crate) fn host_media_loop(
                     // the time it is asked to draw it (until then it keeps the
                     // image it was drawing).
                     let frame_size = (frame.frame.width, frame.frame.height);
-                    for part in cursor_images.update(cur.shape.as_ref(), frame_size) {
-                        let _ = ctl_tx.send(serde_json::to_vec(&part).unwrap_or_default());
+                    {
+                        // Across streams, the viewer must insert images in
+                        // the order the shared record did.
+                        let _order = shared.cursor_send.lock();
+                        for part in cursor_images.update(cur.shape.as_ref(), frame_size) {
+                            let _ = ctl_tx.send(serde_json::to_vec(&part).unwrap_or_default());
+                        }
                     }
                     let x =
                         (cur.position.x as f64 / frame.frame.width.max(1) as f64).clamp(0.0, 1.0);
@@ -281,6 +662,7 @@ pub(crate) fn host_media_loop(
                         y,
                         shape: cursor_images.current(),
                         visible: cur.visible,
+                        s: slot,
                     };
                     let _ = cursor_tx.send(serde_json::to_vec(&msg).unwrap_or_default());
                 }
@@ -351,7 +733,7 @@ pub(crate) fn host_media_loop(
                                     applied_bitrate / 1000
                                 );
                             }
-                            let _ = frame_tx.send((u.data, u.keyframe));
+                            let _ = frame_tx.send((slot, u.data, u.keyframe));
                         }
                     }
                     Err(e) => tracing::warn!("encode error: {e}"),
