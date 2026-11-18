@@ -107,6 +107,34 @@ session); P4 keys it by `(SessionId, slot)` when several tabs can have pop-outs.
 change: a refused or failed connection now returns the UI to the home screen at once (it used
 to wait out its 30 s countdown).
 
+As built in P3: the ActiveGate is `session/active.rs`. Each viewer session has a
+`SessionView` that decides, under its own small lock, whether its main video is shown
+(active ∧ ready ∧ ¬link trouble ∧ ¬overlay ∧ ¬ended) and queues the resulting show/hide to
+**one ordered applier** (a tokio task that performs each op on the blocking pool and waits for
+it before the next), so no backend show/hide ever runs under an engine lock and a switch's
+hide of the old tab always happens before the show of the new one (B9, M8). `set_active` is
+taken under `reg`; a session still starting picks the registry's answer up when it is stored.
+`set_overlay` is async and returns after a barrier op, so the UI paints a dialog only once the
+video is out of its way (the `set_video_visible` command became async: it must not wait on
+the UI thread). The present loop skips a hidden view (B5) and the D3D11 / Metal presenters
+check visibility themselves too. The clipboard loop and the shortcut hook follow the active
+session (`Activity`); the clipboard re-baselines while gated off (B3). Shortcut capture has
+**one engine-wide owner** (`hook_owner`): the active session installs the OS hook, the
+previous one uninstalls it first — this is the "one owner, switchable target" of §3.5 for every
+OS, and it is what keeps the Wayland inhibitor's process-wide claim (B7) from ever colliding.
+Platform: `VideoSurface::set_top_inset` (Windows child-window offset, GTK layout for X11 and
+Wayland, AppKit frame on macOS — all real insets: client size and input mapping cover the
+area below) and `VideoSurface::destroy` (explicit, UI thread; Windows `DestroyWindow` with a
+`WM_CLOSE` fallback off the UI thread, macOS `removeFromSuperview`; X11/Wayland keep tearing
+down in `Drop`, which already forwards GTK work to the main thread). `destroy` is a second
+additive, defaulted trait method beside `set_top_inset` (§3.5 named only the inset). Windows
+also takes keyboard focus on show (only inside the foreground app window) and refreshes the
+cursor only for a visible window (B11); macOS takes first responder on show and never yields
+it to another video view (B10); Wayland gives each surface's sink window its own key and frees
+it after the surface's `wl_surface`s are destroyed (B8). The tabs (P4) call `set_top_inset`
+and `destroy`; until then the app opens one main surface, so the device checklist
+(`checklists/TABS-P3.md`) runs on the P4 build.
+
 Signaling: `app/src/main.rs`'s one `while … handle_signaling(event).await` loop stays the
 **dispatcher** only. Per-message work that can wait (secret-store opens, the host approval
 decision, bad-password delay, ICE gathering, `begin_host`, `start_viewer`) runs in a task

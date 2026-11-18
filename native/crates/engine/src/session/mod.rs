@@ -764,23 +764,6 @@ fn send_input(ctl: &Sender<Vec<u8>>, msg: &InputMsg) {
     let _ = ctl.send(serde_json::to_vec(msg).unwrap_or_default());
 }
 
-/// The shortcut hook's forwarder: its keys join the surface's input channel,
-/// so the translator sees hook keys and surface keys in the order they were
-/// produced (M12).
-///
-/// WHY not lock the translator directly from the hook thread (D8's first
-/// version): the surface's keys wait in `input` (behind a pointer move the
-/// input thread may be pacing for up to 10 ms), so a Cmd sent by the surface
-/// could reach the translator **after** the Cmd+C that the hook took a moment
-/// later, and the host would get C, then Ctrl. The hook guarantees that the
-/// modifier is in the channel before its own key (it forwards the modifier
-/// itself unless the surface already did); one FIFO channel turns that into
-/// the order the host sees. A channel send never blocks, as the hook's OS
-/// callback requires.
-///
-/// Fallback to the translator directly: a code outside the shared keymap
-/// (cannot be a `&'static str` for [`VideoInput::Key`]), or the input thread
-/// already gone at session end (a release must still reach the host).
 /// Session `id`'s shortcut capture: whenever the session is active and no
 /// other session holds the hook, install it, run it until the session stops
 /// being active (or stops), uninstall it and hand the owner slot back.
@@ -838,6 +821,23 @@ fn shortcut_loop(
     }
 }
 
+/// The shortcut hook's forwarder: its keys join the surface's input channel,
+/// so the translator sees hook keys and surface keys in the order they were
+/// produced (M12).
+///
+/// WHY not lock the translator directly from the hook thread (D8's first
+/// version): the surface's keys wait in `input` (behind a pointer move the
+/// input thread may be pacing for up to 10 ms), so a Cmd sent by the surface
+/// could reach the translator **after** the Cmd+C that the hook took a moment
+/// later, and the host would get C, then Ctrl. The hook guarantees that the
+/// modifier is in the channel before its own key (it forwards the modifier
+/// itself unless the surface already did); one FIFO channel turns that into
+/// the order the host sees. A channel send never blocks, as the hook's OS
+/// callback requires.
+///
+/// Fallback to the translator directly: a code outside the shared keymap
+/// (cannot be a `&'static str` for [`VideoInput::Key`]), or the input thread
+/// already gone at session end (a release must still reach the host).
 fn hook_forwarder(
     input: Sender<VideoInput>,
     keys: Arc<Mutex<KeyTranslator>>,

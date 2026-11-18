@@ -29,6 +29,8 @@ pub(crate) enum ViewOp {
     /// re-showing does not repaint, and a static screen would stay black.
     Show(Arc<dyn VideoSurface>, Arc<Shared>),
     Hide(Arc<dyn VideoSurface>),
+    /// Answered once every op queued before it has been performed.
+    Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
 /// The applier queue: ops sent to it run one at a time, in order.
@@ -58,6 +60,9 @@ fn perform(op: ViewOp) {
             shared.repaint_requested.store(true, Ordering::SeqCst);
         }
         ViewOp::Hide(surface) => surface.hide(),
+        ViewOp::Barrier(done) => {
+            let _ = done.send(());
+        }
     }
 }
 

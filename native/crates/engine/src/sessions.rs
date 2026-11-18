@@ -799,8 +799,11 @@ impl Engine {
 
     /// A web dialog opened over the video (`true`) or the last one closed
     /// (`false`): every main video is hidden meanwhile, then the active one is
-    /// shown and repainted again (08a §6.18).
-    pub fn set_overlay(&self, open: bool) {
+    /// shown and repainted again (08a §6.18). Returns once the hides and shows
+    /// are done, so the UI paints a dialog only after the native video is out
+    /// of its way (the surface contract). Must not be awaited on the UI thread:
+    /// a backend's show/hide may run there.
+    pub async fn set_overlay(&self, open: bool) {
         self.overlay.store(open, Ordering::SeqCst);
         let views: Vec<_> = {
             let reg = self.reg.lock();
@@ -812,6 +815,18 @@ impl Engine {
         };
         for v in views {
             v.refresh();
+        }
+        // Bounded: a UI thread stuck elsewhere must not hang the dialog.
+        let (done, applied) = tokio::sync::oneshot::channel();
+        if self
+            .view_ops
+            .send(session::active::ViewOp::Barrier(done))
+            .is_ok()
+            && tokio::time::timeout(std::time::Duration::from_secs(2), applied)
+                .await
+                .is_err()
+        {
+            tracing::warn!("video show/hide still pending after 2 s; opening the dialog anyway");
         }
     }
 

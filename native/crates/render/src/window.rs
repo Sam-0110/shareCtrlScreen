@@ -12,6 +12,20 @@
 //! per-window state — input and drop sinks, letterbox size, hover reveal, held
 //! keys/buttons, cursor hiding — lives in a [`WinState`] per HWND, never in a
 //! process-wide static. Every public function names the window it acts on.
+//!
+//! ## References
+//! * `SetFocus` (owning thread only; activates the top-level window):
+//!   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-setfocus>
+//! * `DestroyWindow` ("a thread cannot use DestroyWindow to destroy a window
+//!   created by a different thread"), `WM_CLOSE` default handling:
+//!   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-destroywindow>,
+//!   <https://learn.microsoft.com/windows/win32/winmsg/wm-close>
+//! * `SetCursor` (affects the calling thread's cursor):
+//!   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-setcursor>
+//! * `IsWindowVisible`, `GetForegroundWindow`, `GetAncestor(GA_ROOT)`:
+//!   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-iswindowvisible>,
+//!   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getforegroundwindow>,
+//!   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getancestor>
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -27,12 +41,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, LoadCursorW, MoveWindow, PostMessageW,
-    RegisterClassW, SetCursor, ShowWindow, CS_HREDRAW, CS_VREDRAW, HMENU, HTCLIENT, IDC_ARROW,
-    SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_APP, WM_DROPFILES, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCDESTROY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
+    CreateWindowExW, DefWindowProcW, GetClientRect, IsWindowVisible, LoadCursorW, MoveWindow,
+    PostMessageW, RegisterClassW, SetCursor, ShowWindow, CS_HREDRAW, CS_VREDRAW, HMENU, HTCLIENT,
+    IDC_ARROW, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_APP, WM_DROPFILES, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SETFOCUS, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
 };
 
 const CLASS_NAME: PCWSTR = w!("ShareCtrlVideoWindow");
@@ -88,6 +102,11 @@ struct WinState {
     /// entry (Windows cancels leave-tracking after it fires the one
     /// `WM_MOUSELEAVE`).
     leave_tracked: AtomicBool,
+    /// The parent's top strip kept for the web UI (the tab bar, plans/08
+    /// P3), in CSS px; the window sits below it. A real layout inset, unlike
+    /// the reveal clip: the client size (and so the input mapping and the
+    /// host's encode size) is the area below it.
+    top_inset_css: AtomicI32,
 }
 
 impl Default for WinState {
@@ -104,6 +123,7 @@ impl Default for WinState {
             pointer_inside: AtomicBool::new(false),
             focused: AtomicBool::new(false),
             leave_tracked: AtomicBool::new(false),
+            top_inset_css: AtomicI32::new(0),
         }
     }
 }
@@ -252,12 +272,63 @@ const BAR_CSS_PX: i32 = 40;
 /// Cursor deeper than this many physical px into the video re-hides the bar.
 const UNREVEAL_DEPTH_PX: i32 = 56;
 
-/// The bar height in physical pixels for this window's monitor DPI.
-fn bar_phys(hwnd: HWND) -> i32 {
-    // SAFETY: valid HWND; returns 96 on failure paths.
+/// `css` CSS px in physical pixels for this window's monitor DPI.
+fn css_to_phys(hwnd: HWND, css: i32) -> i32 {
+    // SAFETY: valid HWND; returns 0 on failure, treated as 96 DPI.
     let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
     let dpi = if dpi == 0 { 96 } else { dpi as i32 };
-    BAR_CSS_PX * dpi / 96
+    css * dpi / 96
+}
+
+/// The bar height in physical pixels for this window's monitor DPI.
+fn bar_phys(hwnd: HWND) -> i32 {
+    css_to_phys(hwnd, BAR_CSS_PX)
+}
+
+/// Where the window goes in its parent's client area: below the top inset,
+/// full width, the rest of the height (never 0: a 0-size window cannot be
+/// presented to). `None` when the parent cannot be read.
+fn target_rect(hwnd: HWND, st: &WinState) -> Option<(i32, i32, i32)> {
+    // SAFETY: valid child HWND; GetParent/GetClientRect only read.
+    unsafe {
+        let parent = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd).ok()?;
+        let mut rc = RECT::default();
+        GetClientRect(parent, &mut rc).ok()?;
+        let w = (rc.right - rc.left).max(1);
+        let h = (rc.bottom - rc.top).max(1);
+        let inset = css_to_phys(hwnd, st.top_inset_css.load(Ordering::SeqCst)).clamp(0, h - 1);
+        Some((inset, w, h - inset))
+    }
+}
+
+/// The window's current top-left in its parent's client coordinates.
+fn position_in_parent(hwnd: HWND) -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::POINT;
+    // SAFETY: valid child HWND; reads its screen rect and maps it.
+    unsafe {
+        let parent = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd).ok()?;
+        let mut rc = RECT::default();
+        windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rc).ok()?;
+        let mut pt = POINT {
+            x: rc.left,
+            y: rc.top,
+        };
+        windows::Win32::Graphics::Gdi::ScreenToClient(parent, &mut pt)
+            .as_bool()
+            .then_some((pt.x, pt.y))
+    }
+}
+
+/// Keep the parent's top `css_px` CSS px for the web UI (see
+/// `WinState::top_inset_css`) and move the window below it now. Safe from
+/// any thread (`MoveWindow` marshals to the owning thread).
+pub fn set_top_inset(hwnd_raw: isize, css_px: u32) {
+    let st = state(hwnd_raw);
+    // Bounded so the DPI scaling cannot overflow; any real bar is far below.
+    let css = css_px.min(MAX_INSET_CSS_PX) as i32;
+    if st.top_inset_css.swap(css, Ordering::SeqCst) != css {
+        fit(hwnd_raw);
+    }
 }
 
 /// Reveal the web session bar over the video, or hide it again.
@@ -298,11 +369,19 @@ fn apply_reveal_clip(hwnd: HWND, bar: i32) {
     }
 }
 
+/// Largest top inset accepted, in CSS px.
+const MAX_INSET_CSS_PX: u32 = 4096;
+
 /// A private message posted from [`set_cursor_control`] so the OS cursor is
 /// refreshed on the UI thread at once (a `SetCursor` from another thread would
 /// not affect the window's cursor, and `WM_SETCURSOR` only fires on the next
 /// mouse move — so a stationary pointer would keep the stale cursor).
 const WM_REFRESH_CURSOR: u32 = WM_APP + 1;
+
+/// A private message posted from [`show`]: take the keyboard focus on the UI
+/// thread (`SetFocus` only works on the thread that owns the window), so an
+/// activated tab gets the keys without a click first (plans/08 §3.5).
+const WM_TAKE_FOCUS: u32 = WM_APP + 2;
 
 /// Task D10: hide the OS cursor over the video while controlling, or restore
 /// it. Stores the flag, drops the inside flag when turning off, and asks the
@@ -544,25 +623,18 @@ impl VideoWindow {
 pub fn show(hwnd_raw: isize) {
     use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, HWND_TOP, SWP_SHOWWINDOW};
     let hwnd = HWND(hwnd_raw as *mut _);
-    state(hwnd_raw).reveal_offset.store(0, Ordering::SeqCst);
+    let st = state(hwnd_raw);
+    st.reveal_offset.store(0, Ordering::SeqCst);
+    let (y, w, h) = target_rect(hwnd, &st).unwrap_or((0, 1, 1));
     // SAFETY: valid child HWND created by `VideoWindow::create`.
     unsafe {
-        let parent = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd);
-        let mut w = 1;
-        let mut h = 1;
-        if let Ok(parent) = parent {
-            let mut rc = RECT::default();
-            if GetClientRect(parent, &mut rc).is_ok() {
-                w = (rc.right - rc.left).max(1);
-                h = (rc.bottom - rc.top).max(1);
-            }
-        }
-        tracing::info!("video window: show {w}x{h} (raise to top)");
-        let _ = MoveWindow(hwnd, 0, 0, w, h, true);
+        tracing::info!("video window: show {w}x{h} at y={y} (raise to top)");
+        let _ = MoveWindow(hwnd, 0, y, w, h, true);
         apply_reveal_clip(hwnd, 0); // drop any clip left over from a past session
                                     // Raise above the WebView2 sibling AND show in one call.
-        let _ = SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, w, h, SWP_SHOWWINDOW);
+        let _ = SetWindowPos(hwnd, Some(HWND_TOP), 0, y, w, h, SWP_SHOWWINDOW);
         let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = PostMessageW(Some(hwnd), WM_TAKE_FOCUS, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -572,28 +644,47 @@ pub fn show(hwnd_raw: isize) {
 /// when the size already matches.
 pub fn fit(hwnd_raw: isize) {
     let hwnd = HWND(hwnd_raw as *mut _);
-    // SAFETY: valid child HWND; reads two client rects and conditionally moves.
+    let st = state(hwnd_raw);
+    // The client area below the top inset — the revealed bar is a clip, not
+    // an offset, so it does not enter here.
+    let Some((want_y, want_w, want_h)) = target_rect(hwnd, &st) else {
+        return;
+    };
+    let mut crc = RECT::default();
+    // SAFETY: valid child HWND; reads its client rect and conditionally moves.
     unsafe {
-        let Ok(parent) = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) else {
-            return;
-        };
-        let mut prc = RECT::default();
-        let mut crc = RECT::default();
-        if GetClientRect(parent, &mut prc).is_err() || GetClientRect(hwnd, &mut crc).is_err() {
+        if GetClientRect(hwnd, &mut crc).is_err() {
             return;
         }
-        // Always the FULL client area — the revealed bar is a clip, not an offset.
-        let want_w = (prc.right - prc.left).max(1);
-        let want_h = (prc.bottom - prc.top).max(1);
         let cur_w = crc.right - crc.left;
         let cur_h = crc.bottom - crc.top;
-        if cur_w != want_w || cur_h != want_h {
-            let _ = MoveWindow(hwnd, 0, 0, want_w, want_h, true);
+        let cur_y = position_in_parent(hwnd).map_or(want_y, |(_, y)| y);
+        if cur_w != want_w || cur_h != want_h || cur_y != want_y {
+            let _ = MoveWindow(hwnd, 0, want_y, want_w, want_h, true);
             // A resize invalidates the old region — re-clip if the bar is up.
-            let offset = state(hwnd_raw).reveal_offset.load(Ordering::SeqCst);
+            let offset = st.reveal_offset.load(Ordering::SeqCst);
             if offset > 0 {
                 apply_reveal_clip(hwnd, offset);
             }
+        }
+    }
+}
+
+/// Destroy video window `hwnd_raw` now (plans/08 B6: a closed tab's window
+/// must not live on until the app window closes). On the UI thread it goes
+/// at once; from any other thread `DestroyWindow` is refused, so it is asked
+/// to close itself on its own thread (`WM_CLOSE` → `DefWindowProc` destroys
+/// it). Its state is dropped on `WM_NCDESTROY` either way.
+pub fn destroy(hwnd_raw: isize) {
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WM_CLOSE};
+    let hwnd = HWND(hwnd_raw as *mut _);
+    // Input and drops stop now, whatever the thread.
+    clear_input_sink(hwnd_raw);
+    clear_file_drop_sink(hwnd_raw);
+    // SAFETY: valid child HWND created by `VideoWindow::create`.
+    unsafe {
+        if DestroyWindow(hwnd).is_err() {
+            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
     }
 }
@@ -762,6 +853,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // Task D10: refresh the cursor now that control / inside / focus
         // changed, without waiting for the next mouse move.
         WM_REFRESH_CURSOR => {
+            // B11: `SetCursor` is thread-wide, so a hidden tab's window (a
+            // control change in a background session) must not touch the
+            // cursor the visible one set.
+            // SAFETY: valid HWND (this is its wndproc).
+            if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                return LRESULT(0);
+            }
             // Task D11: control may have just turned ON while the pointer was
             // already sitting over the video (no move since), so re-evaluate
             // `pointer_inside` here or the sprite would stay at the host spot.
@@ -769,6 +867,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 reevaluate_pointer_inside(st, hwnd);
             }
             apply_os_cursor(cursor_should_hide(st));
+            return LRESULT(0);
+        }
+        // The tab was shown: take the keys. Not if it was hidden again since
+        // (a quick switch away): focus would go to a hidden window.
+        WM_TAKE_FOCUS => {
+            // SAFETY: valid HWND, on its own thread (this is its wndproc).
+            // Only inside the active app window: focus must never pull the app
+            // to the front over whatever the user is working in.
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    GetAncestor, GetForegroundWindow, GA_ROOT,
+                };
+                if IsWindowVisible(hwnd).as_bool()
+                    && GetForegroundWindow() == GetAncestor(hwnd, GA_ROOT)
+                {
+                    let _ = SetFocus(Some(hwnd));
+                }
+            }
             return LRESULT(0);
         }
         // Task D10: regained focus — re-hide if still controlling over the video.

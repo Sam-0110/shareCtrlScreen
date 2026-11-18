@@ -239,9 +239,15 @@ pub(crate) fn display_label(d: &protocol::RemoteDisplay) -> String {
 /// A web dialog (Settings, a confirm) opened over the video (`visible` false)
 /// or the last one closed: the native surface would otherwise cover it, so
 /// the engine's gate hides every main video meanwhile (08a §6.18).
+/// Async so it runs off the UI thread: the hide it waits for may itself need
+/// the UI thread (macOS dispatches show/hide to the main thread).
 #[tauri::command]
-pub fn set_video_visible(state: tauri::State<'_, AppState>, visible: bool) {
-    state.engine.set_overlay(!visible);
+pub async fn set_video_visible(
+    state: tauri::State<'_, AppState>,
+    visible: bool,
+) -> Result<(), String> {
+    state.engine.set_overlay(!visible).await;
+    Ok(())
 }
 
 #[tauri::command]

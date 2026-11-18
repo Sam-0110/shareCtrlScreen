@@ -757,6 +757,18 @@ impl VideoSurface for X11Surface {
         self.shared.state.local_pointer()
     }
 
+    /// The inset is applied where the layout is computed (`gtk_host`), on the
+    /// GTK thread; this asks for a relayout there.
+    fn set_top_inset(&self, css_px: u32) {
+        if self.shared.state.top_inset() == css_px {
+            return;
+        }
+        self.shared.state.set_top_inset(css_px);
+        if let Some(host) = &self.host {
+            host.relayout_now();
+        }
+    }
+
     fn set_cursor_control(&self, active: bool) {
         // X11's cursor is a window attribute shown only over our video, so hide
         // it whenever controlling; the sprite is drawn at the local pointer so

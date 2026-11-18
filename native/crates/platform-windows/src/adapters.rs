@@ -2,7 +2,7 @@
 
 use std::any::Any;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
@@ -518,6 +518,10 @@ impl VideoDecoder for MfDecoder {
 /// marshal to the owning thread), which is why only the raw value is stored.
 pub struct ChildWindowSurface {
     pub(crate) hwnd: isize,
+    /// Set by [`VideoSurface::destroy`]: every method is a no-op from then
+    /// on. WHY: a destroyed HWND value can be reused by a new window (another
+    /// tab's), and a late call through a stale handle must not act on that.
+    destroyed: AtomicBool,
 }
 
 impl ChildWindowSurface {
@@ -525,42 +529,68 @@ impl ChildWindowSurface {
         let w = render::VideoWindow::create(HWND(parent_hwnd as *mut _))
             .map_err(|e| SurfaceError::Backend(format!("video window: {e}")))?;
         tracing::info!("native video child window created");
-        // The window lives until its parent is destroyed (no destroying Drop).
-        Ok(Self { hwnd: w.hwnd_raw() })
+        // The window lives until `destroy` (a closed tab) or until its parent
+        // is destroyed (a pop-out window): there is no destroying `Drop`,
+        // because the last reference may go on any thread.
+        Ok(Self {
+            hwnd: w.hwnd_raw(),
+            destroyed: AtomicBool::new(false),
+        })
+    }
+
+    /// The window, unless the surface was destroyed.
+    fn live(&self) -> Option<isize> {
+        (!self.destroyed.load(Ordering::SeqCst)).then_some(self.hwnd)
     }
 }
 
 impl VideoSurface for ChildWindowSurface {
     fn show(&self) {
-        render::window::show(self.hwnd);
+        if let Some(h) = self.live() {
+            render::window::show(h);
+        }
     }
     fn hide(&self) {
-        render::window::hide(self.hwnd);
+        if let Some(h) = self.live() {
+            render::window::hide(h);
+        }
     }
     fn fit(&self) {
-        render::window::fit(self.hwnd);
+        if let Some(h) = self.live() {
+            render::window::fit(h);
+        }
     }
     fn client_size(&self) -> (u32, u32) {
-        render::window::client_size(self.hwnd)
+        self.live().map_or((0, 0), render::window::client_size)
     }
     fn set_input_sink(&self, sink: Option<Sender<VideoInput>>) {
+        let Some(h) = self.live() else {
+            return;
+        };
         match sink {
-            Some(tx) => render::window::set_input_sink(self.hwnd, tx),
-            None => render::window::clear_input_sink(self.hwnd),
+            Some(tx) => render::window::set_input_sink(h, tx),
+            None => render::window::clear_input_sink(h),
         }
     }
     fn set_drop_sink(&self, sink: Option<Sender<FileDrop>>) {
+        let Some(h) = self.live() else {
+            return;
+        };
         match sink {
-            Some(tx) => render::window::set_file_drop_sink(self.hwnd, tx),
-            None => render::window::clear_file_drop_sink(self.hwnd),
+            Some(tx) => render::window::set_file_drop_sink(h, tx),
+            None => render::window::clear_file_drop_sink(h),
         }
     }
     fn create_presenter(&self) -> Result<Box<dyn Presenter>, SurfaceError> {
+        let hwnd = self
+            .live()
+            .ok_or_else(|| SurfaceError::Backend("the video window was destroyed".into()))?;
         let dev = create_render_device()?;
-        let renderer = render::Renderer::new(&dev, HWND(self.hwnd as *mut _), 1920, 1080)
+        let renderer = render::Renderer::new(&dev, HWND(hwnd as *mut _), 1920, 1080)
             .map_err(|e| SurfaceError::Backend(format!("renderer: {e}")))?;
         Ok(Box::new(D3dPresenter {
             renderer,
+            hwnd,
             device: D3d11Device(dev),
             upload: crate::cpu::Nv12Upload::default(),
         }))
@@ -569,15 +599,29 @@ impl VideoSurface for ChildWindowSurface {
         self
     }
     fn local_pointer(&self) -> Option<(f64, f64)> {
-        render::window::local_pointer(self.hwnd)
+        self.live().and_then(render::window::local_pointer)
     }
     fn set_cursor_control(&self, active: bool) {
-        render::window::set_cursor_control(self.hwnd, active);
+        if let Some(h) = self.live() {
+            render::window::set_cursor_control(h, active);
+        }
+    }
+    fn set_top_inset(&self, css_px: u32) {
+        if let Some(h) = self.live() {
+            render::window::set_top_inset(h, css_px);
+        }
+    }
+    fn destroy(&self) {
+        if !self.destroyed.swap(true, Ordering::SeqCst) {
+            render::window::destroy(self.hwnd);
+        }
     }
 }
 
 struct D3dPresenter {
     renderer: render::Renderer,
+    /// The window it draws into, to skip presenting while it is hidden (B5).
+    hwnd: isize,
     device: D3d11Device,
     /// CPU NV12 frames (the Cisco OpenH264 software decoder) go through this.
     upload: crate::cpu::Nv12Upload,
@@ -589,6 +633,16 @@ impl Presenter for D3dPresenter {
         frame: &Frame<'_>,
         cursor: Option<(f64, f64)>,
     ) -> Result<(), SurfaceError> {
+        // B5: a hidden window is not drawn to (the engine skips it too; this
+        // also covers a present racing a hide). The frame stays decoded.
+        // SAFETY: `IsWindowVisible` only reads the window's style bits.
+        if !unsafe {
+            windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(HWND(self.hwnd as *mut _))
+        }
+        .as_bool()
+        {
+            return Ok(());
+        }
         let render = |r: &mut render::Renderer, tex: &_, slice| {
             r.render_frame(tex, slice, cursor)
                 .map_err(|e| SurfaceError::Backend(e.to_string()))

@@ -68,6 +68,9 @@ pub(crate) struct MacVideoSurface {
     layer: SharedLayer,
     /// Coalesces `fit` polls: at most one main-thread layout pass queued.
     fit_queued: Arc<AtomicBool>,
+    /// The view was taken out of the window (`destroy`, or `Drop`): nothing
+    /// touches it again (a late `show` would re-add it to the window).
+    torn_down: AtomicBool,
 }
 
 impl MacVideoSurface {
@@ -102,6 +105,7 @@ impl MacVideoSurface {
             state,
             layer: SharedLayer::new(layer),
             fit_queued: Arc::new(AtomicBool::new(false)),
+            torn_down: AtomicBool::new(false),
         }))
     }
 
@@ -114,6 +118,9 @@ impl MacVideoSurface {
     /// Run `f` on the main thread: at once when already there, otherwise
     /// queued and waited for up to [`MAIN_WAIT`] (see the module docs).
     fn on_main(&self, what: &'static str, f: impl FnOnce(&VideoView) + Send + 'static) {
+        if self.torn_down.load(Ordering::Acquire) {
+            return;
+        }
         let Some(main) = &self.main else {
             return;
         };
@@ -138,15 +145,19 @@ impl MacVideoSurface {
 
 impl VideoSurface for MacVideoSurface {
     fn show(&self) {
+        self.state.set_shown(true);
         self.on_main("show", |view| {
             view.reset_reveal();
             view.raise();
             view.apply_layout();
             view.setHidden(false);
+            // The tab on screen takes the keys without a click first.
+            view.take_focus();
         });
     }
 
     fn hide(&self) {
+        self.state.set_shown(false);
         self.on_main("hide", |view| {
             view.setHidden(true);
             // The UI paints its modal right after this returns: push the
@@ -215,35 +226,77 @@ impl VideoSurface for MacVideoSurface {
         // so the OS cursor can never leak onto the desktop.
         self.on_main("cursor control", |view| view.refresh_cursor());
     }
+    fn set_top_inset(&self, css_px: u32) {
+        if self.state.top_inset() == css_px {
+            return;
+        }
+        // CSS px are AppKit points in the web view: `apply_layout` uses it as
+        // is, below the parent's visual top.
+        self.state.set_top_inset(css_px);
+        self.on_main("top inset", |view| view.apply_layout());
+    }
+
+    /// Takes the view out of the window now (on the main thread, as AppKit
+    /// requires); the surface is inert afterwards.
+    fn destroy(&self) {
+        self.release_input();
+        if self.torn_down.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(main) = self.main.clone() else {
+            return;
+        };
+        match MainThreadMarker::new() {
+            Some(mtm) => teardown(main.get(mtm)),
+            None => DispatchQueue::main().exec_async(move || {
+                // SAFETY: blocks submitted to the main queue run on the main thread.
+                teardown(main.get(unsafe { MainThreadMarker::new_unchecked() }));
+            }),
+        }
+    }
+}
+
+/// Remove the view from the window: no cursor rect, no key monitor, out of
+/// its superview. Runs once (`torn_down`), on the main thread.
+fn teardown(parts: &MainParts) {
+    parts.view.refresh_cursor();
+    // SAFETY: the token came from `addLocalMonitorForEvents` and is removed
+    // exactly once (the caller's `torn_down` swap).
+    unsafe { NSEvent::removeMonitor(&parts.monitor) };
+    parts.view.removeFromSuperview();
+}
+
+impl MacVideoSurface {
+    /// Release anything still held so the host is not left with a stuck key,
+    /// and clear control (Task M15: the view adds no cursor rect as it goes).
+    fn release_input(&self) {
+        self.state.input().set_sink(None);
+        self.state.set_cursor_control(false);
+        self.state.set_shown(false);
+    }
 }
 
 impl Drop for MacVideoSurface {
     fn drop(&mut self) {
-        // Release anything still held so the host is not left with a stuck key.
-        self.state.input().set_sink(None);
+        self.release_input();
         let Some(main) = self.main.take() else {
             return;
         };
-        // Task M15: clear control and rebuild the cursor rects so the view adds
-        // no cursor rect as it goes away (the OS cursor is already safe — it was
-        // only ever scoped to the video rect — but keep the state consistent).
-        self.state.set_cursor_control(false);
-        let teardown = move |mtm: MainThreadMarker| {
-            let parts = main.get(mtm);
-            parts.view.refresh_cursor();
-            // SAFETY: the token came from `addLocalMonitorForEvents` and is
-            // removed exactly once.
-            unsafe { NSEvent::removeMonitor(&parts.monitor) };
-            parts.view.removeFromSuperview();
+        let torn_down = self.torn_down.swap(true, Ordering::AcqRel);
+        let finish = move |mtm: MainThreadMarker| {
+            if !torn_down {
+                teardown(main.get(mtm));
+            }
+            // `main` is dropped here, on the main thread.
         };
         match MainThreadMarker::new() {
-            Some(mtm) => teardown(mtm),
+            Some(mtm) => finish(mtm),
             // Asynchronous on purpose: at process exit the main run loop may
             // already be gone, and a synchronous hop would hang the exit. If it
             // never runs, the process is ending and AppKit cleans up anyway.
             None => DispatchQueue::main().exec_async(move || {
                 // SAFETY: blocks submitted to the main queue run on the main thread.
-                teardown(unsafe { MainThreadMarker::new_unchecked() });
+                finish(unsafe { MainThreadMarker::new_unchecked() });
             }),
         }
     }

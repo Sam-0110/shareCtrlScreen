@@ -145,6 +145,28 @@ pub trait VideoSurface: Send + Sync {
     /// sprite drawn at the local position ([`local_pointer`](Self::local_pointer)),
     /// so the two cursors coincide and there is no visible lag gap.
     fn set_cursor_control(&self, _active: bool) {}
+
+    /// Reserve the top `css_px` CSS pixels of the parent's client area for
+    /// the web UI (the persistent tab bar, plans/08 §3.5): the surface covers
+    /// only the area below it. Unlike the toolbar reveal this is a real
+    /// layout change — [`client_size`](Self::client_size) and the input
+    /// mapping both cover the area below the inset. Scaled by the backend's
+    /// own DPI/backing scale. May be called while hidden; applies on the next
+    /// show if so.
+    ///
+    /// Default: ignored, so the surface keeps covering the whole client area
+    /// (the pre-tabs layout).
+    fn set_top_inset(&self, _css_px: u32) {}
+
+    /// Tear the native view down now (plans/08 B6). Call **on the UI
+    /// thread**, once the session that used it was released; afterwards the
+    /// surface is inert (every other method does nothing). Pop-out surfaces
+    /// need no call: they go with their window.
+    ///
+    /// Default: nothing, for backends whose `Drop` already tears the view
+    /// down safely from any thread (X11, Wayland: GTK work is forwarded to
+    /// the main thread).
+    fn destroy(&self) {}
 }
 
 /// Draws decoded frames onto a [`VideoSurface`]: aspect-preserving letterbox
