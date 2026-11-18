@@ -5073,6 +5073,7 @@ version = "2.1.15"
 dependencies = [
  "elevation",
  "platform-api",
+ "static_vcruntime",
  "tracing",
  "tracing-subscriber",
  "windows",
