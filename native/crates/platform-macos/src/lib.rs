@@ -35,6 +35,7 @@ mod surface;
 mod view;
 mod vt_encoder;
 mod vt_params;
+mod winwatch;
 
 // The skip convention of the hardware tests, shared with `tests/vt_encode.rs`.
 #[cfg(test)]
@@ -168,6 +169,15 @@ impl Platform for MacPlatform {
         _display: RawDisplayHandle,
     ) -> Result<Arc<dyn VideoSurface>, SurfaceError> {
         Ok(surface::MacVideoSurface::create(window)?)
+    }
+
+    fn watch_window(
+        &self,
+        window: RawWindowHandle,
+        _display: RawDisplayHandle,
+        on_change: platform_api::WindowActivityFn,
+    ) -> Result<Box<dyn platform_api::WindowWatch>, SurfaceError> {
+        winwatch::watch(window, on_change)
     }
 
     fn create_injector(&self) -> Result<Box<dyn InputInjector>, InputError> {

@@ -83,6 +83,27 @@ pub struct PlatformInfo {
     pub login_screen_supported: bool,
 }
 
+/// A top-level app window's activation and minimised state, as the OS
+/// reports it (plans/09 W3, 09a §3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowActivity {
+    /// It is the active window (it, or the native video inside it, has the
+    /// keyboard).
+    pub active: bool,
+    /// Minimised; `None` where the OS never says (Wayland: xdg-shell has no
+    /// minimised state).
+    pub minimized: Option<bool>,
+}
+
+/// What [`Platform::watch_window`] calls on every change, on the UI thread
+/// (inside the OS's event dispatch): it must not block or call back into the
+/// window system; hand the value on (a channel send).
+pub type WindowActivityFn = Box<dyn Fn(WindowActivity) + Send + Sync>;
+
+/// A live watch. Dropping it stops the calls; drop it **on the UI thread**,
+/// before the window is destroyed or after — both are safe.
+pub trait WindowWatch: Send {}
+
 /// Everything OS-specific, constructed once by the app.
 ///
 /// Factories marked "call on the using thread" create objects that may hold
@@ -107,6 +128,23 @@ pub trait Platform: Send + Sync {
         window: RawWindowHandle,
         display: RawDisplayHandle,
     ) -> Result<Arc<dyn VideoSurface>, SurfaceError>;
+    /// Follow the activation and minimised state of the top-level app window
+    /// behind `window` (plans/09 W3): Tauri's own focus events miss the
+    /// native video on Windows (they follow WebView2's focus, 09 §7 blocker
+    /// 1), and no backend reports minimise there. Calls `on_change` with the
+    /// state now, then on every change. Call on the UI thread.
+    ///
+    /// Default: unavailable (the app falls back to its own events).
+    fn watch_window(
+        &self,
+        _window: RawWindowHandle,
+        _display: RawDisplayHandle,
+        _on_change: WindowActivityFn,
+    ) -> Result<Box<dyn WindowWatch>, SurfaceError> {
+        Err(SurfaceError::Backend(
+            "window activation is not reported on this platform".into(),
+        ))
+    }
     /// Call on the host transport thread.
     fn create_injector(&self) -> Result<Box<dyn InputInjector>, InputError>;
     /// Call on the hook thread. `None` = this OS/session has no shortcut capture.

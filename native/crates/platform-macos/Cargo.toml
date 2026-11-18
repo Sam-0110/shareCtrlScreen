@@ -29,8 +29,11 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSEnumerator",
     "NSError",
     "NSGeometry",
-    # Window-resign-key observer of the video view (task M4).
+    # Window-resign-key observer of the video view (task M4); window
+    # activation and minimise observers (plans/09 W3).
     "NSNotification",
+    "NSOperation",
+    "block2",
     "NSString",
     "NSURL",
     "NSValue",
