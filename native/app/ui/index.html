@@ -450,7 +450,7 @@
     </div>
 
     <!-- PERMISSIONS — OS grants the app needs (screen recording, remote control,
-         shortcut capture). Rows are filled in by app.js from get_permissions;
+         shortcut capture). Rows are filled in by settings.js from get_permissions;
          a permission this OS does not have is simply not listed. -->
     <div id="modal-permissions" class="modal hidden">
       <div class="modal-box modal-wide">
@@ -467,6 +467,6 @@
 
     <div id="toasts" class="toasts"></div>
 
-    <script src="app.js"></script>
+    <script type="module" src="main.js"></script>
   </body>
 </html>

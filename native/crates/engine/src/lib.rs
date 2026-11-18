@@ -105,6 +105,38 @@ pub enum IcePolicy {
     LoopbackOnly,
 }
 
+/// The peer a signaling message is from (or, for a relay error, about), which
+/// picks the queue it is handled on. `None` for messages that concern no single
+/// peer (TURN credentials, unknown kinds): those are handled immediately.
+fn signal_peer(msg: &SignalMsg) -> Option<String> {
+    match msg {
+        SignalMsg::ConnectRequest { from, .. }
+        | SignalMsg::ConnectResponse { from, .. }
+        | SignalMsg::PasswordRequired { from, .. }
+        | SignalMsg::Signal { from, .. }
+        | SignalMsg::EndSession { from, .. } => from.clone(),
+        SignalMsg::RelayError { to, .. } => to.clone(),
+        _ => None,
+    }
+}
+
+/// Holds [`Engine::admitting`] for one peer and clears it when dropped, so an
+/// admission that ends any way (accepted, denied, a wrong password, a panic)
+/// never leaves this computer stuck "busy".
+struct Admission<'a> {
+    engine: &'a Engine,
+    peer: String,
+}
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        let mut admitting = self.engine.admitting.lock();
+        if admitting.as_deref() == Some(self.peer.as_str()) {
+            *admitting = None;
+        }
+    }
+}
+
 /// The engine. Owns config, the signaling client, the current role and session.
 pub struct Engine {
     config_path: PathBuf,
@@ -140,6 +172,17 @@ pub struct Engine {
     /// connect-response from anyone else is ignored — otherwise any peer that
     /// knows our id could make us start a viewer session with it.
     outbound: Mutex<Option<String>>,
+    /// Host: the one peer currently being admitted — its approval prompt is open
+    /// or its password proof is being checked. While it is set, every other
+    /// connect-request is answered "busy" and no outgoing session may start, so
+    /// "one session at a time" (plans/08 D1) still holds now that each peer's
+    /// signaling runs on its own task (see [`Engine::dispatch_signaling`]).
+    admitting: Mutex<Option<String>>,
+    /// Per-peer signaling queues: each peer's messages are handled in arrival
+    /// order on that peer's own task, so a slow step for one peer (an approval
+    /// prompt, a keyring unlock, ICE gathering) never stalls another peer's.
+    peer_queues:
+        Mutex<std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<SignalMsg>>>,
     /// OS services.
     platform: Arc<dyn Platform>,
     /// The viewer's native video surface, attached by the app once its window
@@ -196,6 +239,8 @@ impl Engine {
             pending_login: Arc::new(Mutex::new(None)),
             auto_attempted: Arc::new(Mutex::new(None)),
             outbound: Mutex::new(None),
+            admitting: Mutex::new(None),
+            peer_queues: Mutex::new(Default::default()),
             platform,
             surface: Mutex::new(None),
             negotiated: Mutex::new(Codec::H264),
@@ -230,7 +275,68 @@ impl Engine {
         let _ = cfg.persist(&self.config_path);
     }
 
-    /// Drive one inbound signaling event. Call this from the app's event loop.
+    /// Dispatch one inbound signaling event without waiting for it to be handled.
+    /// The app's signaling loop calls this.
+    ///
+    /// Messages from (or about) a peer go to that peer's own queue, handled in
+    /// arrival order on its own task; everything else is handled right here.
+    /// Ordering only matters within one peer (its connect-response must precede
+    /// its offer), and a step that waits — the host's approval prompt, a keyring
+    /// unlock for a saved password, ICE gathering — must not hold up any other
+    /// peer, nor the registration and TURN bookkeeping below.
+    pub async fn dispatch_signaling(self: &Arc<Self>, event: SigEvent) {
+        let SigEvent::Message(mut msg) = event else {
+            self.handle_signaling(event).await;
+            return;
+        };
+        let Some(peer) = signal_peer(&msg) else {
+            self.route(msg).await;
+            return;
+        };
+        // Send under the map lock: the worker checks "empty" and removes its
+        // entry under the same lock, so a message can never be queued on a
+        // worker that has just decided to exit.
+        let mut queues = self.peer_queues.lock();
+        if let Some(tx) = queues.get(&peer) {
+            match tx.send(msg) {
+                Ok(()) => return,
+                // The worker is gone (it panicked): start a fresh one below.
+                Err(returned) => msg = returned.0,
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(msg);
+        queues.insert(peer.clone(), tx);
+        drop(queues);
+        let engine = Arc::clone(self);
+        tokio::spawn(async move { engine.peer_worker(peer, rx).await });
+    }
+
+    /// One peer's signaling, in order. Exits after a quiet minute (removing its
+    /// queue under the map lock only if nothing arrived meanwhile).
+    async fn peer_worker(
+        self: Arc<Self>,
+        peer: String,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<SignalMsg>,
+    ) {
+        const IDLE: Duration = Duration::from_secs(60);
+        loop {
+            match tokio::time::timeout(IDLE, rx.recv()).await {
+                Ok(Some(msg)) => self.route(msg).await,
+                Ok(None) => return,
+                Err(_) => {
+                    let mut queues = self.peer_queues.lock();
+                    if rx.is_empty() {
+                        queues.remove(&peer);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drive one inbound signaling event to completion, serially. The loopback
+    /// tests use this; the app uses [`Engine::dispatch_signaling`].
     pub async fn handle_signaling(&self, event: SigEvent) {
         match event {
             SigEvent::Registered => {
@@ -369,8 +475,29 @@ impl Engine {
         password: Option<String>,
         decode_caps: Vec<String>,
     ) {
-        // Busy: one session at a time.
-        if !matches!(*self.role.lock(), Role::Idle) {
+        let cfg = self.config.lock().clone();
+        let mode = cfg.effective_mode();
+        // An approval prompt or a password proof is an admission in progress; a
+        // bare first password request (we only send a challenge) is not — the
+        // viewer may never answer it.
+        let admits = mode == Mode::Approve || password.is_some();
+
+        // Busy: one session at a time, and one admission at a time. Checked and
+        // claimed under the same locks, because each peer is handled on its own
+        // task: two requests (or a request and our own outgoing connect) must not
+        // both get through. Lock order: role → admitting → outbound.
+        let busy = {
+            let role = self.role.lock();
+            let mut admitting = self.admitting.lock();
+            let busy = !matches!(*role, Role::Idle)
+                || admitting.as_deref().is_some_and(|p| p != from)
+                || self.outbound.lock().is_some();
+            if !busy && admits {
+                *admitting = Some(from.clone());
+            }
+            busy
+        };
+        if busy {
             let _ = self.signaling.send(SignalMsg::ConnectResponse {
                 to: Some(from),
                 from: None,
@@ -382,6 +509,12 @@ impl Engine {
             });
             return;
         }
+        // Released however the admission ends (accepted, denied, wrong password).
+        // On accept the role is Host before this drops, so there is no gap.
+        let _admission = admits.then(|| Admission {
+            engine: self,
+            peer: from.clone(),
+        });
 
         // Remember the viewer's decode caps for codec negotiation at accept time.
         // Only the first attempt carries caps; a password retry sends none, so
@@ -390,11 +523,16 @@ impl Engine {
             self.pending_caps.lock().insert(from.clone(), decode_caps);
         }
 
-        let cfg = self.config.lock().clone();
-        match cfg.effective_mode() {
+        match mode {
             Mode::Password => self.handle_password_request(from, password, &cfg).await,
             Mode::Approve => self.handle_approve_request(from).await,
         }
+    }
+
+    /// Whether this computer is hosting or admitting a viewer — when it may not
+    /// start a session of its own (plans/08 D1).
+    fn hosting_or_admitting(&self) -> bool {
+        matches!(*self.role.lock(), Role::Host { .. }) || self.admitting.lock().is_some()
     }
 
     async fn handle_password_request(&self, from: String, password: Option<String>, cfg: &Config) {
@@ -494,6 +632,14 @@ impl Engine {
 
     /// UI action: connect out to `host_uuid`. Sends the first connect-request.
     pub fn connect_to(&self, host_uuid: String) {
+        // Not while this computer is controlled or letting someone in (D1): the
+        // two sessions would fight over the one session slot.
+        if self.hosting_or_admitting() {
+            let _ = self.ui.send(UiEvent::Toast(
+                "This computer is being controlled: end that session first".into(),
+            ));
+            return;
+        }
         // Advertise only codecs this viewer can actually hardware-decode. A
         // hardcoded list (e.g. always claiming AV1) makes the host negotiate a
         // codec we cannot decode → the viewer media loop dies → black screen.
@@ -709,6 +855,19 @@ impl Engine {
                 return;
             }
             *outbound = None;
+        }
+        // We started hosting (or admitting a viewer) while waiting for this
+        // answer: a second session must not start (D1). Tell that host to drop
+        // the session it just opened for us.
+        if accepted && self.hosting_or_admitting() {
+            let _ = self.signaling.send(SignalMsg::EndSession {
+                to: Some(from),
+                from: None,
+            });
+            let _ = self.ui.send(UiEvent::Toast(
+                "Connection cancelled: this computer is being controlled".into(),
+            ));
+            return;
         }
         if !accepted {
             *self.pending_login.lock() = None;

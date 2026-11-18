@@ -110,6 +110,12 @@ src/menu.rs        native menus (Session, Monitor, Tabs, key equivalents) — fr
 `overlay.js` (§6.18). **This split is its own step (P0) with no behaviour change**, because P1
 (switcher) and P4 (tabs) both rewrite the UI.
 
+As built in P0: the entry module is `main.js` (attaches every listener, in one order, after all
+modules have loaded, then boots), shared mutable state is the exported object `S` in `state.js`
+(an import binding is read-only), and the single live session (role changes, the viewer's menu
+bar, monitor pickers and pop-outs, the link-lost panel) is in `session.js`, which P4 replaces
+with per-tab views in `tabs.js`. `host.js` holds the approval modal and the host controls.
+
 ### 2.5 `server`
 
 ```

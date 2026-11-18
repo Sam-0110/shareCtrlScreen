@@ -18,7 +18,7 @@ Each row is marked complete in the commit that finishes it.
 | Step | What | Status |
 |---|---|---|
 | S | Structure, contracts and flows ([08a](08a-STRUCTURE-AND-FLOWS.md)), adversarial review folded in | **complete** (plan commit on the feature branch) |
-| P0 | Bugs + signaling dispatcher + UI/main.rs split + server CI | not started |
+| P0 | Bugs + signaling dispatcher + UI/main.rs split + server CI | **complete**, review pending (gate TABS-08 Windows + TABS-09 WSL PASS; macOS compile of the moved menu code is CI-pending; UI split smoke-tested in Node, not yet run in the app) |
 | P1 | Accounts own the workspace + sync v2 + synced prefs + migration | not started |
 | P2 | Engine multi-session core | not started |
 | P3 | Platform multi-surface (inset, active gate, focus, hooks, clipboard) | not started |

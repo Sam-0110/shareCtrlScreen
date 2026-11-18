@@ -61,9 +61,14 @@ jobs:
             echo "::notice::$tag not deployed yet — will deploy to Cloudflare."
           fi
 
-  # Deploy job: runs ONLY when this server version has not been deployed.
+  # The server's tests (server-tests.yml): a deploy never runs on a red test.
+  test:
+    uses: ./.github/workflows/server-tests.yml
+
+  # Deploy job: runs ONLY when this server version has not been deployed AND the
+  # server tests passed.
   deploy:
-    needs: check
+    needs: [check, test]
     if: needs.check.outputs.exists == 'false'
     runs-on: ubuntu-latest
     defaults:

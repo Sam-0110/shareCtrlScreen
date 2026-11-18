@@ -114,6 +114,33 @@ impl Decider for AllowControl {
     }
 }
 
+/// An approval prompt that stays open until the test releases it: `decide`
+/// records that it was asked, then waits for a permit before allowing control.
+struct HeldApproval {
+    asked: Arc<std::sync::atomic::AtomicBool>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl Decider for HeldApproval {
+    fn decide<'a>(
+        &'a self,
+        _from: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ApprovalDecision> + Send + 'a>> {
+        Box::pin(async move {
+            self.asked.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Closing the semaphore is never done; a failed acquire would mean the
+            // test tore down, and a denial is the safe answer then.
+            match self.release.acquire().await {
+                Ok(permit) => {
+                    permit.forget();
+                    ApprovalDecision::Allow(Permission::Control)
+                }
+                Err(_) => ApprovalDecision::Deny,
+            }
+        })
+    }
+}
+
 struct Peer {
     engine: Arc<Engine>,
     platform: Arc<MockPlatform>,
@@ -163,6 +190,16 @@ fn start_peer_on(name: &str, relay: &str, os: &'static str) -> Peer {
 
 /// A peer whose mock platform `configure` adjusts before the engine starts.
 fn start_peer_with(name: &str, relay: &str, configure: impl FnOnce(&mut MockPlatform)) -> Peer {
+    start_peer_full(name, relay, configure, Arc::new(AllowControl))
+}
+
+/// A peer with a chosen approval `decider` (approve mode is the default).
+fn start_peer_full(
+    name: &str,
+    relay: &str,
+    configure: impl FnOnce(&mut MockPlatform),
+    decider: Arc<dyn Decider>,
+) -> Peer {
     let root = temp_root(name);
     let mut platform = MockPlatform::new(&root);
     configure(&mut platform);
@@ -178,14 +215,15 @@ fn start_peer_with(name: &str, relay: &str, configure: impl FnOnce(&mut MockPlat
         .unwrap();
     let uuid = cfg.uuid.clone();
 
-    let (engine, mut ui_rx, mut sig_rx) = Engine::start(platform.clone(), Arc::new(AllowControl));
+    let (engine, mut ui_rx, mut sig_rx) = Engine::start(platform.clone(), decider);
     engine.set_ice_policy(IcePolicy::LoopbackOnly);
     engine.attach_surface(platform.surface.clone());
 
+    // The same dispatch path as the app: per-peer tasks.
     let e = engine.clone();
     tokio::spawn(async move {
         while let Some(ev) = sig_rx.recv().await {
-            e.handle_signaling(ev).await;
+            e.dispatch_signaling(ev).await;
         }
     });
     let toasts: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
@@ -257,6 +295,69 @@ fn files_in(dir: &Path) -> Vec<PathBuf> {
 }
 
 // ---- the test -------------------------------------------------------------------
+
+/// While the host's approval prompt is open for one viewer, a second viewer is
+/// answered "busy" at once — signaling for one peer no longer waits on another
+/// peer's prompt (plans/08 P0) — and the one-session rule still holds: only the
+/// first viewer gets in once the prompt is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_viewer_is_told_busy_while_the_first_awaits_approval() {
+    let relay = start_relay().await;
+    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let host = start_peer_full(
+        "host-held",
+        &relay,
+        |_| {},
+        Arc::new(HeldApproval {
+            asked: asked.clone(),
+            release: release.clone(),
+        }),
+    );
+    let first = start_peer("viewer-first", &relay);
+    let second = start_peer("viewer-second", &relay);
+    let t = Duration::from_secs(15);
+    eventually("all registered", t, || {
+        host.engine.server_connected()
+            && first.engine.server_connected()
+            && second.engine.server_connected()
+    })
+    .await;
+
+    first.engine.connect_to(host.uuid.clone());
+    eventually("the host's prompt is open for the first viewer", t, || {
+        asked.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+
+    second.engine.connect_to(host.uuid.clone());
+    eventually("the second viewer is told busy", t, || {
+        second
+            .toasts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m == "connection busy")
+    })
+    .await;
+    // Answered while the first prompt is still open: nothing was decided yet.
+    assert!(
+        matches!(host.engine.role(), Role::Idle),
+        "the busy answer must not wait for the first viewer's prompt"
+    );
+
+    release.add_permits(1);
+    let first_id = first.uuid.clone();
+    eventually("the first viewer is admitted", t, || {
+        matches!(host.engine.role(), Role::Host { ref peer, .. } if *peer == first_id)
+            && matches!(first.engine.role(), Role::Viewer { .. })
+    })
+    .await;
+    assert!(
+        matches!(second.engine.role(), Role::Idle),
+        "only one session at a time"
+    );
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_session_over_real_webrtc() {

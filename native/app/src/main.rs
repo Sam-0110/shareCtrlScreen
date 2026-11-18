@@ -17,456 +17,31 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod account;
+mod bridge;
+mod commands;
+mod menu;
 mod popout;
+mod state;
 #[cfg(windows)]
 mod tray;
 mod uiaccess;
 mod updater;
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-use codec_openh264::{Availability, OpenH264};
-use engine::handshake::{ApprovalDecision, Decider};
-use engine::{Engine, Role, UiEvent};
-use platform_api::{OsPermission, PermissionReport, PermissionState, Platform, AUTOSTART_FLAG};
-use protocol::Permission;
+use codec_openh264::OpenH264;
+use engine::handshake::Decider;
+use engine::Engine;
+use platform_api::{Platform, AUTOSTART_FLAG};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use tauri::{Emitter, Manager};
-use tokio::sync::{oneshot, Mutex};
+use tauri::Manager;
 
-/// Approve-mode decider backed by the WebView2 modal: `decide` parks on a
-/// oneshot channel that the `approve` command resolves when the human clicks.
-#[derive(Default)]
-struct AppDecider {
-    pending: Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>,
-}
-
-impl Decider for AppDecider {
-    fn decide<'a>(
-        &'a self,
-        from: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ApprovalDecision> + Send + 'a>> {
-        Box::pin(async move {
-            let (tx, rx) = oneshot::channel();
-            self.pending.lock().await.insert(from.to_string(), tx);
-            // 30 s auto-deny (contract §3.3): whichever fires first wins.
-            match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-                Ok(Ok(decision)) => decision,
-                _ => ApprovalDecision::Deny,
-            }
-        })
-    }
-}
-
-impl AppDecider {
-    async fn resolve(&self, from: &str, decision: ApprovalDecision) {
-        if let Some(tx) = self.pending.lock().await.remove(from) {
-            let _ = tx.send(decision);
-        }
-    }
-}
-
-/// Shared Tauri state.
-struct AppState {
-    engine: Arc<Engine>,
-    decider: Arc<AppDecider>,
-    /// The Cisco OpenH264 software codec (Settings → Advanced).
-    openh264: Arc<OpenH264>,
-    /// `Some(advice)` when this computer has no H.264 codec at all; shown next
-    /// to the OpenH264 toggle.
-    h264_problem: H264Problem,
-}
-
-/// Asks the platform whether H.264 is missing altogether (it can change when
-/// the user toggles OpenH264, so it is asked each time, not cached).
-type H264Problem = Arc<dyn Fn() -> Option<String> + Send + Sync>;
-
-// ---- commands (one per old ipcMain.handle) ----------------------------------
-
-/// UI-shaped config (camelCase, as the ported renderer expects). Deliberately
-/// omits `passwordHash` — the webview never needs it — and exposes a
-/// `hasPassword` boolean instead, which is all the settings modal uses.
-#[tauri::command]
-fn get_config(state: tauri::State<'_, AppState>) -> serde_json::Value {
-    let c = state.engine.config();
-    serde_json::json!({
-        "uuid": c.uuid,
-        "serverUrl": c.server_url,
-        "mode": match c.mode { protocol::Mode::Password => "password", _ => "approve" },
-        "hasPassword": c.password_hash.is_some(),
-        "passwordPermission": c.password_permission.as_str(),
-        "shareAudio": c.share_audio,
-        "shareDisplayId": c.share_display_id,
-        "recentIds": c.recent_ids,
-        "remoteNames": c.remote_names,
-        // Signed-in account for ID sync (username/server/lastSync; no token).
-        "account": account::account_json(&c),
-        "captureShortcuts": c.capture_shortcuts,
-        "autoLogin": c.auto_login,
-        "clipboardSync": c.clipboard_sync,
-        "pasteDroppedFiles": c.paste_dropped_files,
-        "startWithWindows": c.start_with_windows,
-        "useOpenH264": c.use_openh264,
-        "translateModifiers": c.translate_modifiers,
-        // Count only — the saved passwords themselves never reach the WebView.
-        "savedLoginCount": c.saved_logins.len(),
-    })
-}
-
-/// What the UI needs to word itself for this OS and to list the monitors.
-/// Built from the platform alone so it can be tested against the mock.
-fn platform_info_json(platform: &dyn Platform) -> serde_json::Value {
-    let info = platform.info();
-    let displays: Vec<_> = platform
-        .displays()
-        .into_iter()
-        .map(|d| {
-            serde_json::json!({
-                "id": d.id,
-                "name": d.name,
-                "x": d.x,
-                "y": d.y,
-                "width": d.width,
-                "height": d.height,
-                "scale": d.scale,
-                "primary": d.primary,
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "name": info.name,
-        "startAtLoginLabel": info.start_at_login_label,
-        "shortcutCaptureHint": info.shortcut_capture_hint,
-        "loginScreenSupported": info.login_screen_supported,
-        "downloadsDir": platform.paths().downloads_dir.display().to_string(),
-        "displays": displays,
-    })
-}
-
-#[tauri::command]
-fn get_platform_info(state: tauri::State<'_, AppState>) -> serde_json::Value {
-    platform_info_json(state.engine.platform().as_ref())
-}
-
-#[tauri::command]
-fn clear_recents(state: tauri::State<'_, AppState>) -> Vec<String> {
-    state.engine.clear_recents()
-}
-
-/// Name a remote ID (an empty name removes it). Returns all names.
-#[tauri::command]
-fn set_remote_name(
-    state: tauri::State<'_, AppState>,
-    id: String,
-    name: String,
-) -> std::collections::BTreeMap<String, String> {
-    state.engine.set_remote_name(&id, &name)
-}
-
-/// Current signaling status, queried by the UI on boot. The one-shot
-/// `server-status` event can fire before the WebView subscribes, so the boot
-/// path pulls the live value instead of relying solely on that event.
-#[tauri::command]
-fn get_server_status(state: tauri::State<'_, AppState>) -> String {
-    if state.engine.server_connected() {
-        "connected".into()
-    } else {
-        "disconnected".into()
-    }
-}
-
-#[tauri::command]
-fn get_role(state: tauri::State<'_, AppState>) -> String {
-    match state.engine.role() {
-        Role::Idle => "idle".into(),
-        Role::Host { .. } => "host".into(),
-        Role::Viewer { .. } => "viewer".into(),
-    }
-}
-
-#[tauri::command]
-fn connect_to(state: tauri::State<'_, AppState>, id: String) {
-    state.engine.connect_to(id);
-}
-
-#[tauri::command]
-fn submit_password(
-    state: tauri::State<'_, AppState>,
-    host: String,
-    password: String,
-    remember: Option<bool>,
-) {
-    state
-        .engine
-        .submit_password(host, password, remember.unwrap_or(false));
-}
-
-#[tauri::command]
-fn set_permission(state: tauri::State<'_, AppState>, value: String) {
-    let perm = if value == "control" {
-        Permission::Control
-    } else {
-        Permission::View
-    };
-    state.engine.set_permission(perm);
-}
-
-#[tauri::command]
-fn end_session(state: tauri::State<'_, AppState>) {
-    state.engine.end_session();
-}
-
-/// Viewer: ask the host for a fresh keyframe (clears smear after packet loss).
-#[tauri::command]
-fn request_refresh(state: tauri::State<'_, AppState>) {
-    state.engine.request_refresh();
-}
-
-/// Switch the shared monitor mid-session (host: directly; viewer: asks the
-/// host, which needs control). The result arrives as a `displays` event.
-#[tauri::command]
-fn select_display(state: tauri::State<'_, AppState>, id: String) {
-    state.engine.select_display(id);
-}
-
-/// The `displays` event payload: the host's monitors, the one shared now, and
-/// whether this side may switch.
-fn displays_json(
-    list: &[protocol::RemoteDisplay],
-    current: &str,
-    can_switch: bool,
-    popouts: &[protocol::PopoutStream],
-) -> serde_json::Value {
-    let popouts: Vec<_> = popouts
-        .iter()
-        .map(|p| serde_json::json!({ "slot": p.s, "id": p.id }))
-        .collect();
-    let displays: Vec<_> = list
-        .iter()
-        .map(|d| {
-            serde_json::json!({
-                "id": d.id,
-                "name": d.name,
-                "width": d.width,
-                "height": d.height,
-                "primary": d.primary,
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "displays": displays,
-        "current": current,
-        "canSwitch": can_switch,
-        "popouts": popouts,
-    })
-}
-
-/// Viewer: ask the host to also show monitor `id` in a separate window (D14;
-/// needs control). The window opens when the host's `displays` lists it.
-#[tauri::command]
-fn popout_display(state: tauri::State<'_, AppState>, id: String) {
-    state.engine.popout_display(id);
-}
-
-/// How a monitor is labelled in the pickers and pop-out titles (the web UI
-/// builds the same label in `app.js`).
-fn display_label(d: &protocol::RemoteDisplay) -> String {
-    let name = if d.name.is_empty() {
-        d.id.as_str()
-    } else {
-        d.name.as_str()
-    };
-    let primary = if d.primary { ", primary" } else { "" };
-    format!("{name} ({}\u{d7}{}{primary})", d.width, d.height)
-}
-
-/// Viewer: hide/show the native video surface so web modals (settings) are
-/// visible mid-session — the native surface otherwise covers them.
-#[tauri::command]
-fn set_video_visible(state: tauri::State<'_, AppState>, visible: bool) {
-    state.engine.set_video_visible(visible);
-}
-
-#[tauri::command]
-async fn approve(
-    state: tauri::State<'_, AppState>,
-    from: String,
-    decision: String,
-) -> Result<(), ()> {
-    let d = match decision.as_str() {
-        "control" => ApprovalDecision::Allow(Permission::Control),
-        "view" => ApprovalDecision::Allow(Permission::View),
-        _ => ApprovalDecision::Deny,
-    };
-    state.decider.resolve(&from, d).await;
-    Ok(())
-}
-
-#[tauri::command]
-fn save_settings(
-    state: tauri::State<'_, AppState>,
-    patch: serde_json::Value,
-) -> Result<(), String> {
-    state.engine.update_config(|cfg| {
-        if let Some(mode) = patch.get("mode").and_then(|v| v.as_str()) {
-            cfg.mode = if mode == "password" {
-                protocol::Mode::Password
-            } else {
-                protocol::Mode::Approve
-            };
-        }
-        if let Some(pw) = patch.get("password").and_then(|v| v.as_str()) {
-            if pw.is_empty() {
-                cfg.set_password(None);
-            } else {
-                cfg.set_password(Some(pw));
-            }
-        }
-        if let Some(perm) = patch.get("passwordPermission").and_then(|v| v.as_str()) {
-            cfg.password_permission = if perm == "control" {
-                Permission::Control
-            } else {
-                Permission::View
-            };
-        }
-        if let Some(url) = patch.get("serverUrl").and_then(|v| v.as_str()) {
-            cfg.server_url = url.to_string();
-        }
-        if let Some(b) = patch.get("shareAudio").and_then(|v| v.as_bool()) {
-            cfg.share_audio = b;
-        }
-        if let Some(b) = patch.get("captureShortcuts").and_then(|v| v.as_bool()) {
-            cfg.capture_shortcuts = b;
-        }
-        if let Some(v) = patch.get("shareDisplayId") {
-            cfg.share_display_id = v.as_str().filter(|s| !s.is_empty()).map(String::from);
-        }
-        if let Some(b) = patch.get("autoLogin").and_then(|v| v.as_bool()) {
-            cfg.auto_login = b;
-        }
-        if let Some(b) = patch.get("clipboardSync").and_then(|v| v.as_bool()) {
-            cfg.clipboard_sync = b;
-        }
-        if let Some(b) = patch.get("pasteDroppedFiles").and_then(|v| v.as_bool()) {
-            cfg.paste_dropped_files = b;
-        }
-        // Explicit "forget everything" from the settings modal.
-        if patch
-            .get("clearSavedLogins")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            cfg.saved_logins.clear();
-        }
-        if let Some(b) = patch.get("startWithWindows").and_then(|v| v.as_bool()) {
-            cfg.start_with_windows = b;
-        }
-        if let Some(b) = patch.get("useOpenH264").and_then(|v| v.as_bool()) {
-            cfg.use_openh264 = b;
-        }
-        // Read by the running session's key translator on its next key event
-        // (`Engine::update_config` publishes it); held keys release as sent.
-        if let Some(b) = patch.get("translateModifiers").and_then(|v| v.as_bool()) {
-            cfg.translate_modifiers = b;
-        }
-    });
-    // Takes effect for the next codec the engine creates (Cisco's licence: the
-    // user can disable and re-enable the binary at any time).
-    if let Some(b) = patch.get("useOpenH264").and_then(|v| v.as_bool()) {
-        state.openh264.set_enabled(b);
-    }
-
-    // Apply the startup registration AFTER the config is persisted. A failure is
-    // surfaced rather than swallowed (a startup toggle that silently does nothing
-    // is worse than one that says why) — and the saved setting is rolled back, so
-    // the config never claims an autostart that is not registered.
-    if let Some(b) = patch.get("startWithWindows").and_then(|v| v.as_bool()) {
-        if let Err(e) = state.engine.platform().autostart().set_enabled(b) {
-            tracing::warn!("start at sign-in: {e}");
-            state
-                .engine
-                .update_config(|cfg| cfg.start_with_windows = !b);
-            return Err(e);
-        }
-    }
-    Ok(())
-}
-
-/// Wire name of a permission state. Spelled out (not `{:?}`) so the UI contract
-/// cannot drift if the enum's Debug output ever changes.
-fn permission_state_name(s: PermissionState) -> &'static str {
-    match s {
-        PermissionState::Granted => "granted",
-        PermissionState::Denied => "denied",
-        PermissionState::NotDetermined => "notDetermined",
-        PermissionState::NotApplicable => "notApplicable",
-    }
-}
-
-fn permissions_json(report: &PermissionReport) -> serde_json::Value {
-    serde_json::json!({
-        "screenCapture": permission_state_name(report.screen_capture),
-        "inputInjection": permission_state_name(report.input_injection),
-        "inputMonitoring": permission_state_name(report.input_monitoring),
-        "notes": report.notes,
-    })
-}
-
-fn parse_os_permission(name: &str) -> Result<OsPermission, String> {
-    match name {
-        "screenCapture" => Ok(OsPermission::ScreenCapture),
-        "inputInjection" => Ok(OsPermission::InputInjection),
-        "inputMonitoring" => Ok(OsPermission::InputMonitoring),
-        other => Err(format!("unknown permission '{other}'")),
-    }
-}
-
-/// OS permissions the preflight modal lists. The UI polls this while the modal
-/// is open, so it only reads state — it never prompts.
-#[tauri::command]
-fn get_permissions(state: tauri::State<'_, AppState>) -> serde_json::Value {
-    permissions_json(&state.engine.platform().permissions())
-}
-
-/// Show the OS prompt (or open the matching settings pane) for one permission.
-/// The outcome is not returned: the user answers out of band and the UI
-/// re-polls `get_permissions`.
-#[tauri::command]
-fn request_permission(state: tauri::State<'_, AppState>, name: String) -> Result<(), String> {
-    let permission = parse_os_permission(&name)?;
-    state.engine.platform().request_permission(permission);
-    Ok(())
-}
-
-/// What Settings → Advanced shows about the software codec: Cisco's required
-/// notice and licence text, and where the download stands.
-#[tauri::command]
-fn openh264_info(state: tauri::State<'_, AppState>) -> serde_json::Value {
-    let availability = state.openh264.availability();
-    serde_json::json!({
-        "notice": codec_openh264::NOTICE,
-        "license": codec_openh264::LICENSE_TEXT,
-        "version": codec_openh264::VERSION,
-        "ready": availability == Availability::Ready,
-        "status": availability.describe(),
-        "problem": (state.h264_problem)(),
-    })
-}
-
-/// "Download now": fetch the Cisco binary ahead of need (or retry after an
-/// offline first run). Blocking network I/O, so off the async runtime.
-#[tauri::command]
-async fn openh264_download(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let openh264 = state.openh264.clone();
-    tauri::async_runtime::spawn_blocking(move || openh264.ensure())
-        .await
-        .map_err(|e| format!("download task failed: {e}"))?
-        .map_err(|e| e.to_string())?;
-    Ok(state.openh264.availability().describe())
-}
+// Re-exported at the crate root so the modules keep reaching them as
+// `crate::AppState` / `crate::display_label`.
+use commands::display_label;
+use state::{AppDecider, AppState, H264Problem};
 
 /// The running app's log file.
 const APP_LOG: &str = "app.log";
@@ -569,181 +144,6 @@ fn raise_main_window(app: &tauri::AppHandle) {
     }
 }
 
-/// Build the native app menu and install it. macOS + Linux only (task M15):
-/// Windows keeps its existing web drawer, so it gets no menu. A single "Session"
-/// submenu with exactly three always-enabled items — Settings, Disconnect / End
-/// Session, Check for updates. On macOS the standard app menu (About, Hide and
-/// ⌘Q — the video view's key handling relies on ⌘Q reaching the menu bar) is
-/// kept and ours is appended; Linux has no system app menu, so only ours shows
-/// (in the window's menu bar).
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn install_native_menu(app: &tauri::App) -> tauri::Result<()> {
-    use tauri::menu::{Menu, MenuItem, Submenu};
-    let settings = MenuItem::with_id(app, "menu-settings", "Settings", true, None::<&str>)?;
-    let disconnect = MenuItem::with_id(
-        app,
-        "menu-end-session",
-        "Disconnect / End Session",
-        true,
-        None::<&str>,
-    )?;
-    let updates = MenuItem::with_id(
-        app,
-        "menu-check-updates",
-        "Check for updates",
-        true,
-        None::<&str>,
-    )?;
-    let session = Submenu::with_items(app, "Session", true, &[&settings, &disconnect, &updates])?;
-    // The host's monitors during a session, rebuilt on every `displays` event
-    // (see `update_monitor_menu`); a placeholder until then.
-    let monitor = Submenu::with_id(app, "menu-monitor", "Monitor", true)?;
-    #[cfg(target_os = "macos")]
-    {
-        let menu = Menu::default(app.handle())?;
-        menu.append(&session)?;
-        menu.append(&monitor)?;
-        app.set_menu(menu)?;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let menu = Menu::with_items(app, &[&session, &monitor])?;
-        app.set_menu(menu)?;
-    }
-    app.manage(MonitorMenu(std::sync::Mutex::new(Some(monitor.clone()))));
-    update_monitor_menu(app.handle(), &[], "", false, &[]);
-    Ok(())
-}
-
-/// The native "Monitor" submenu (macOS + Linux), kept so it can be rebuilt.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-struct MonitorMenu(std::sync::Mutex<Option<tauri::menu::Submenu<tauri::Wry>>>);
-
-/// Menu item id prefix for a monitor; the rest is the display id.
-const MENU_DISPLAY_PREFIX: &str = "menu-display:";
-/// Menu item id prefix for "open this monitor in a new window" (D14).
-const MENU_POPOUT_PREFIX: &str = "menu-popout:";
-
-/// Rebuild the native "Monitor" submenu: one checkable item per monitor, the
-/// shared one checked, all disabled while this side may not switch. Fewer than
-/// two monitors (or no session) shows one disabled placeholder. A no-op on
-/// Windows, where the web drawer has the picker.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn update_monitor_menu(
-    app: &tauri::AppHandle,
-    list: &[protocol::RemoteDisplay],
-    current: &str,
-    can_switch: bool,
-    popouts: &[protocol::PopoutStream],
-) {
-    use tauri::menu::{CheckMenuItem, MenuItem, PredefinedMenuItem, Submenu};
-    let Some(state) = app.try_state::<MonitorMenu>() else {
-        return;
-    };
-    let Some(sub) = state.0.lock().ok().and_then(|g| g.clone()) else {
-        return;
-    };
-    let rebuild = || -> tauri::Result<()> {
-        while sub.remove_at(0)?.is_some() {}
-        if list.len() < 2 {
-            let none = MenuItem::with_id(
-                app,
-                "menu-display-none",
-                "No other monitors",
-                false,
-                None::<&str>,
-            )?;
-            sub.append(&none)?;
-            return Ok(());
-        }
-        for d in list {
-            let mut label = display_label(d);
-            if !can_switch {
-                label.push_str(" \u{2014} needs control");
-            }
-            let item = CheckMenuItem::with_id(
-                app,
-                format!("{MENU_DISPLAY_PREFIX}{}", d.id),
-                label,
-                can_switch,
-                d.id == current,
-                None::<&str>,
-            )?;
-            sub.append(&item)?;
-        }
-        // D14: "Open in New Window" for every monitor not already on screen
-        // (only the viewer acts on it; on the host the engine ignores it).
-        let others: Vec<&protocol::RemoteDisplay> = list
-            .iter()
-            .filter(|d| d.id != current && !popouts.iter().any(|p| p.id == d.id))
-            .collect();
-        if !others.is_empty() {
-            sub.append(&PredefinedMenuItem::separator(app)?)?;
-            let open = Submenu::with_id(app, "menu-popout", "Open in New Window", can_switch)?;
-            for d in others {
-                let item = MenuItem::with_id(
-                    app,
-                    format!("{MENU_POPOUT_PREFIX}{}", d.id),
-                    display_label(d),
-                    can_switch,
-                    None::<&str>,
-                )?;
-                open.append(&item)?;
-            }
-            sub.append(&open)?;
-        }
-        Ok(())
-    };
-    if let Err(e) = rebuild() {
-        tracing::warn!("monitor menu: {e}");
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn update_monitor_menu(
-    _app: &tauri::AppHandle,
-    _list: &[protocol::RemoteDisplay],
-    _current: &str,
-    _can_switch: bool,
-    _popouts: &[protocol::PopoutStream],
-) {
-}
-
-/// Dispatch a click on one of the native menu items (task M15). Settings and
-/// "Check for updates" go to the webview as events — the same `openSettings`
-/// flow the gear buttons use; "Check for updates" additionally runs the quiet
-/// updater check in the Updates panel. Disconnect ends the session straight
-/// through the engine, exactly as the `end_session` command does. On Windows
-/// only the service host's tray menu fires ([`tray`]).
-fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
-    #[cfg(windows)]
-    if tray::handle_menu_event(app, event.id().as_ref()) {
-        return;
-    }
-    match event.id().as_ref() {
-        "menu-settings" => {
-            let _ = app.emit("menu://settings", ());
-        }
-        "menu-check-updates" => {
-            let _ = app.emit("menu://check-updates", ());
-        }
-        "menu-end-session" => {
-            app.state::<AppState>().engine.end_session();
-        }
-        other => {
-            if let Some(id) = other.strip_prefix(MENU_DISPLAY_PREFIX) {
-                app.state::<AppState>()
-                    .engine
-                    .select_display(id.to_string());
-            } else if let Some(id) = other.strip_prefix(MENU_POPOUT_PREFIX) {
-                app.state::<AppState>()
-                    .engine
-                    .popout_display(id.to_string());
-            }
-        }
-    }
-}
-
 fn main() {
     // `--print-uiaccess` answers and exits before anything else exists: no
     // window, no network, no logging (which truncates app.log) and no instance
@@ -799,7 +199,7 @@ fn main() {
     let _runtime_guard = runtime.enter();
 
     let decider = Arc::new(AppDecider::default());
-    let (engine, mut ui_rx, mut sig_rx) =
+    let (engine, ui_rx, mut sig_rx) =
         Engine::start(platform.clone(), decider.clone() as Arc<dyn Decider>);
 
     // Keep the autostart entry honest. It records an absolute path, which goes
@@ -840,7 +240,7 @@ fn main() {
         })
         // Native menu clicks (macOS + Linux), and the Windows service host's
         // tray menu.
-        .on_menu_event(handle_menu_event)
+        .on_menu_event(menu::handle_menu_event)
         // Windows service host: closing the window hides it to the tray (a
         // no-op until the tray icon exists, so other instances still quit).
         .on_window_event(|window, event| {
@@ -850,29 +250,29 @@ fn main() {
             let _ = (window, event);
         })
         .invoke_handler(tauri::generate_handler![
-            get_config,
-            get_platform_info,
-            clear_recents,
-            set_remote_name,
+            commands::get_config,
+            commands::get_platform_info,
+            commands::clear_recents,
+            commands::set_remote_name,
             account::account_sign_in,
             account::account_sync,
             account::account_sign_out,
-            get_server_status,
-            get_role,
-            connect_to,
-            submit_password,
-            set_permission,
-            end_session,
-            request_refresh,
-            select_display,
-            popout_display,
-            set_video_visible,
-            approve,
-            save_settings,
-            get_permissions,
-            request_permission,
-            openh264_info,
-            openh264_download,
+            commands::get_server_status,
+            commands::get_role,
+            commands::connect_to,
+            commands::submit_password,
+            commands::set_permission,
+            commands::end_session,
+            commands::request_refresh,
+            commands::select_display,
+            commands::popout_display,
+            commands::set_video_visible,
+            commands::approve,
+            commands::save_settings,
+            commands::get_permissions,
+            commands::request_permission,
+            commands::openh264_info,
+            commands::openh264_download,
             updater::updater_check,
             updater::updater_install,
             updater::open_releases_page,
@@ -883,7 +283,7 @@ fn main() {
             // Native menu (macOS + Linux only; Windows keeps its web drawer).
             // Not fatal: the app is still fully usable without the menu.
             #[cfg(any(target_os = "macos", target_os = "linux"))]
-            if let Err(e) = install_native_menu(app) {
+            if let Err(e) = menu::install_native_menu(app) {
                 tracing::warn!("native menu: {e}");
             }
 
@@ -906,76 +306,16 @@ fn main() {
             }
 
             // Bridge engine UiEvents → WebView2 events (replaces ipcRenderer.on).
-            let bridge_engine = engine.clone();
-            tauri::async_runtime::spawn(async move {
-                while let Some(ev) = ui_rx.recv().await {
-                    let (name, payload) = match ev {
-                        UiEvent::ServerStatus(s) => {
-                            ("server-status", serde_json::json!({ "status": s }))
-                        }
-                        UiEvent::ApprovalRequest { from } => {
-                            #[cfg(windows)]
-                            tray::show_for_approval(&handle);
-                            ("approval-request", serde_json::json!({ "from": from }))
-                        }
-                        UiEvent::PasswordRequired { from } => {
-                            ("password-required", serde_json::json!({ "from": from }))
-                        }
-                        // Structured, not Debug-formatted: the UI needs the peer
-                        // id and permission as real fields.
-                        UiEvent::RoleChanged(role) => (
-                            "role-changed",
-                            match role {
-                                Role::Idle => serde_json::json!({ "role": "idle" }),
-                                Role::Host { peer, permission } => serde_json::json!({
-                                    "role": "host",
-                                    "peer": peer,
-                                    "permission": permission.as_str(),
-                                }),
-                                Role::Viewer { peer, permission } => serde_json::json!({
-                                    "role": "viewer",
-                                    "peer": peer,
-                                    "permission": permission.as_str(),
-                                }),
-                            },
-                        ),
-                        UiEvent::Toast(msg) => ("toast", serde_json::json!({ "message": msg })),
-                        UiEvent::LinkTrouble { secs_left } => {
-                            ("link-trouble", serde_json::json!({ "secsLeft": secs_left }))
-                        }
-                        UiEvent::LinkRestored => ("link-restored", serde_json::json!({})),
-                        UiEvent::Displays {
-                            list,
-                            current,
-                            can_switch,
-                            popouts,
-                        } => {
-                            update_monitor_menu(&handle, &list, &current, can_switch, &popouts);
-                            // Viewer: open/close pop-out windows to match.
-                            if matches!(bridge_engine.role(), Role::Viewer { .. }) {
-                                popout::reconcile(&handle, &bridge_engine, &list, &popouts);
-                            }
-                            (
-                                "displays",
-                                displays_json(&list, &current, can_switch, &popouts),
-                            )
-                        }
-                    };
-                    // A session that ended takes its monitor list and its
-                    // pop-out windows with it.
-                    if name == "role-changed" && payload["role"] == "idle" {
-                        update_monitor_menu(&handle, &[], "", false, &[]);
-                        popout::close_all(&handle, &bridge_engine);
-                    }
-                    let _ = handle.emit(name, payload);
-                }
-            });
+            bridge::spawn(handle, engine.clone(), ui_rx);
 
-            // Drive the signaling event loop into the engine.
+            // Drive the signaling event loop into the engine. The loop only
+            // dispatches: each peer's messages run on that peer's own task, so a
+            // slow step for one (an approval prompt, a keyring unlock) never
+            // stalls the others or the server bookkeeping.
             let sig_engine = engine.clone();
             tauri::async_runtime::spawn(async move {
                 while let Some(event) = sig_rx.recv().await {
-                    sig_engine.handle_signaling(event).await;
+                    sig_engine.dispatch_signaling(event).await;
                 }
             });
 
@@ -992,108 +332,4 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running ShareCtrlScreen");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use platform_api::mock::MockPlatform;
-
-    fn platform_with(report: PermissionReport) -> MockPlatform {
-        let platform = MockPlatform::new(&std::env::temp_dir());
-        *platform.permissions.lock().expect("mock lock") = report;
-        platform
-    }
-
-    #[test]
-    fn denied_report_serialises_to_the_ui_shape() {
-        let platform = platform_with(PermissionReport {
-            screen_capture: PermissionState::Denied,
-            input_injection: PermissionState::NotDetermined,
-            input_monitoring: PermissionState::NotApplicable,
-            notes: vec!["a caveat".into()],
-        });
-        assert_eq!(
-            permissions_json(&platform.permissions()),
-            serde_json::json!({
-                "screenCapture": "denied",
-                "inputInjection": "notDetermined",
-                "inputMonitoring": "notApplicable",
-                "notes": ["a caveat"],
-            })
-        );
-    }
-
-    #[test]
-    fn granted_report_serialises_to_the_ui_shape() {
-        let platform = platform_with(PermissionReport {
-            screen_capture: PermissionState::Granted,
-            input_injection: PermissionState::Granted,
-            input_monitoring: PermissionState::Granted,
-            notes: Vec::new(),
-        });
-        assert_eq!(
-            permissions_json(&platform.permissions()),
-            serde_json::json!({
-                "screenCapture": "granted",
-                "inputInjection": "granted",
-                "inputMonitoring": "granted",
-                "notes": [],
-            })
-        );
-    }
-
-    #[test]
-    fn request_names_map_to_permissions_and_unknown_is_an_error() {
-        assert_eq!(
-            parse_os_permission("screenCapture"),
-            Ok(OsPermission::ScreenCapture)
-        );
-        assert_eq!(
-            parse_os_permission("inputInjection"),
-            Ok(OsPermission::InputInjection)
-        );
-        assert_eq!(
-            parse_os_permission("inputMonitoring"),
-            Ok(OsPermission::InputMonitoring)
-        );
-        assert!(parse_os_permission("camera").is_err());
-    }
-
-    #[test]
-    fn a_parsed_request_reaches_the_platform() {
-        let platform = platform_with(PermissionReport::all_not_applicable());
-        let p = parse_os_permission("inputInjection").expect("known name");
-        platform.request_permission(p);
-        assert_eq!(
-            *platform.permission_requests.lock().expect("mock lock"),
-            vec![OsPermission::InputInjection]
-        );
-    }
-
-    #[test]
-    fn platform_info_has_the_shape_the_ui_reads() {
-        let root = std::env::temp_dir().join("sct-app-platform-info");
-        let platform = MockPlatform::new(&root);
-        let v = platform_info_json(&platform);
-
-        assert_eq!(v["name"], "mock");
-        assert_eq!(v["startAtLoginLabel"], "Start at sign-in");
-        assert!(v["shortcutCaptureHint"].is_string());
-        assert_eq!(v["loginScreenSupported"], false);
-        assert_eq!(
-            v["downloadsDir"],
-            root.join("downloads").display().to_string()
-        );
-
-        let displays = v["displays"].as_array().expect("displays is an array");
-        assert_eq!(displays.len(), 1);
-        let d = &displays[0];
-        assert_eq!(d["id"], "mock-0");
-        assert_eq!(d["name"], "Mock display");
-        assert_eq!((d["x"].as_i64(), d["y"].as_i64()), (Some(0), Some(0)));
-        assert!(d["width"].is_u64() && d["height"].is_u64());
-        assert_eq!(d["scale"], 1.0);
-        assert_eq!(d["primary"], true);
-    }
 }
