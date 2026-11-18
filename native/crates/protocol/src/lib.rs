@@ -17,7 +17,7 @@ pub mod signaling;
 pub mod transfer;
 
 pub use config::{Config, IceServer, Mode, Permission};
-pub use control::{ControlMsg, RemoteDisplay};
+pub use control::{ControlMsg, PopoutStream, RemoteDisplay};
 pub use input::{Button, InputMsg};
 pub use signaling::{IceCandidate, IceServers, SignalData, SignalMsg};
 pub use transfer::{BulkFrame, FileMeta};

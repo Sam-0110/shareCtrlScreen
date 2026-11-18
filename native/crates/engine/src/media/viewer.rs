@@ -14,6 +14,9 @@ pub(crate) struct ViewerMedia {
     pub surface: Arc<dyn VideoSurface>,
     pub codec: Codec,
     pub shared: Arc<Shared>,
+    /// The video stream shown (0 = main window; 1.. = a pop-out, D14). Tags
+    /// this loop's keyframe requests and size reports.
+    pub slot: u8,
 }
 
 /// Idle repaint cadence (D11): how long the loop blocks for a new frame before
@@ -34,6 +37,7 @@ pub(crate) fn viewer_media_loop(
         surface,
         codec,
         shared,
+        slot,
     } = media;
 
     // Presenter + decoder share one device (zero-copy decode → present). Create
@@ -93,6 +97,7 @@ pub(crate) fn viewer_media_loop(
                 let _ = ctl_tx.send(serialize(&protocol::ControlMsg::ViewSize {
                     width: now_size.0,
                     height: now_size.1,
+                    s: slot,
                 }));
             }
         }
@@ -122,7 +127,9 @@ pub(crate) fn viewer_media_loop(
                     // Deltas can't decode until the requested IDR arrives.
                     skipped += pending.len() as u64;
                     if last_kf_req.elapsed() >= std::time::Duration::from_secs(1) {
-                        let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest));
+                        let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest {
+                            s: slot,
+                        }));
                         last_kf_req = std::time::Instant::now();
                     }
                     continue;
@@ -135,7 +142,9 @@ pub(crate) fn viewer_media_loop(
                         "viewer: {} frame(s) behind — dumped backlog, requesting keyframe",
                         pending.len()
                     );
-                    let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest));
+                    let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest {
+                        s: slot,
+                    }));
                     last_kf_req = std::time::Instant::now();
                     continue;
                 }
@@ -156,7 +165,9 @@ pub(crate) fn viewer_media_loop(
                     ts += 166_667;
                     match decoder.decode(&au, keyframe, ts) {
                         Ok(Some(_)) => note_decoded(&mut rendered, &mut undecoded_streak, skipped),
-                        Ok(None) => on_no_picture(&mut undecoded_streak, &mut last_kf_req, &ctl_tx),
+                        Ok(None) => {
+                            on_no_picture(&mut undecoded_streak, &mut last_kf_req, &ctl_tx, slot)
+                        }
                         Err(e) => tracing::warn!("decode error: {e}"),
                     }
                 }
@@ -184,7 +195,9 @@ pub(crate) fn viewer_media_loop(
                             last_cursor = cursor;
                             last_frame = Some(frame);
                         }
-                        Ok(None) => on_no_picture(&mut undecoded_streak, &mut last_kf_req, &ctl_tx),
+                        Ok(None) => {
+                            on_no_picture(&mut undecoded_streak, &mut last_kf_req, &ctl_tx, slot)
+                        }
                         Err(e) => tracing::warn!("decode error: {e}"),
                     }
                 }
@@ -218,7 +231,10 @@ pub(crate) fn viewer_media_loop(
                     // to show, instead of leaving the surface black.
                     None => {
                         if repaint && last_kf_req.elapsed() >= std::time::Duration::from_secs(1) {
-                            let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest));
+                            let _ =
+                                ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest {
+                                    s: slot,
+                                }));
                             last_kf_req = std::time::Instant::now();
                         }
                     }
@@ -247,11 +263,14 @@ fn on_no_picture(
     undecoded_streak: &mut u32,
     last_kf_req: &mut std::time::Instant,
     ctl_tx: &Sender<Vec<u8>>,
+    slot: u8,
 ) {
     *undecoded_streak += 1;
     if *undecoded_streak >= 5 && last_kf_req.elapsed() >= std::time::Duration::from_secs(1) {
         tracing::info!("viewer: no decodable frames — requesting keyframe");
-        let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest));
+        let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest {
+            s: slot,
+        }));
         *last_kf_req = std::time::Instant::now();
     }
 }

@@ -25,7 +25,7 @@ use parking_lot::Mutex;
 use platform_api::{FileDrop, KeyForwarder, Rect, VideoInput};
 use protocol::{ControlMsg, InputMsg, Permission, SignalData, SignalMsg};
 
-use crate::media::host::{host_media_loop, HostMedia};
+use crate::media::host::{host_media_loop, HostCtx, HostStreams, StreamSpec, MAX_POPOUTS};
 use crate::media::viewer::{viewer_media_loop, ViewerMedia};
 use crate::modifiers::{KeyTranslator, OsFamily};
 use crate::{Engine, Role};
@@ -36,13 +36,14 @@ pub(crate) use crate::tuning::{DESIRED_BITRATE, TARGET_BITRATE};
 /// engines in one process — the loopback test — never see each other's state.
 #[derive(Default)]
 pub(crate) struct Shared {
-    /// Host: the viewer's display size `w << 32 | h` (0 = unknown). The host
-    /// encodes to it so the viewer presents 1:1.
-    pub view_size: AtomicU64,
+    /// Host: the viewer's display size `w << 32 | h` (0 = unknown) for the main
+    /// stream. The host encodes to it so the viewer presents 1:1.
+    pub view_size: Arc<AtomicU64>,
     /// Viewer: latest cursor from the host, drawn as a sprite by the presenter.
     pub cursor: Mutex<Option<ViewerPointer>>,
-    /// Viewer: the host's cursor images received so far (task D9).
-    pub cursor_images: Mutex<crate::media::cursor::ViewerCursors>,
+    /// Viewer: the host's cursor images received so far (task D9). One cache
+    /// for the session: a pop-out stream's `Shared` holds the same `Arc`.
+    pub cursor_images: Arc<Mutex<crate::media::cursor::ViewerCursors>>,
     /// Viewer: whether this session currently has CONTROL (task D10). Set from
     /// the granted permission at session start and updated on every inbound
     /// `ControlMsg::Perm`. While `true` and the local pointer is over the
@@ -66,6 +67,29 @@ pub(crate) struct Shared {
     /// right after the new capture is live, taken by the transport thread
     /// (which owns the injector), so input follows the picture.
     pub input_rect: Mutex<Option<Option<Rect>>>,
+    /// Host (D14): the main stream's monitor and the pop-out streams.
+    pub host_streams: Mutex<HostStreams>,
+    /// Host: how many video streams are live (main + pop-outs) — the encoder
+    /// bitrate is split evenly across them. 0 is read as 1.
+    pub live_streams: AtomicU32,
+    /// Host: the record of cursor images the viewer holds, shared by every
+    /// stream (`HostCursor::sharing`), and the lock that keeps their sends in
+    /// that record's order.
+    pub host_cursor_root: crate::media::cursor::HostCursor,
+    pub cursor_send: Mutex<()>,
+    /// Threads started after the session began (host pop-out streams), joined
+    /// at teardown.
+    pub stream_threads: Mutex<Vec<JoinHandle<()>>>,
+    /// Viewer (D14): the open pop-out windows by stream slot. Only on the main
+    /// stream's `Shared`.
+    pub popouts: Mutex<std::collections::BTreeMap<u8, ViewerPopout>>,
+    /// Viewer: the stream the host currently maps pointer input onto. Every
+    /// window's input thread sends `InputTarget` before its first positional
+    /// message when this differs from its own slot (under this lock, so the
+    /// switch and the message stay in order on ctl).
+    pub input_target: Arc<Mutex<u8>>,
+    /// Viewer: the last pop-out attachment generation handed out.
+    pub popout_gen: AtomicU64,
     /// Test hook (`test-hooks` feature only): the host's current encode size,
     /// `w << 32 | h`, so the loopback can assert it stays full resolution as the
     /// link varies (V2 has no resolution ladder).
@@ -91,6 +115,27 @@ pub(crate) struct ViewerPointer {
     pub shape: Option<u32>,
 }
 
+/// Viewer: one pop-out window's stream (D14).
+pub(crate) struct ViewerPopout {
+    /// Which attachment this is (a slot can be reused by a later window).
+    pub gen: u64,
+    /// Its own present-loop state (cursor, repaint); shares the cursor images.
+    pub shared: Arc<Shared>,
+    /// Reassembled AUs for its decoder.
+    pub video_tx: Sender<(Vec<u8>, bool)>,
+    pub surface: Arc<dyn platform_api::VideoSurface>,
+    pub stop: Arc<AtomicBool>,
+    pub threads: Vec<JoinHandle<()>>,
+}
+
+/// What a viewer session keeps to open pop-out windows later.
+#[derive(Clone)]
+pub(crate) struct ViewerCtx {
+    platform: Arc<dyn platform_api::Platform>,
+    codec: platform_api::Codec,
+    keys: Arc<Mutex<KeyTranslator>>,
+}
+
 /// The live session, owned by [`Engine`].
 pub(crate) struct Session {
     peer: String,
@@ -111,6 +156,8 @@ pub(crate) struct Session {
     /// set the repaint flag when the surface is re-shown (task D12); on the host
     /// so [`request_display`] can hand a monitor switch to the media thread.
     shared: Arc<Shared>,
+    /// Viewer: what opening a pop-out window needs. `None` on a host.
+    viewer: Option<ViewerCtx>,
     threads: Vec<JoinHandle<()>>,
     /// Test hooks (`test-hooks` feature only): the host's rate state, so the
     /// loopback can observe the encoder target / raw link and inject estimates.
@@ -184,7 +231,9 @@ pub(crate) fn input_rect_for(d: &platform_api::DisplayInfo) -> Option<Rect> {
 
 /// Host: build the offer and data channels, start the transport, capture →
 /// encode and clipboard threads, then send the offer to `peer`.
-pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) {
+/// `popouts`: the viewer said it can show pop-out windows (D14), so spare
+/// video tracks are worth offering.
+pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission, popouts: bool) {
     teardown(engine);
     let platform = engine.platform();
     let cfg = engine.config();
@@ -193,7 +242,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
     let stop = Arc::new(AtomicBool::new(false));
     let (signal_tx, signal_rx) = std::sync::mpsc::channel::<SignalData>();
     let (ctl_tx, ctl_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let (frame_tx, frame_rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
+    let (frame_tx, frame_rx) = std::sync::mpsc::channel::<(u8, Vec<u8>, bool)>();
     let (cursor_tx, cursor_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
     // Offer exactly the negotiated codec, so the media track's payload type is
@@ -226,14 +275,29 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
         let bulk = dapi.create_data_channel(blk);
         transport::Channels { ctl, cursor, bulk }
     };
+    // One video track for the main window, plus a spare per possible pop-out
+    // window (D14): a monitor besides the shared one, up to MAX_POPOUTS. A
+    // spare carries nothing until a pop-out is opened, and having them in the
+    // offer means opening one needs no renegotiation. Their order is the slot
+    // number; the viewer reads it back from the m-line order.
+    let pop_slots = if popouts {
+        (platform.displays().len().saturating_sub(1)).min(MAX_POPOUTS as usize) as u8
+    } else {
+        0
+    };
     let mut api = rtc.sdp_api();
-    let video_mid = api.add_media(
-        str0m::media::MediaKind::Video,
-        str0m::media::Direction::SendOnly,
-        None,
-        None,
-        None,
-    );
+    let video_mids: Vec<str0m::media::Mid> = (0..=pop_slots)
+        .map(|_| {
+            api.add_media(
+                str0m::media::MediaKind::Video,
+                str0m::media::Direction::SendOnly,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    shared.host_streams.lock().pop_slots = pop_slots;
     // One SDP-negotiated channel forces the m=application section (the SCTP
     // association the direct channels ride on). Its label is never used.
     api.add_channel("init".to_string());
@@ -247,6 +311,17 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
     let bitrate = Arc::new(AtomicU32::new(TARGET_BITRATE));
     let link = Arc::new(AtomicU32::new(TARGET_BITRATE));
     let force_key = Arc::new(AtomicBool::new(false));
+    let host_ctx = HostCtx {
+        platform: platform.clone(),
+        codec,
+        shared: shared.clone(),
+        ctl_tx: ctl_tx.clone(),
+        ui: engine.ui_sender(),
+        frame_tx,
+        cursor_tx,
+        bitrate: bitrate.clone(),
+        stop: stop.clone(),
+    };
     // Clipboard sync is gated on the SAME live permission as input: a view-only
     // peer must not read this machine's clipboard (it can hold a password that
     // was never on screen) or write to it.
@@ -280,7 +355,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
         bulk_rx: None,
         clip_tx,
         channels: Some(channels),
-        video_mid: Some(video_mid),
+        video_mids,
         force_key: Some(force_key.clone()),
         bitrate: Some(bitrate.clone()),
         link: Some(link.clone()),
@@ -295,6 +370,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
         downloads_dir: platform.paths().downloads_dir,
         paste_dropped: cfg.paste_dropped_files,
         target_rect: target_rect_for(engine, cfg.share_display_id.as_deref()),
+        host: Some(host_ctx.clone()),
     };
     spawn_or_abort!(engine, stop, threads, "transport", move || {
         driver::transport_driver(driver)
@@ -307,19 +383,16 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
     let host_shared = shared.clone();
 
     {
-        let media = HostMedia {
-            platform,
+        let spec = StreamSpec {
+            slot: 0,
             display: cfg.share_display_id.clone(),
-            codec,
-            shared,
-            ctl_tx: ctl_tx.clone(),
-            ui: engine.ui_sender(),
+            force_key,
+            view_size: shared.view_size.clone(),
+            stream_stop: None,
         };
-        let stop_m = stop.clone();
         let ui = engine.ui_sender();
         spawn_or_abort!(engine, stop, threads, "host-media", move || {
-            if let Err(e) = host_media_loop(media, frame_tx, cursor_tx, bitrate, force_key, stop_m)
-            {
+            if let Err(e) = host_media_loop(host_ctx, spec) {
                 tracing::warn!("host media loop ended: {e}");
                 let _ = ui.send(crate::UiEvent::Toast(format!(
                     "Screen sharing stopped: {e}"
@@ -341,6 +414,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
         clip_on,
         clipboard_setting: cfg.clipboard_sync,
         shared: host_shared,
+        viewer: None,
         threads,
         #[cfg(feature = "test-hooks")]
         hooks: Some(TestHooks {
@@ -481,9 +555,13 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
     // its own permission (defence in depth).
     let (input_tx, input_rx) = std::sync::mpsc::channel::<VideoInput>();
     {
+        let target = InputTarget {
+            slot: 0,
+            current: shared.input_target.clone(),
+        };
         let (ctl, keys, stop_i) = (ctl_tx.clone(), keys.clone(), stop.clone());
         spawn_or_abort!(engine, stop, threads, "input", move || {
-            input_loop(input_rx, ctl, keys, stop_i)
+            input_loop(input_rx, ctl, keys, target, stop_i)
         });
     }
 
@@ -498,8 +576,10 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
         cursor_rx: None,
         bulk_rx: Some(bulk_rx),
         clip_tx,
-        channels: None,  // learned from ChannelOpen by label
-        video_mid: None, // learned from Event::MediaAdded
+        channels: None, // learned from ChannelOpen by label
+        // Stream slots in the offer's m-line order (D14); MediaAdded fills
+        // them in if the offer could not be read.
+        video_mids: transport::video_mids_in_sdp(&offer_sdp),
         force_key: None,
         bitrate: None,
         link: None,
@@ -514,6 +594,7 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
         downloads_dir: platform.paths().downloads_dir,
         paste_dropped: false,
         target_rect: None,
+        host: None,
     };
     spawn_or_abort!(engine, stop, threads, "transport", move || {
         driver::transport_driver(driver)
@@ -525,6 +606,7 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
             surface: surface.clone(),
             codec,
             shared: shared.clone(),
+            slot: 0,
         };
         let (ctl, stop_r, ui) = (ctl_tx.clone(), stop.clone(), engine.ui_sender());
         spawn_or_abort!(engine, stop, threads, "viewer-media", move || {
@@ -576,6 +658,11 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
         clip_on,
         clipboard_setting: cfg.clipboard_sync,
         shared,
+        viewer: Some(ViewerCtx {
+            platform: platform.clone(),
+            codec,
+            keys,
+        }),
         threads,
         #[cfg(feature = "test-hooks")]
         hooks: None,
@@ -639,6 +726,7 @@ fn input_loop(
     input_rx: std::sync::mpsc::Receiver<VideoInput>,
     ctl: Sender<Vec<u8>>,
     keys: Arc<Mutex<KeyTranslator>>,
+    target: InputTarget,
     stop: Arc<AtomicBool>,
 ) {
     const MOVE_INTERVAL: Duration = Duration::from_millis(10);
@@ -647,6 +735,14 @@ fn input_loop(
             keys.lock()
                 .key(code, down, &mut |msg| send_input(&ctl, &msg));
         } else if let Some(msg) = translate_input(ev) {
+            // Positional: make sure the host maps it onto THIS window's
+            // monitor. Held across the send so another window's switch cannot
+            // slip in between.
+            let mut current = target.current.lock();
+            if *current != target.slot {
+                *current = target.slot;
+                let _ = ctl.send(serialize(&ControlMsg::InputTarget { s: target.slot }));
+            }
             send_input(&ctl, &msg);
         }
     };
@@ -687,6 +783,13 @@ fn input_loop(
             send(ev);
         }
     }
+}
+
+/// Which video stream an input thread's window shows, and the session-wide
+/// record of which stream the host maps pointer input onto (D14).
+struct InputTarget {
+    slot: u8,
+    current: Arc<Mutex<u8>>,
 }
 
 /// Pointer and wheel input → wire message. Buttons outside 0..=2 are dropped.
@@ -755,6 +858,189 @@ pub(crate) fn request_display(engine: &Engine, id: String) {
     }
 }
 
+/// Viewer: no stream known — the next positional input from any window sends
+/// `InputTarget` again (after a pop-out opens or closes, a slot may be reused
+/// by another monitor; the host may also have mapped input elsewhere).
+const NO_INPUT_TARGET: u8 = u8::MAX;
+
+/// Viewer (D14): whether pop-out stream `slot` currently has a window
+/// attached.
+pub(crate) fn viewer_popout_attached(engine: &Engine, slot: u8) -> bool {
+    engine
+        .session
+        .lock()
+        .as_ref()
+        .is_some_and(|s| s.shared.popouts.lock().contains_key(&slot))
+}
+
+/// Viewer (D14): the app opened a window for pop-out stream `slot` and made
+/// `surface` in it. Start that stream's decode → present and input threads.
+/// Returns the attachment's generation (what [`close_viewer_popout`] takes),
+/// or `None` without a viewer session, for slot 0, or when the slot is already
+/// attached.
+pub(crate) fn open_viewer_popout(
+    engine: &Engine,
+    slot: u8,
+    surface: Arc<dyn platform_api::VideoSurface>,
+) -> Option<u64> {
+    let guard = engine.session.lock();
+    let session = guard.as_ref()?;
+    let ctx = session.viewer.clone()?;
+    if slot == 0 || session.shared.popouts.lock().contains_key(&slot) {
+        return None;
+    }
+    let main = session.shared.clone();
+    let ctl_tx = session.ctl_tx.clone();
+    let session_stop = session.stop.clone();
+    drop(guard);
+
+    let control = main.control.load(Ordering::SeqCst);
+    let shared = Arc::new(Shared {
+        cursor_images: main.cursor_images.clone(),
+        ..Shared::default()
+    });
+    shared.control.store(control, Ordering::SeqCst);
+    // The window's threads stop when it closes OR the session stops (the
+    // watcher carries the latter over, so a dead session never leaves a
+    // pop-out presenting).
+    let loop_stop = Arc::new(AtomicBool::new(false));
+    let (video_tx, video_rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
+    let (input_tx, input_rx) = std::sync::mpsc::channel::<VideoInput>();
+    let mut threads = Vec::new();
+    let watcher = {
+        let (loop_stop, session_stop) = (loop_stop.clone(), session_stop.clone());
+        spawn(&format!("popout-{slot}-stop"), move || {
+            while !loop_stop.load(Ordering::SeqCst) {
+                if session_stop.load(Ordering::SeqCst) {
+                    loop_stop.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+    {
+        let media = ViewerMedia {
+            platform: ctx.platform.clone(),
+            surface: surface.clone(),
+            codec: ctx.codec,
+            shared: shared.clone(),
+            slot,
+        };
+        let (ctl, stop_r, ui) = (ctl_tx.clone(), loop_stop.clone(), engine.ui_sender());
+        let media_thread = spawn(&format!("popout-{slot}-media"), move || {
+            if let Err(e) = viewer_media_loop(media, video_rx, ctl, stop_r) {
+                tracing::warn!("pop-out {slot} media loop ended: {e}");
+                let _ = ui.send(crate::UiEvent::Toast(format!(
+                    "Cannot display that monitor: {e}"
+                )));
+            }
+        });
+        let target = InputTarget {
+            slot,
+            current: main.input_target.clone(),
+        };
+        let (ctl, keys, stop_i) = (ctl_tx.clone(), ctx.keys.clone(), loop_stop.clone());
+        let input_thread = spawn(&format!("popout-{slot}-input"), move || {
+            input_loop(input_rx, ctl, keys, target, stop_i)
+        });
+        for t in [watcher, media_thread, input_thread] {
+            match t {
+                Ok(h) => threads.push(h),
+                Err(e) => {
+                    tracing::error!("could not start a pop-out thread: {e}");
+                    loop_stop.store(true, Ordering::SeqCst);
+                    for t in threads {
+                        let _ = t.join();
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+    surface.set_input_sink(Some(input_tx));
+    surface.set_cursor_control(control);
+    let popout = ViewerPopout {
+        gen: main.popout_gen.fetch_add(1, Ordering::SeqCst) + 1,
+        shared,
+        video_tx,
+        surface,
+        stop: loop_stop,
+        threads,
+    };
+    let gen = popout.gen;
+    // Register under the session lock, and only into the session we started
+    // from: teardown takes the session out under this lock and then stops
+    // every registered pop-out, so nothing registered here can be missed —
+    // and a session that ended meanwhile gets nothing registered at all.
+    {
+        let guard = engine.session.lock();
+        let live = guard
+            .as_ref()
+            .is_some_and(|s| Arc::ptr_eq(&s.shared, &main) && !s.stop.load(Ordering::SeqCst));
+        let mut popouts = main.popouts.lock();
+        if !live || popouts.contains_key(&slot) {
+            drop(popouts);
+            drop(guard);
+            stop_viewer_popout(popout);
+            return None;
+        }
+        popouts.insert(slot, popout);
+        *main.input_target.lock() = NO_INPUT_TARGET;
+    }
+    // The host forced an IDR when it started this stream, probably before
+    // this window existed to decode it.
+    let _ = ctl_tx.send(serialize(&ControlMsg::KeyframeRequest { s: slot }));
+    Some(gen)
+}
+
+/// Viewer (D14): close pop-out stream `slot`'s threads and take its surface
+/// down (blocking until its threads are gone, so the app may then destroy the
+/// window). With `tell_host`, also asks the host to stop streaming it (the
+/// user closed the window; when the host dropped it, it already knows).
+///
+/// `gen` names the attachment ([`open_viewer_popout`]'s result): only that one
+/// is taken down, so a late close of an old window can never take down a
+/// newer window that reuses the slot. `None` = the window never attached;
+/// nothing is taken down (the host is still told, with `tell_host`).
+pub(crate) fn close_viewer_popout(engine: &Engine, slot: u8, gen: Option<u64>, tell_host: bool) {
+    let (popout, ctl_tx) = {
+        let guard = engine.session.lock();
+        let Some(session) = guard.as_ref() else {
+            return;
+        };
+        let mut popouts = session.shared.popouts.lock();
+        let mine = gen.is_some() && popouts.get(&slot).map(|p| p.gen) == gen;
+        if gen.is_some() && !mine {
+            // Already gone (session teardown, or closed twice): the host was
+            // told then, if it needed telling.
+            return;
+        }
+        let popout = if mine { popouts.remove(&slot) } else { None };
+        drop(popouts);
+        *session.shared.input_target.lock() = NO_INPUT_TARGET;
+        (popout, session.ctl_tx.clone())
+    };
+    if let Some(p) = popout {
+        stop_viewer_popout(p);
+    }
+    // After the window's threads are gone, so none of its late messages for
+    // this slot (`vsize`, `kf`) can follow and reach a stream the host has
+    // meanwhile given the slot to.
+    if tell_host {
+        let _ = ctl_tx.send(serialize(&ControlMsg::PopoutClose { s: slot }));
+    }
+}
+
+fn stop_viewer_popout(p: ViewerPopout) {
+    p.surface.set_input_sink(None);
+    p.surface.set_cursor_control(false);
+    p.stop.store(true, Ordering::SeqCst);
+    for t in p.threads {
+        let _ = t.join();
+    }
+    p.surface.hide();
+}
+
 /// End the session: stop capturing input, stop and join every thread, hide the
 /// video. Idempotent.
 pub(crate) fn teardown(engine: &Engine) {
@@ -775,6 +1061,15 @@ pub(crate) fn teardown(engine: &Engine) {
         session.stop.store(true, Ordering::SeqCst);
         for t in session.threads {
             let _ = t.join();
+        }
+        // Host pop-out streams, and viewer pop-out windows (D14).
+        let extra: Vec<_> = session.shared.stream_threads.lock().drain(..).collect();
+        for t in extra {
+            let _ = t.join();
+        }
+        let popouts = std::mem::take(&mut *session.shared.popouts.lock());
+        for (_, p) in popouts {
+            stop_viewer_popout(p);
         }
     }
     if let Some(s) = &surface {
@@ -815,6 +1110,57 @@ impl Session {
 mod tests {
     use super::*;
 
+    fn main_target() -> InputTarget {
+        InputTarget {
+            slot: 0,
+            current: Arc::default(),
+        }
+    }
+
+    /// D14: a pop-out window's pointer input is preceded by ONE switch of the
+    /// host's input target to its stream; keys never are.
+    #[test]
+    fn popout_pointer_input_switches_the_target_once_and_keys_do_not() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ctl_tx, ctl_rx) = std::sync::mpsc::channel();
+        let current: Arc<Mutex<u8>> = Arc::default();
+        tx.send(VideoInput::Key {
+            code: "KeyA",
+            down: true,
+        })
+        .unwrap();
+        tx.send(VideoInput::Button {
+            button: 0,
+            down: true,
+            nx: 0.5,
+            ny: 0.5,
+        })
+        .unwrap();
+        tx.send(VideoInput::Wheel { dx: 0, dy: 120 }).unwrap();
+        drop(tx);
+        let target = InputTarget {
+            slot: 2,
+            current: current.clone(),
+        };
+        input_loop(
+            rx,
+            ctl_tx,
+            identity_keys(),
+            target,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let kinds: Vec<String> = ctl_rx
+            .try_iter()
+            .map(|b| {
+                let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+                v["t"].as_str().unwrap_or_default().to_string()
+                    + &v["s"].as_u64().map(|s| s.to_string()).unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(kinds, ["kd", "itgt2", "md", "wh"], "{kinds:?}");
+        assert_eq!(*current.lock(), 2);
+    }
+
     fn identity_keys() -> Arc<Mutex<KeyTranslator>> {
         Arc::new(Mutex::new(KeyTranslator::new(
             OsFamily::Windows,
@@ -843,7 +1189,13 @@ mod tests {
             OsFamily::Windows,
             Arc::new(AtomicBool::new(true)),
         )));
-        input_loop(rx, ctl_tx, keys, Arc::new(AtomicBool::new(false)));
+        input_loop(
+            rx,
+            ctl_tx,
+            keys,
+            main_target(),
+            Arc::new(AtomicBool::new(false)),
+        );
         let codes: Vec<(String, bool)> = sent(&ctl_rx)
             .into_iter()
             .map(|m| match m {
@@ -905,7 +1257,13 @@ mod tests {
         // Nothing reached the host yet: the hook did not jump the queue.
         assert!(key_codes(&ctl_rx).is_empty());
         drop((tx, forward));
-        input_loop(rx, ctl_tx, keys, Arc::new(AtomicBool::new(false)));
+        input_loop(
+            rx,
+            ctl_tx,
+            keys,
+            main_target(),
+            Arc::new(AtomicBool::new(false)),
+        );
         assert_eq!(
             key_codes(&ctl_rx),
             [
@@ -946,7 +1304,13 @@ mod tests {
         })
         .unwrap();
         // Already stopped: the loop body never runs, only the drain.
-        input_loop(rx, ctl_tx, identity_keys(), Arc::new(AtomicBool::new(true)));
+        input_loop(
+            rx,
+            ctl_tx,
+            identity_keys(),
+            main_target(),
+            Arc::new(AtomicBool::new(true)),
+        );
         assert_eq!(key_codes(&ctl_rx), [("KeyA".to_string(), false)]);
     }
 
@@ -1002,7 +1366,7 @@ mod tests {
         })
         .unwrap();
         drop(tx);
-        input_loop(rx, ctl_tx, identity_keys(), stop);
+        input_loop(rx, ctl_tx, identity_keys(), main_target(), stop);
         let msgs: Vec<InputMsg> = ctl_rx
             .try_iter()
             .map(|b| serde_json::from_slice(&b).unwrap())

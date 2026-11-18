@@ -125,6 +125,8 @@ struct Peer {
     link_trouble: Arc<std::sync::atomic::AtomicU32>,
     /// Every monitor announcement this side's UI received.
     displays: Arc<std::sync::Mutex<Vec<Announced>>>,
+    /// The pop-out streams `(slot, monitor id)` the latest announcement listed.
+    popouts: Arc<std::sync::Mutex<Vec<(u8, String)>>>,
 }
 
 /// One monitor announcement: `(ids, current, can_switch)`.
@@ -190,11 +192,13 @@ fn start_peer_with(name: &str, relay: &str, configure: impl FnOnce(&mut MockPlat
     let roles: Arc<std::sync::Mutex<Vec<Role>>> = Arc::default();
     let link_trouble: Arc<std::sync::atomic::AtomicU32> = Arc::default();
     let displays: Arc<std::sync::Mutex<Vec<Announced>>> = Arc::default();
-    let (t, r, lt, ds) = (
+    let popouts: Arc<std::sync::Mutex<Vec<(u8, String)>>> = Arc::default();
+    let (t, r, lt, ds, po) = (
         toasts.clone(),
         roles.clone(),
         link_trouble.clone(),
         displays.clone(),
+        popouts.clone(),
     );
     tokio::spawn(async move {
         while let Some(ev) = ui_rx.recv().await {
@@ -208,11 +212,15 @@ fn start_peer_with(name: &str, relay: &str, configure: impl FnOnce(&mut MockPlat
                     list,
                     current,
                     can_switch,
-                } => ds.lock().unwrap().push((
-                    list.into_iter().map(|d| d.id).collect(),
-                    current,
-                    can_switch,
-                )),
+                    popouts,
+                } => {
+                    *po.lock().unwrap() = popouts.into_iter().map(|p| (p.s, p.id)).collect();
+                    ds.lock().unwrap().push((
+                        list.into_iter().map(|d| d.id).collect(),
+                        current,
+                        can_switch,
+                    ))
+                }
                 _ => {}
             }
         }
@@ -225,6 +233,7 @@ fn start_peer_with(name: &str, relay: &str, configure: impl FnOnce(&mut MockPlat
         roles,
         link_trouble,
         displays,
+        popouts,
     }
 }
 
@@ -1240,6 +1249,166 @@ async fn monitor_switch_follows_picture_input_and_the_control_gate() {
         host.last_displays().map(|d| d.1),
         Some("mock-0".to_string())
     );
+
+    viewer.engine.end_session();
+    eventually("both idle", t, || {
+        host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
+    })
+    .await;
+}
+
+/// Pop-out windows (D14): a controlling viewer streams a second host monitor
+/// to its own surface on a spare video track, at that monitor's size, while
+/// the main window keeps its own; input from either window lands on the
+/// monitor that window shows; closing the window stops the stream; revoking
+/// control closes it from the host side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn popout_window_streams_a_second_monitor_with_its_own_input() {
+    let relay = start_relay().await;
+    let second = platform_api::DisplayInfo {
+        id: "mock-1".into(),
+        name: "Second".into(),
+        x: 640,
+        y: 0,
+        width: 800,
+        height: 600,
+        scale: 1.0,
+        primary: false,
+    };
+    let host = start_peer_with("popout-host", &relay, |p| {
+        p.extra_displays.push(second.clone())
+    });
+    let viewer = start_peer("popout-viewer", &relay);
+    let t = Duration::from_secs(15);
+    eventually("both registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    viewer.engine.connect_to(host.uuid.clone());
+    eventually("main window presenting", t, || {
+        viewer.last_displays().is_some_and(|d| d.2)
+            && !viewer.platform.surface.state().presented.is_empty()
+    })
+    .await;
+
+    // Ask for the second monitor in its own window; the host assigns stream 1.
+    viewer.engine.popout_display("mock-1".into());
+    eventually("pop-out announced", t, || {
+        *viewer.popouts.lock().unwrap() == vec![(1, "mock-1".to_string())]
+    })
+    .await;
+    assert_eq!(
+        *host.popouts.lock().unwrap(),
+        vec![(1, "mock-1".to_string())],
+        "the host's UI lists it too"
+    );
+    // The app opens the window and hands its surface over.
+    let pop = platform_api::mock::MockSurface::new((800, 600));
+    let gen1 = viewer.engine.attach_popout(1, pop.clone());
+    assert!(gen1.is_some());
+    assert!(
+        viewer.engine.attach_popout(1, pop.clone()).is_none(),
+        "one window per stream"
+    );
+    eventually("second monitor presented in the pop-out", t, || {
+        pop.state()
+            .presented
+            .iter()
+            .any(|p| (p.width, p.height) == (800, 600))
+    })
+    .await;
+    // The main window still shows the first monitor, still live.
+    let main_before = viewer.platform.surface.state().presented.len();
+    eventually("main window still presenting", t, || {
+        viewer.platform.surface.state().presented.len() > main_before + 3
+    })
+    .await;
+    assert!(viewer
+        .platform
+        .surface
+        .state()
+        .presented
+        .iter()
+        .all(|p| (p.width, p.height) == (640, 360)));
+
+    // Input from the pop-out maps onto the second monitor ...
+    assert!(pop.user_input(VideoInput::Button {
+        button: 0,
+        down: true,
+        nx: 0.25,
+        ny: 0.5,
+    }));
+    assert!(pop.user_input(VideoInput::Button {
+        button: 0,
+        down: false,
+        nx: 0.25,
+        ny: 0.5,
+    }));
+    let rect = platform_api::Rect {
+        x: 640,
+        y: 0,
+        w: 800,
+        h: 600,
+    };
+    eventually("pop-out click injected on the second monitor", t, || {
+        let log = host.platform.injector.lock().unwrap();
+        log.target == Some(rect)
+            && log
+                .events
+                .iter()
+                .any(|e| matches!(e, InputMsg::ButtonUp { x, .. } if (*x - 0.25).abs() < 1e-9))
+    })
+    .await;
+    // ... and from the main window back onto the first.
+    assert!(viewer
+        .platform
+        .surface
+        .user_input(VideoInput::Move { nx: 0.75, ny: 0.5 }));
+    eventually("main-window input back on the primary", t, || {
+        host.platform.injector.lock().unwrap().target.is_none()
+    })
+    .await;
+
+    // Closing the window stops the stream on the host.
+    viewer.engine.close_popout(1, gen1);
+    assert!(!viewer.engine.popout_attached(1));
+    eventually("host stopped the pop-out stream", t, || {
+        host.popouts.lock().unwrap().is_empty() && viewer.popouts.lock().unwrap().is_empty()
+    })
+    .await;
+    let frames = pop.state().presented.len();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        pop.state().presented.len(),
+        frames,
+        "closed window presents nothing"
+    );
+
+    // Pop it out again, then revoke control: the host closes it.
+    viewer.engine.popout_display("mock-1".into());
+    eventually("pop-out announced again", t, || {
+        !viewer.popouts.lock().unwrap().is_empty()
+    })
+    .await;
+    let pop2 = platform_api::mock::MockSurface::new((800, 600));
+    let slot = viewer.popouts.lock().unwrap()[0].0;
+    let gen2 = viewer.engine.attach_popout(slot, pop2.clone());
+    assert!(gen2.is_some() && gen2 != gen1);
+    // A late close of the OLD window (same slot) must not touch the new one.
+    viewer.engine.close_popout(slot, gen1);
+    assert!(viewer.engine.popout_attached(slot));
+    host.engine.set_permission(Permission::View);
+    eventually("revoking control closes pop-outs", t, || {
+        viewer.popouts.lock().unwrap().is_empty() && host.popouts.lock().unwrap().is_empty()
+    })
+    .await;
+    // A view-only viewer cannot open one.
+    viewer.engine.popout_display("mock-1".into());
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(host.popouts.lock().unwrap().is_empty());
+    // (The app closes the window when the list drops it.)
+    viewer.engine.detach_popout(slot, gen2);
+    assert!(!viewer.engine.popout_attached(slot));
 
     viewer.engine.end_session();
     eventually("both idle", t, || {

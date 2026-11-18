@@ -75,8 +75,8 @@ pub(super) struct Driver {
     pub(super) pending: Option<str0m::change::SdpPendingOffer>,
     pub(super) signal_rx: Receiver<SignalData>,
     pub(super) ctl_rx: Receiver<Vec<u8>>,
-    /// Host: encoded AUs to send on the video channel.
-    pub(super) frame_rx: Option<Receiver<(Vec<u8>, bool)>>,
+    /// Host: encoded AUs to send, tagged with their video stream slot.
+    pub(super) frame_rx: Option<Receiver<(u8, Vec<u8>, bool)>>,
     /// Viewer: reassembled AUs (+ keyframe flag) out to the decode/render thread.
     pub(super) video_tx: Option<Sender<(Vec<u8>, bool)>>,
     /// Host: injection gate (Some ⇒ this side injects remote input).
@@ -91,9 +91,10 @@ pub(super) struct Driver {
     pub(super) clip_tx: Sender<String>,
     /// Host: the §6 data-channel ids created on the Rtc in `begin_host`.
     pub(super) channels: Option<transport::Channels>,
-    /// Host: the video RTP media track's mid (from `add_media`). Viewer learns
-    /// its own from `Event::MediaAdded`, so this is `None` there.
-    pub(super) video_mid: Option<str0m::media::Mid>,
+    /// The video RTP media tracks' mids in stream-slot order (0 = main, then
+    /// the pop-out spares, D14). Host: from `add_media`. Viewer: read from the
+    /// offer (empty if it could not be: `Event::MediaAdded` fills it in).
+    pub(super) video_mids: Vec<str0m::media::Mid>,
     /// Host: set to make the encoder emit an IDR (on video-channel open, and on a
     /// viewer `KeyframeRequest`). Frames sent before the channel opened are lost
     /// on the wire, so the first *deliverable* frame must restart the decoder.
@@ -132,7 +133,33 @@ pub(super) struct Driver {
     pub(super) paste_dropped: bool,
     /// Host: the shared display's rectangle when it is not the primary one.
     pub(super) target_rect: Option<Rect>,
+    /// Host: what starting a pop-out stream needs (D14).
+    pub(super) host: Option<crate::media::host::HostCtx>,
 }
+
+/// Host: ask video stream `slot`'s encoder for an IDR (rate-limited there).
+fn host_force_key(slot: u8, main: &Option<Arc<AtomicBool>>, shared: &Shared) {
+    if slot == 0 {
+        if let Some(fk) = main {
+            fk.store(true, Ordering::SeqCst);
+        }
+    } else if let Some(p) = shared.host_streams.lock().popouts.get(&slot) {
+        p.force_key.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Viewer: every open pop-out window's surface (D14).
+fn popout_surfaces(shared: &Shared) -> Vec<Arc<dyn VideoSurface>> {
+    shared
+        .popouts
+        .lock()
+        .values()
+        .map(|p| p.surface.clone())
+        .collect()
+}
+
+/// Most video streams a session carries (main + pop-outs).
+const MAX_STREAMS: usize = 1 + crate::media::host::MAX_POPOUTS as usize;
 
 pub(super) fn transport_driver(d: Driver) {
     let Driver {
@@ -147,7 +174,7 @@ pub(super) fn transport_driver(d: Driver) {
         bulk_rx,
         clip_tx,
         channels,
-        video_mid,
+        video_mids,
         force_key,
         bitrate,
         link: link_bw,
@@ -162,6 +189,7 @@ pub(super) fn transport_driver(d: Driver) {
         downloads_dir,
         paste_dropped,
         target_rect,
+        host,
     } = d;
     use transport::{Inbound, Transport};
 
@@ -172,6 +200,7 @@ pub(super) fn transport_driver(d: Driver) {
         let ui = ui.clone();
         let role = role.clone();
         let surface = surface.clone();
+        let shared = shared.clone();
         move |reason: &str| {
             let was_active = !matches!(&*role.lock(), crate::Role::Idle);
             if was_active {
@@ -185,6 +214,10 @@ pub(super) fn transport_driver(d: Driver) {
                     s.hide();
                     s.set_input_sink(None);
                     s.set_drop_sink(None);
+                }
+                for s in popout_surfaces(&shared) {
+                    s.hide();
+                    s.set_input_sink(None);
                 }
                 let _ = ui.send(crate::UiEvent::Toast(format!("Disconnected: {reason}")));
                 let _ = ui.send(crate::UiEvent::RoleChanged(crate::Role::Idle));
@@ -223,8 +256,8 @@ pub(super) fn transport_driver(d: Driver) {
     if let Some(ch) = channels {
         tp.set_channels(ch);
     }
-    if let Some(mid) = video_mid {
-        tp.set_video_mid(mid);
+    if !video_mids.is_empty() {
+        tp.set_video_mids(video_mids);
     }
     let host_side = frame_rx.is_some();
     if host_side {
@@ -245,7 +278,16 @@ pub(super) fn transport_driver(d: Driver) {
     let mut incoming_drop_at: Option<(f64, f64)> = None;
     // Viewer: the host's last monitor announcement, re-sent to the UI when our
     // control permission changes (switching needs control).
-    let mut remote_displays: Option<(Vec<protocol::RemoteDisplay>, String)> = None;
+    let mut remote_displays: Option<(
+        Vec<protocol::RemoteDisplay>,
+        String,
+        Vec<protocol::PopoutStream>,
+    )> = None;
+    // Host: where pointer input maps (D14). The main stream's monitor rect (it
+    // changes on a switch) and the stream the viewer last said its input is
+    // over (`InputTarget`).
+    let mut main_rect = target_rect;
+    let mut input_slot: u8 = 0;
 
     // Liveness watchdog: if NOTHING arrives from the peer for this long, the
     // connection is dead even if ICE hasn't declared it yet. str0m's ICE consent
@@ -281,8 +323,9 @@ pub(super) fn transport_driver(d: Driver) {
     // delivers the next frame with `contiguous=false`. From that instant every
     // delta is undecodable garbage (the "random black/smeared pixels") — drop
     // them all and request a keyframe (rate-limited) until an IDR arrives.
-    let mut drop_till_key = false;
-    let mut last_pli = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    // Per video stream (D14: pop-out windows have their own).
+    let mut drop_till_key = [false; MAX_STREAMS];
+    let mut last_pli = [std::time::Instant::now() - std::time::Duration::from_secs(5); MAX_STREAMS];
 
     // Periodic pipeline stats (both sides, every 5s) so field tests yield DATA:
     // host logs frames/IDRs sent + applied bitrate + last BWE estimate; viewer
@@ -342,6 +385,9 @@ pub(super) fn transport_driver(d: Driver) {
                     if let Some(s) = &surface {
                         s.hide();
                     }
+                    for s in popout_surfaces(&shared) {
+                        s.hide();
+                    }
                 }
                 // Re-emit ~1/s so the UI can count down.
                 if last_trouble_tick.elapsed() >= std::time::Duration::from_millis(900) {
@@ -356,9 +402,23 @@ pub(super) fn transport_driver(d: Driver) {
                 if let Some(s) = &surface {
                     s.show();
                     // The stream may have advanced without us; get a clean start.
-                    ctl.send(serialize(&protocol::ControlMsg::KeyframeRequest), |b| {
-                        tp.send_ctl(b)
-                    });
+                    ctl.send(
+                        serialize(&protocol::ControlMsg::KeyframeRequest { s: 0 }),
+                        |b| tp.send_ctl(b),
+                    );
+                }
+                let open: Vec<(u8, Arc<dyn VideoSurface>)> = shared
+                    .popouts
+                    .lock()
+                    .iter()
+                    .map(|(slot, p)| (*slot, p.surface.clone()))
+                    .collect();
+                for (slot, s) in open {
+                    s.show();
+                    ctl.send(
+                        serialize(&protocol::ControlMsg::KeyframeRequest { s: slot }),
+                        |b| tp.send_ctl(b),
+                    );
                 }
                 let _ = ui.send(crate::UiEvent::LinkRestored);
             }
@@ -402,11 +462,36 @@ pub(super) fn transport_driver(d: Driver) {
             }
             was_control = now;
         }
+        // Host (D14): pop-out windows are a control privilege; revoking control
+        // closes them (the viewer keeps the main window's monitor only).
+        if let (Some(ctx), Some(gate)) = (host.as_ref(), inject.as_ref()) {
+            if !gate.load(Ordering::SeqCst) && shared.host_streams.lock().close_all() {
+                tracing::info!("control revoked — closing pop-out streams");
+                crate::media::host::announce(ctx);
+            }
+        }
+        // Host: the pop-out input was mapped onto is gone (closed by any
+        // path) — fall back to the main monitor until the viewer says
+        // otherwise, never leave input aimed at a monitor nobody sees.
+        if host.is_some()
+            && input_slot != 0
+            && !shared.host_streams.lock().popouts.contains_key(&input_slot)
+        {
+            input_slot = 0;
+            if let Some(inj) = injector.as_mut() {
+                inj.set_target_rect(main_rect);
+            }
+        }
         // Host: a monitor switch took effect on the media thread — map input
         // onto the newly shared monitor from here on.
         let new_rect = shared.input_rect.lock().take();
-        if let (Some(rect), Some(inj)) = (new_rect, injector.as_mut()) {
-            inj.set_target_rect(rect);
+        if let Some(rect) = new_rect {
+            main_rect = rect;
+            if input_slot == 0 {
+                if let Some(inj) = injector.as_mut() {
+                    inj.set_target_rect(rect);
+                }
+            }
         }
 
         // 1) Accept inbound answer/ICE relayed from signaling.
@@ -437,7 +522,7 @@ pub(super) fn transport_driver(d: Driver) {
             ctl.send(bytes, |b| tp.send_ctl(b));
         }
         if let Some(frame_rx) = &frame_rx {
-            while let Ok((au, keyframe)) = frame_rx.try_recv() {
+            while let Ok((slot, au, keyframe)) = frame_rx.try_recv() {
                 // Write onto the RTP media track. str0m packetizes, paces, and
                 // NACK-repairs; it no-ops until the track is connected. The encoder
                 // bitrate is steered by the BWE back-off (Inbound::BweEstimate
@@ -446,7 +531,7 @@ pub(super) fn transport_driver(d: Driver) {
                 if keyframe {
                     stat_idr += 1;
                 }
-                let _ = tp.send_video(&au);
+                let _ = tp.send_video(slot, &au);
             }
         }
         // Host: cursor position updates on the cursor channel (§5a/§7). Stale
@@ -599,10 +684,15 @@ pub(super) fn transport_driver(d: Driver) {
                             }
                         }
                         Inbound::Video {
+                            slot,
                             data,
                             keyframe,
                             contiguous,
                         } => {
+                            let i = usize::from(slot);
+                            if i >= MAX_STREAMS {
+                                continue;
+                            }
                             video_count += 1;
                             stat_sent += 1;
                             if video_count <= 5 {
@@ -617,31 +707,45 @@ pub(super) fn transport_driver(d: Driver) {
                             // blocks). Drop them ALL until an IDR arrives; keep
                             // asking for one (rate-limited) on both paths — native
                             // RTCP PLI and the reliable ctl channel.
-                            if !contiguous && !keyframe && !drop_till_key {
+                            if !contiguous && !keyframe && !drop_till_key[i] {
                                 stat_gaps += 1;
-                                drop_till_key = true;
+                                drop_till_key[i] = true;
                             }
-                            if drop_till_key {
+                            if drop_till_key[i] {
                                 if keyframe {
-                                    drop_till_key = false; // clean restart point
+                                    drop_till_key[i] = false; // clean restart point
                                 } else {
                                     stat_dropped += 1;
-                                    if last_pli.elapsed() >= std::time::Duration::from_millis(500) {
-                                        tp.request_keyframe();
+                                    if last_pli[i].elapsed()
+                                        >= std::time::Duration::from_millis(500)
+                                    {
+                                        tp.request_keyframe(slot);
                                         ctl.send(
-                                            serialize(&protocol::ControlMsg::KeyframeRequest),
+                                            serialize(&protocol::ControlMsg::KeyframeRequest {
+                                                s: slot,
+                                            }),
                                             |b| tp.send_ctl(b),
                                         );
-                                        last_pli = std::time::Instant::now();
+                                        last_pli[i] = std::time::Instant::now();
                                     }
                                     continue; // NEVER feed a broken delta
                                 }
                             }
-                            if let Some(tx) = &video_tx {
-                                let _ = tx.send((data, keyframe));
+                            if slot == 0 {
+                                if let Some(tx) = &video_tx {
+                                    let _ = tx.send((data, keyframe));
+                                }
+                            } else {
+                                // A pop-out stream: to its window, if open yet
+                                // (it asks for an IDR when it opens).
+                                let tx =
+                                    shared.popouts.lock().get(&slot).map(|p| p.video_tx.clone());
+                                if let Some(tx) = tx {
+                                    let _ = tx.send((data, keyframe));
+                                }
                             }
                         }
-                        Inbound::KeyframeRequest => {
+                        Inbound::KeyframeRequest(slot) => {
                             // Host: the peer (or str0m on its behalf) asked for a
                             // keyframe over RTCP. Counted, because this path was
                             // invisible in the field logs while the ctl-channel
@@ -649,9 +753,7 @@ pub(super) fn transport_driver(d: Driver) {
                             // unattributed. The host rate-limits what it actually
                             // emits (see `host_media_loop`).
                             stat_pli += 1;
-                            if let Some(fk) = &force_key {
-                                fk.store(true, Ordering::SeqCst);
-                            }
+                            host_force_key(slot, &force_key, &shared);
                         }
                         Inbound::BweEstimate(bps) => {
                             last_est = bps;
@@ -690,23 +792,25 @@ pub(super) fn transport_driver(d: Driver) {
                                 // A viewer keyframe request restarts the stream
                                 // (decoder never started / lost the keyframe). NOT
                                 // gated on control — view-only viewers need it too.
-                                Ok(protocol::ControlMsg::KeyframeRequest) if host_side => {
-                                    tracing::info!("viewer requested keyframe");
-                                    if let Some(fk) = &force_key {
-                                        fk.store(true, Ordering::SeqCst);
-                                    }
+                                Ok(protocol::ControlMsg::KeyframeRequest { s }) if host_side => {
+                                    tracing::info!("viewer requested keyframe (stream {s})");
+                                    host_force_key(s, &force_key, &shared);
                                     continue;
                                 }
                                 // The viewer told us its display size — encode to
                                 // exactly that so it presents 1:1 (no resampling
                                 // blur) and we don't spend bits on unseen pixels.
-                                Ok(protocol::ControlMsg::ViewSize { width, height })
+                                Ok(protocol::ControlMsg::ViewSize { width, height, s })
                                     if host_side =>
                                 {
-                                    shared.view_size.store(
-                                        ((width as u64) << 32) | height as u64,
-                                        Ordering::SeqCst,
-                                    );
+                                    let v = ((width as u64) << 32) | height as u64;
+                                    if s == 0 {
+                                        shared.view_size.store(v, Ordering::SeqCst);
+                                    } else if let Some(p) =
+                                        shared.host_streams.lock().popouts.get(&s)
+                                    {
+                                        p.view_size.store(v, Ordering::SeqCst);
+                                    }
                                     continue;
                                 }
                                 // Clipboard text from the peer. On the host this
@@ -733,25 +837,103 @@ pub(super) fn transport_driver(d: Driver) {
                                     if let Some(s) = &surface {
                                         s.set_cursor_control(control);
                                     }
+                                    for p in shared.popouts.lock().values() {
+                                        p.shared.control.store(control, Ordering::SeqCst);
+                                        p.surface.set_cursor_control(control);
+                                    }
                                     // The monitor picker follows control.
-                                    if let Some((list, current)) = &remote_displays {
+                                    if let Some((list, current, popouts)) = &remote_displays {
                                         let _ = ui.send(crate::UiEvent::Displays {
                                             list: list.clone(),
                                             current: current.clone(),
                                             can_switch: control,
+                                            popouts: popouts.clone(),
                                         });
                                     }
                                     continue;
                                 }
-                                // Viewer: the host's monitors / the one shown now.
-                                Ok(protocol::ControlMsg::Displays { list, current }) => {
+                                // Viewer: the host's monitors / the one shown now,
+                                // and the pop-out streams (the app opens and
+                                // closes windows to match).
+                                Ok(protocol::ControlMsg::Displays {
+                                    list,
+                                    current,
+                                    popouts,
+                                }) => {
                                     if !host_side {
                                         let _ = ui.send(crate::UiEvent::Displays {
                                             list: list.clone(),
                                             current: current.clone(),
                                             can_switch: shared.control.load(Ordering::SeqCst),
+                                            popouts: popouts.clone(),
                                         });
-                                        remote_displays = Some((list, current));
+                                        remote_displays = Some((list, current, popouts));
+                                    }
+                                    continue;
+                                }
+                                // Host (D14): the viewer wants a monitor in a
+                                // separate window too. Control only, as for a
+                                // switch. Always answered with `displays`.
+                                Ok(protocol::ControlMsg::Popout { id }) => {
+                                    if let Some(ctx) = &host {
+                                        let allowed = inject
+                                            .as_ref()
+                                            .is_some_and(|gate| gate.load(Ordering::SeqCst));
+                                        if allowed {
+                                            crate::media::host::start_popout(ctx, &id);
+                                        } else {
+                                            tracing::warn!(
+                                                "ignored a pop-out request from a view-only viewer"
+                                            );
+                                        }
+                                        crate::media::host::announce(ctx);
+                                    }
+                                    continue;
+                                }
+                                // Host: the viewer closed that pop-out window.
+                                Ok(protocol::ControlMsg::PopoutClose { s }) => {
+                                    if let Some(ctx) = &host {
+                                        let removed = shared.host_streams.lock().popouts.remove(&s);
+                                        if let Some(p) = removed {
+                                            tracing::info!("host: pop-out window {s} closed");
+                                            p.stop.store(true, Ordering::SeqCst);
+                                            crate::media::host::announce(ctx);
+                                        }
+                                        if input_slot == s {
+                                            input_slot = 0;
+                                            if let Some(inj) = injector.as_mut() {
+                                                inj.set_target_rect(main_rect);
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                                // Host: the pointer input that follows is over
+                                // stream `s`'s window — map it onto that monitor.
+                                Ok(protocol::ControlMsg::InputTarget { s }) => {
+                                    if host_side {
+                                        let rect = if s == 0 {
+                                            Some(main_rect)
+                                        } else {
+                                            let id = shared
+                                                .host_streams
+                                                .lock()
+                                                .popouts
+                                                .get(&s)
+                                                .map(|p| p.id.clone());
+                                            id.and_then(|id| {
+                                                platform.displays().into_iter().find(|d| d.id == id)
+                                            })
+                                            .map(|d| super::input_rect_for(&d))
+                                        };
+                                        // An unknown stream (closed meanwhile)
+                                        // leaves the mapping alone.
+                                        if let Some(rect) = rect {
+                                            input_slot = s;
+                                            if let Some(inj) = injector.as_mut() {
+                                                inj.set_target_rect(rect);
+                                            }
+                                        }
                                     }
                                     continue;
                                 }
@@ -926,14 +1108,20 @@ pub(super) fn transport_driver(d: Driver) {
                                 y,
                                 visible,
                                 shape,
+                                s,
                             }) = serde_json::from_slice::<protocol::ControlMsg>(&bytes)
                             {
-                                *shared.cursor.lock() = Some(super::ViewerPointer {
+                                let pointer = Some(super::ViewerPointer {
                                     x,
                                     y,
                                     visible,
                                     shape,
                                 });
+                                if s == 0 {
+                                    *shared.cursor.lock() = pointer;
+                                } else if let Some(p) = shared.popouts.lock().get(&s) {
+                                    *p.shared.cursor.lock() = pointer;
+                                }
                             }
                         }
                         Inbound::Disconnected => {
