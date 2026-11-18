@@ -1192,6 +1192,9 @@ async fn monitor_switch_follows_picture_input_and_the_control_gate() {
             .any(|p| (p.width, p.height) == (800, 600))
     })
     .await;
+    // The encode size the host chose, re-fit to the viewer's window
+    // (observable only through the `test-hooks` feature).
+    #[cfg(feature = "test-hooks")]
     assert_eq!(host.engine.test_encode_dims(), Some((532, 400)));
     eventually("input mapped onto the second monitor", t, || {
         host.platform.injector.lock().unwrap().target
