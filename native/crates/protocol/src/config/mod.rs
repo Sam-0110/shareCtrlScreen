@@ -90,6 +90,9 @@ pub struct AccountRef {
     pub token_ref: Option<String>,
     /// Last successful sync (ms since the epoch); 0 = never.
     pub last_sync: u64,
+    /// Fields a newer version added, kept so this build does not drop them.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl AccountRef {
@@ -194,6 +197,10 @@ pub struct Loaded {
     /// Sealed secrets the migration did not carry over, for the caller to
     /// delete from the secret store.
     pub forget_sealed: Vec<String>,
+    /// Whether this load wrote the file (a migration or a fresh one). The
+    /// secrets in `forget_sealed` may be deleted only then: until the new file
+    /// is on disk, the old one still refers to them.
+    pub persisted: bool,
     /// What happened, for the log (no secrets).
     pub notes: Vec<String>,
 }
@@ -324,12 +331,13 @@ impl Config {
             legacy_token: None,
             forget_sealed: Vec::new(),
             notes: Vec::new(),
+            persisted: false,
         };
         let raw = match std::fs::read_to_string(path) {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 out.config.normalize(now);
-                out.persist_or_note(path);
+                out.persisted = out.persist_or_note(path);
                 return out;
             }
             Err(e) => {
@@ -374,8 +382,29 @@ impl Config {
             out.forget_sealed = migrated.forget;
             out.notes
                 .push("config: migrated from the 2.1.x layout".to_string());
+            // A 2.1.x file next to a copy of this build's layout means the app
+            // was downgraded and upgraded again: the older version dropped the
+            // accounts and workspaces it did not know. Bring them back, with
+            // what the older version recorded meanwhile merged in.
+            if let Some(kept) = read_v2_copy(path, &out.config.uuid, now) {
+                out.config = restore_after_downgrade(kept, out.config, now);
+                out.notes.push(
+                    "config: restored the accounts and workspaces kept from before a downgrade"
+                        .to_string(),
+                );
+            }
             match write_backup(path, "v1", &without_token(value)) {
-                Ok(()) => out.persist_or_note(path),
+                Ok(()) => {
+                    out.persisted = out.persist_or_note(path);
+                    if out.persisted {
+                        if let Ok(v) = serde_json::to_value(&out.config) {
+                            if let Err(e) = write_copy(path, V2_COPY, &v) {
+                                out.notes
+                                    .push(format!("config: could not write {V2_COPY} ({e})"));
+                            }
+                        }
+                    }
+                }
                 Err(e) => {
                     out.writable = false;
                     out.notes.push(format!(
@@ -403,6 +432,12 @@ impl Config {
             Ok(mut cfg) => {
                 cfg.config_version = CONFIG_VERSION;
                 cfg.normalize(now);
+                // Kept for a re-upgrade after a downgrade (see above): a 2.1.x
+                // build rewrites this file without the fields it does not know.
+                if let Err(e) = write_copy(path, V2_COPY, &value) {
+                    out.notes
+                        .push(format!("config: could not refresh {V2_COPY} ({e})"));
+                }
                 out.config = cfg;
                 out
             }
@@ -431,7 +466,7 @@ impl Config {
         }
         out.config.normalize(now);
         if out.writable {
-            out.persist_or_note(path);
+            out.persisted = out.persist_or_note(path);
         }
         out
     }
@@ -448,12 +483,72 @@ impl Config {
 }
 
 impl Loaded {
-    fn persist_or_note(&mut self, path: &Path) {
-        if let Err(e) = self.config.persist(path) {
-            self.notes
-                .push(format!("config: could not save {} ({e})", path.display()));
+    /// Save, noting a failure. Returns whether the file was written.
+    fn persist_or_note(&mut self, path: &Path) -> bool {
+        match self.config.persist(path) {
+            Ok(()) => true,
+            Err(e) => {
+                self.notes
+                    .push(format!("config: could not save {} ({e})", path.display()));
+                false
+            }
         }
     }
+}
+
+/// A copy of this build's layout, refreshed at every launch, for a re-upgrade
+/// after a downgrade: 2.1.x reads the file (its UUID survives) but rewrites it
+/// without `accounts` and `workspaces`, which it does not know.
+const V2_COPY: &str = "config.v2.json";
+
+/// Write `value` next to `path` as `name`, replacing any older copy
+/// (tmp file then rename, so a crash never leaves half a copy).
+fn write_copy(path: &Path, name: &str, value: &serde_json::Value) -> std::io::Result<()> {
+    let copy = path.with_file_name(name);
+    let tmp = copy.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
+    std::fs::rename(&tmp, &copy)
+}
+
+/// The kept copy of this build's layout, if there is a readable one for this
+/// machine (same UUID).
+fn read_v2_copy(path: &Path, uuid: &str, now: u64) -> Option<Config> {
+    let raw = std::fs::read_to_string(path.with_file_name(V2_COPY)).ok()?;
+    let mut kept: Config = serde_json::from_str(&raw).ok()?;
+    kept.normalize(now);
+    (kept.uuid == uuid).then_some(kept)
+}
+
+/// Rebuild after a downgrade and re-upgrade: the kept accounts and
+/// workspaces, the device settings as the older version last saved them, and
+/// what it recorded meanwhile (recents, names, saved passwords) merged into
+/// the workspace it belongs to by the sync rules — nothing is dropped.
+fn restore_after_downgrade(mut kept: Config, migrated: Config, now: u64) -> Config {
+    kept.server_url = migrated.server_url;
+    kept.mode = migrated.mode;
+    kept.password_hash = migrated.password_hash;
+    kept.password_permission = migrated.password_permission;
+    kept.ice_servers = migrated.ice_servers;
+    kept.share_audio = migrated.share_audio;
+    kept.share_display_id = migrated.share_display_id;
+    kept.start_with_windows = migrated.start_with_windows;
+    kept.use_openh264 = migrated.use_openh264;
+    for account in migrated.accounts {
+        if kept.account(&account.key()).is_none() {
+            kept.accounts.push(account);
+        }
+    }
+    for (key, meanwhile) in migrated.workspaces {
+        // A password the older version saved for a host this workspace already
+        // has one for is left alone: its secret may be the very same item.
+        let _ = kept.workspace_mut(&key).absorb_local(meanwhile, now);
+    }
+    if migrated.active_account.is_some() {
+        kept.active_account = migrated.active_account;
+    }
+    kept.config_version = CONFIG_VERSION;
+    kept.normalize(now);
+    kept
 }
 
 /// Write `value` next to `path` as `config.<tag>.json`, once: an existing copy
@@ -510,7 +605,9 @@ pub(crate) fn remote_name_key(id: &str) -> Option<String> {
 /// one space, trimmed, capped at `MAX_REMOTE_NAME_CHARS`. `None` if empty.
 pub(crate) fn clean_remote_name(name: &str) -> Option<String> {
     let folded = name
-        .split(|c: char| c.is_whitespace() || c.is_control())
+        // U+FEFF too: JavaScript's `\s` folds it (server/src/sync.js), Rust's
+        // whitespace does not, and the two sides must clean names alike.
+        .split(|c: char| c.is_whitespace() || c.is_control() || c == '\u{feff}')
         .filter(|w| !w.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
@@ -763,5 +860,50 @@ mod tests {
             l.config.workspaces[LOCAL_WORKSPACE].id_stamps[X].used_at,
             NOW + FUTURE_SLACK_MS
         );
+    }
+
+    /// A downgrade to 2.1.x rewrites the file without the accounts and
+    /// workspaces; upgrading again brings them back from the kept copy, with
+    /// what the older version recorded meanwhile merged in (P1 review M4).
+    #[test]
+    fn accounts_and_workspaces_survive_a_downgrade_and_re_upgrade() {
+        const Y: &str = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+        let d = dir("downgrade");
+        let path = d.join("config.json");
+        std::fs::write(&path, include_str!("../../testdata/config/v1-2.1.10.json")).unwrap();
+        let first = Config::load_at(&path, NOW);
+        let key = first.config.active_account.clone().unwrap();
+        // This build runs, and later launches keep the copy fresh.
+        let mut cfg = first.config;
+        cfg.workspace_mut(&key)
+            .set_remote_name(Y, "Added in 2.2", NOW);
+        cfg.persist(&path).unwrap();
+        let _ = Config::load_at(&path, NOW);
+        assert!(d.join(V2_COPY).exists());
+
+        // 2.1.x rewrites the file in its own layout: same UUID, one new recent,
+        // no accounts or workspaces.
+        let x = "886313e1-3b8a-4372-9b90-0c9aee199e5d";
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"uuid":"{}","recentIds":["{x}"],"idStamps":{{"{x}":{{"usedAt":{}}}}}}}"#,
+                cfg.uuid,
+                NOW + 1
+            ),
+        )
+        .unwrap();
+
+        let back = Config::load_at(&path, NOW + 10);
+        let c = &back.config;
+        assert_eq!(c.uuid, cfg.uuid);
+        assert!(c.account(&key).is_some(), "the account is back");
+        let ws = &c.workspaces[&key];
+        assert_eq!(ws.remote_name(Y), Some("Added in 2.2"));
+        assert_eq!(ws.remote_name(X), Some("Office PC"));
+        assert_eq!(ws.saved_logins.len(), 2);
+        // What 2.1.x recorded meanwhile is there too (it had no account, so
+        // it went to the local workspace).
+        assert_eq!(c.workspaces[LOCAL_WORKSPACE].recent_ids, vec![x]);
     }
 }

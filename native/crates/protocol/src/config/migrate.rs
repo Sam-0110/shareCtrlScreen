@@ -171,6 +171,7 @@ pub(crate) fn v1_to_v2(v1: ConfigV1, now: u64) -> Migrated {
                 keep_signed_in: true,
                 token_ref: None,
                 last_sync: a.last_sync,
+                extra: serde_json::Map::new(),
             });
             config.active_account = Some(key.clone());
             config.workspaces.insert(key.clone(), workspace);

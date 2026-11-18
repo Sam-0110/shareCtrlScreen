@@ -504,6 +504,61 @@
           }
         }
       }
+    },
+    {
+      "name": "entries that are not UUIDs are dropped",
+      "a": {
+        "entries": {
+          "office-pc": {
+            "name": "Kept nowhere",
+            "nameAt": 5,
+            "usedAt": 5
+          },
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Office",
+            "nameAt": 6
+          }
+        }
+      },
+      "b": {},
+      "merged": {
+        "v": 2,
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Office",
+            "nameAt": 6,
+            "usedAt": 0
+          }
+        },
+        "recentsClearedAt": 0,
+        "tabs": {},
+        "prefs": {}
+      }
+    },
+    {
+      "name": "a byte order mark in a name is folded like whitespace",
+      "a": {
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "﻿Office﻿PC﻿",
+            "nameAt": 5
+          }
+        }
+      },
+      "b": {},
+      "merged": {
+        "v": 2,
+        "entries": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "name": "Office PC",
+            "nameAt": 5,
+            "usedAt": 0
+          }
+        },
+        "recentsClearedAt": 0,
+        "tabs": {},
+        "prefs": {}
+      }
     }
   ]
 }

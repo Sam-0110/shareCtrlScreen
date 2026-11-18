@@ -124,6 +124,9 @@ pub struct Workspace {
     /// opaque handle; the engine owns the crypto). Only written after the
     /// password was accepted. Never synced.
     pub saved_logins: BTreeMap<String, String>,
+    /// Fields a newer version added, kept so this build does not drop them.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Workspace {
@@ -339,6 +342,7 @@ impl Workspace {
                 }
             }
         }
+        self.forget_closed_tabs(now);
 
         for (key, theirs) in &merged.prefs {
             let mine = SyncPref {
@@ -361,8 +365,25 @@ impl Workspace {
     /// host's saved password here wins over the local one, which is adopted
     /// only where there is none. Returns the sealed passwords that were not
     /// adopted, so their secret-store items can be forgotten.
+    ///
+    /// Only what the local workspace *has* joins: its names, its visible
+    /// recents and its tabs. Its history does not — not when its recents were
+    /// cleared (that would hide the account's own older recents on every
+    /// computer) and not the names it removed (a local removal must not delete
+    /// the account's name for that computer). P1 review M2.
     pub fn absorb_local(&mut self, local: Workspace, now: u64) -> Vec<String> {
-        let doc = local.sync_doc(true, false);
+        let mut doc = local.sync_doc(true, false);
+        let cleared = doc.recents_cleared_at;
+        doc.recents_cleared_at = 0;
+        doc.entries.retain(|_, e| {
+            if e.used_at <= cleared {
+                e.used_at = 0; // not a local recent any more
+            }
+            if e.name.is_empty() {
+                e.name_at = 0; // a removal, not a name
+            }
+            e.used_at > 0 || e.name_at > 0
+        });
         let mut rest = Vec::new();
         self.apply_sync_doc(&doc, now, true, false);
         for (host, sealed) in local.saved_logins {
@@ -413,6 +434,8 @@ impl Workspace {
             tab.closed_at = tab.closed_at.min(max_stamp);
             self.tabs.insert(id, tab);
         }
+        // `max_stamp` is now plus the slack: the same 90-day rule as the sync.
+        self.forget_closed_tabs(max_stamp.saturating_sub(crate::sync::FUTURE_SLACK_MS));
         if self
             .active_tab
             .as_ref()
@@ -426,6 +449,17 @@ impl Workspace {
         for at in self.pref_stamps.values_mut() {
             *at = (*at).min(max_stamp);
         }
+    }
+
+    /// Forget tabs closed more than [`CLOSED_TAB_TTL_MS`] before `now`, as
+    /// the sync does on both sides (08a §7.15), so closed tabs cannot pile up
+    /// locally and be sent forever.
+    ///
+    /// [`CLOSED_TAB_TTL_MS`]: crate::sync::CLOSED_TAB_TTL_MS
+    pub fn forget_closed_tabs(&mut self, now: u64) {
+        let before = now.saturating_sub(crate::sync::CLOSED_TAB_TTL_MS);
+        self.tabs
+            .retain(|_, t| t.is_open() || t.closed_at >= before);
     }
 
     /// Keep stamps only for IDs still listed (recent or named) and for the
@@ -718,5 +752,45 @@ mod tests {
         assert_eq!(account.saved_logins[X], "sealed-account");
         assert_eq!(account.saved_logins[Y], "sealed-local-y");
         assert_eq!(rest, vec!["sealed-local-x".to_string()]);
+    }
+
+    /// "Add" brings what the local workspace has, not its history: a local
+    /// clear of the recents or a locally removed name must not hide or delete
+    /// the account's own (P1 review M2).
+    #[test]
+    fn absorbing_does_not_carry_local_clears_or_removals() {
+        let mut account = Workspace::default();
+        account.add_recent(Y, 100);
+        account.set_remote_name(Y, "Account name", 110);
+
+        let mut local = Workspace::default();
+        local.add_recent(Y, 120);
+        local.clear_recents(200); // hides Y locally, at 200
+        local.add_recent(X, 300); // a recent after the clear
+        local.set_remote_name(Y, "Old local name", 50);
+        local.set_remote_name(Y, "", 250); // removed locally, later than the account's
+
+        account.absorb_local(local, now_ms());
+        assert_eq!(account.recents_cleared_at, 0);
+        assert_eq!(account.recent_ids, vec![X, Y]);
+        assert_eq!(account.remote_name(Y), Some("Account name"));
+    }
+
+    #[test]
+    fn closed_tabs_are_forgotten_after_ninety_days() {
+        let now = 1_800_000_000_000;
+        let mut ws = Workspace::default();
+        let tab = |opened, closed| SyncTab {
+            order: "a".into(),
+            order_at: 1,
+            opened_at: opened,
+            closed_at: closed,
+        };
+        ws.tabs
+            .insert(X.into(), tab(1, now - crate::sync::CLOSED_TAB_TTL_MS - 1));
+        ws.tabs.insert(Y.into(), tab(1, now - 1000));
+        ws.forget_closed_tabs(now);
+        assert!(!ws.tabs.contains_key(X));
+        assert!(ws.tabs.contains_key(Y));
     }
 }

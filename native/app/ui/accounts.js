@@ -68,6 +68,13 @@ export function renderAccount() {
   $('account-intro-locked').classList.toggle('hidden', !locked);
   $('btn-account-create').classList.toggle('hidden', locked);
   $('btn-account-use-local').classList.toggle('hidden', !locked);
+  $('btn-account-remove-locked').classList.toggle('hidden', !locked);
+  // A signed-out account's settings cannot change until it is signed in
+  // again; they still apply, so they are shown, read-only.
+  for (const id of ['set-clipboard-sync', 'set-paste-dropped', 'set-translate-modifiers']) {
+    $(id).disabled = locked;
+    $(id).title = locked ? 'Sign in to the account to change this' : '';
+  }
   const user = $('account-username');
   user.readOnly = locked;
   if (locked && v.active) {
@@ -92,6 +99,10 @@ function applyAccountState(v) {
   S.config.account = v;
   renderAccount();
   if (v.error && v.state === 'signedIn') setAccountStatus(v.error, true);
+  // The bring-in question is part of the state, so it also comes back after
+  // the page reloads.
+  if (v.bringIn && $('modal-bring-in').classList.contains('hidden')) showBringIn(v.bringIn);
+  else if (!v.bringIn) $('modal-bring-in').classList.add('hidden');
   render();
 }
 
@@ -144,6 +155,8 @@ async function run(busyText, call, doneText) {
     applyAccountState(v);
     await reloadWorkspace();
     if (v && v.syncError) setAccountStatus('Signed in, but the first sync failed: ' + v.syncError, true);
+    else if (v && v.warning) setAccountStatus(v.warning, true);
+    else if (v && v.state === 'resolving') setAccountStatus('');
     else setAccountStatus(doneText || '');
     return true;
   } catch (err) {
@@ -242,6 +255,7 @@ export function wireAccounts() {
   $('btn-account-create').addEventListener('click', () => accountSignIn(true));
   $('btn-account-sign-out').addEventListener('click', accountSignOut);
   $('btn-account-remove').addEventListener('click', accountRemove);
+  $('btn-account-remove-locked').addEventListener('click', accountRemove);
   $('btn-account-use-local').addEventListener('click', () => accountSwitch(LOCAL));
   $('btn-account-sync').addEventListener('click', syncNowButton);
   $('account-switch').addEventListener('change', (e) => accountSwitch(e.target.value));
@@ -266,7 +280,6 @@ export function wireAccounts() {
   });
 
   api.on('account-state', (e) => applyAccountState(e.payload));
-  api.on('account-bring-in', (e) => showBringIn(e.payload || {}));
   // A sync merged changes from another computer, or the account changed.
   api.on('workspace-changed', () => {
     reloadWorkspace().catch((err) => toast(errorText(err), 'error'));
@@ -276,4 +289,9 @@ export function wireAccounts() {
   window.addEventListener('focus', () => {
     api.accountWindowFocused().catch(() => {});
   });
+}
+
+/** Show the account state loaded with the config (boot, page reload). */
+export function refreshAccount() {
+  applyAccountState(view());
 }

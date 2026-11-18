@@ -74,8 +74,9 @@ pub(crate) struct WsState {
     /// Bumped by every workspace switch; work scheduled for one workspace
     /// checks it before acting (08a §6.7 step 2).
     pub(crate) epoch: u64,
-    /// A switch is in progress: new connections are refused (I10).
-    pub(crate) switching: bool,
+    /// Switches in progress (a count: two can overlap, e.g. a user switch and
+    /// a sign-out from a refused token); new connections are refused (I10).
+    pub(crate) switching: u32,
     /// New connections wait for an answer the account manager is asking for
     /// ("bring this computer's tabs and names in?", 08a §6.10 step 2).
     pub(crate) held: bool,
@@ -101,7 +102,7 @@ impl WsState {
             sel,
             stamper,
             epoch: 0,
-            switching: false,
+            switching: 0,
             held: false,
             tokens: HashMap::new(),
             legacy_token,
@@ -150,6 +151,23 @@ impl Engine {
         Some(r)
     }
 
+    /// Record a connection to `peer` in the recents of workspace `key`, if no
+    /// switch happened since `epoch` (the connection was started in that
+    /// workspace; a later one must not receive it, I13).
+    pub(crate) fn add_recent_in(&self, key: &str, epoch: u64, peer: &str) {
+        {
+            let mut ws = self.ws.lock();
+            if ws.epoch != epoch {
+                return;
+            }
+            let now = ws.stamper.now();
+            let mut cfg = self.config.lock();
+            cfg.workspace_mut(key).add_recent(peer, now);
+            self.save(&cfg);
+        }
+        self.ws_changed.notify_one();
+    }
+
     /// Read the active workspace without changing it (nothing is saved, the
     /// sync is not woken). `None` while signed out (I13).
     pub(crate) fn with_workspace_read<R>(&self, f: impl FnOnce(&Workspace) -> R) -> Option<R> {
@@ -170,9 +188,15 @@ impl Engine {
         Some(cfg.workspaces.get(key).cloned().unwrap_or_default())
     }
 
-    /// The active workspace's preferences; the defaults while signed out.
+    /// The preferences in force: the active workspace's, and while the
+    /// selected account is signed out, that account's stored ones. Unlike its
+    /// names and passwords they are not private, and falling back to the
+    /// defaults would silently turn clipboard sharing back on for a host that
+    /// switched it off (P1 review M1).
     pub fn prefs(&self) -> Prefs {
-        self.workspace().map(|w| w.prefs).unwrap_or_default()
+        let ws = self.ws.lock();
+        let cfg = self.config.lock();
+        prefs_in(&cfg, &ws.sel)
     }
 
     /// Settings → a synced preference. Stamped only when it changes (08a §6.12
@@ -203,7 +227,7 @@ impl Engine {
     /// changes, the choice is saved and the epoch bumped. Hosting is this
     /// computer's, not the account's, and goes on. Returns the new epoch.
     pub async fn switch_workspace(&self, to: WorkspaceSel, end_viewer: bool) -> u64 {
-        self.ws.lock().switching = true;
+        self.ws.lock().switching += 1;
         if end_viewer {
             self.end_viewer_session();
         }
@@ -211,14 +235,10 @@ impl Engine {
             let mut ws = self.ws.lock();
             ws.sel = to.clone();
             ws.epoch += 1;
-            ws.switching = false;
+            ws.switching -= 1;
             let mut cfg = self.config.lock();
             cfg.active_account = to.account_key().map(String::from);
-            let prefs = to
-                .workspace_key()
-                .and_then(|k| cfg.workspaces.get(k))
-                .map(|w| w.prefs)
-                .unwrap_or_default();
+            let prefs = prefs_in(&cfg, &to);
             self.translate_modifiers
                 .store(prefs.translate_modifiers, Ordering::Relaxed);
             self.save(&cfg);
@@ -422,6 +442,11 @@ impl Engine {
             let now = ws.stamper.server_now();
             let mut cfg = self.config.lock();
             let w = cfg.workspace_mut(account);
+            // The server's clock is known now: stamps this computer made while
+            // its clock ran fast come back within the slack before merging, so
+            // they cannot beat newer changes from other computers (I11).
+            ws.stamper.cap_to_max();
+            w.normalize(ws.stamper.max_stamp());
             w.apply_sync_doc(doc, now, with_tabs, with_prefs);
             ws.stamper.observe(w.latest_stamp());
             let tm = w.prefs.translate_modifiers;
@@ -433,19 +458,6 @@ impl Engine {
         }
         let _ = self.ui.send(UiEvent::WorkspaceChanged);
         true
-    }
-
-    /// Whether new connections are refused right now: a switch in progress,
-    /// or the selected account is signed out.
-    pub(crate) fn connect_blocked(&self) -> Option<crate::ConnectError> {
-        let ws = self.ws.lock();
-        if ws.switching || ws.held {
-            Some(crate::ConnectError::Switching)
-        } else if matches!(ws.sel, WorkspaceSel::Locked(_)) {
-            Some(crate::ConnectError::SignedOut)
-        } else {
-            None
-        }
     }
 
     /// End the viewer side only: a viewer session, or a connect-request still
@@ -487,6 +499,29 @@ impl Engine {
                 tracing::warn!("account: the secret store gave no answer in time");
                 None
             }
+        }
+    }
+}
+
+/// The preferences in force for `sel`: its workspace's, or the locked
+/// account's stored ones (see [`Engine::prefs`]).
+pub(crate) fn prefs_in(cfg: &Config, sel: &WorkspaceSel) -> Prefs {
+    let key = match sel {
+        WorkspaceSel::Local => LOCAL_WORKSPACE,
+        WorkspaceSel::Account(k) | WorkspaceSel::Locked(k) => k.as_str(),
+    };
+    cfg.workspaces.get(key).map(|w| w.prefs).unwrap_or_default()
+}
+
+impl WsState {
+    /// Why a new connection is refused right now, if it is.
+    pub(crate) fn connect_blocked(&self) -> Option<crate::ConnectError> {
+        if self.switching > 0 || self.held {
+            Some(crate::ConnectError::Switching)
+        } else if matches!(self.sel, WorkspaceSel::Locked(_)) {
+            Some(crate::ConnectError::SignedOut)
+        } else {
+            None
         }
     }
 }

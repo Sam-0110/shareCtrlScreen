@@ -1655,6 +1655,7 @@ async fn accounts_keep_their_own_workspaces() {
     assert!(e.workspace().unwrap().remote_names.is_empty());
     assert!(e.prefs().clipboard_sync, "bob has the defaults");
     e.set_remote_name(Y, "Bob's");
+    assert!(e.set_pref("clipboardSync", false));
 
     // Signed out: nothing is reachable, connecting is refused.
     e.forget_token(&b);
@@ -1663,6 +1664,9 @@ async fn accounts_keep_their_own_workspaces() {
     assert!(e.workspace().is_none());
     assert!(e.set_remote_name(X, "nope").is_empty());
     assert_eq!(e.connect_to(X.into()), Err(ConnectError::SignedOut));
+    // Its settings still apply while it is signed out (a host keeps the
+    // clipboard off when that was chosen).
+    assert!(!e.prefs().clipboard_sync);
 
     // ann's token comes back from the secret store; her data is intact.
     assert_eq!(e.account_token(&a).await.as_deref(), Some("token-a"));

@@ -133,7 +133,8 @@ impl SyncDoc {
 
         let entries = std::mem::take(&mut self.entries);
         for (id, mut entry) in entries {
-            let Some(key) = remote_name_key(&id) else {
+            // Remote IDs are UUIDs; the server keeps nothing else either.
+            let Some(key) = remote_name_key(&id).filter(|k| crate::is_valid_uuid_v4(k)) else {
                 continue;
             };
             entry.name = clean_remote_name(&entry.name).unwrap_or_default();
@@ -328,8 +329,9 @@ mod tests {
     fn normalize_cleans_untrusted_input() {
         let mut d: SyncDoc = serde_json::from_str(
             r#"{"v":7,"entries":{
-                "ABC":{"name":"  Desk \n top ","nameAt":4,"usedAt":2},
-                "abc":{"name":"older","nameAt":3,"usedAt":9},
+                "0F8FAD5B-D9CB-469F-A165-70867728950E":{"name":"  Desk \n top ","nameAt":4,"usedAt":2},
+                "0f8fad5b-d9cb-469f-a165-70867728950e":{"name":"older","nameAt":3,"usedAt":9},
+                "not-a-uuid":{"name":"dropped","nameAt":5},
                 "":{"name":"x","nameAt":1}
             },"recentsClearedAt":1,"extra":true,
             "prefs":{"clipboardSync":{"value":false,"at":3},"serverUrl":{"value":true,"at":9}},
@@ -341,7 +343,7 @@ mod tests {
         d.normalize(NOW);
         assert_eq!(d.v, SYNC_DOC_VERSION);
         assert_eq!(d.entries.len(), 1);
-        assert_eq!(d.entries["abc"], entry("Desk top", 4, 9));
+        assert_eq!(d.entries[X], entry("Desk top", 4, 9));
         assert_eq!(d.prefs.len(), 1);
         assert!(!d.prefs["clipboardSync"].value);
         assert_eq!(d.tabs.len(), 1);
@@ -351,7 +353,7 @@ mod tests {
     #[test]
     fn normalize_clamps_future_stamps_and_forgets_old_closed_tabs() {
         let far = NOW + 365 * 24 * 3600 * 1000;
-        let mut d = doc(&[("x", entry("A", far, far))], far);
+        let mut d = doc(&[(X, entry("A", far, far))], far);
         d.prefs.insert(
             "captureShortcuts".into(),
             SyncPref {
@@ -380,7 +382,7 @@ mod tests {
         );
         d.normalize(NOW);
         let max = NOW + FUTURE_SLACK_MS;
-        assert_eq!(d.entries["x"], entry("A", max, max));
+        assert_eq!(d.entries[X], entry("A", max, max));
         assert_eq!(d.recents_cleared_at, max);
         assert_eq!(d.prefs["captureShortcuts"].at, max);
         assert_eq!(d.tabs[X].closed_at, max);

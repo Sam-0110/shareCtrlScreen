@@ -20,7 +20,8 @@ use crate::state::AppState;
 pub fn get_config(state: tauri::State<'_, AppState>) -> serde_json::Value {
     let c = state.engine.config();
     let ws = state.engine.workspace().unwrap_or_default();
-    let p = ws.prefs;
+    // A signed-out account's preferences still apply (they are not private).
+    let p = state.engine.prefs();
     serde_json::json!({
         "uuid": c.uuid,
         "serverUrl": c.server_url,

@@ -57,6 +57,13 @@ impl Stamper {
         t.min(self.max_stamp())
     }
 
+    /// Bring the last stamp back within the slack of the server's clock. Called
+    /// once the skew is known: stamps made while this computer's clock ran
+    /// fast must not keep every new stamp ahead of the others (I11).
+    pub fn cap_to_max(&mut self) {
+        self.last = self.last.min(self.max_stamp());
+    }
+
     /// Note a stamp that already exists (loaded or merged), so new stamps are
     /// later than it. Clamped first, so a bad stamp cannot push `now` ahead.
     pub fn observe(&mut self, t: u64) {

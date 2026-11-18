@@ -310,14 +310,8 @@ impl Engine {
             SignalingClient::spawn(config.server_url.clone(), config.uuid.clone());
         let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
         let ws = workspace::WsState::at_launch(&config, loaded.legacy_token);
-        // The selected workspace's setting; the default while an account is
-        // still signed out (it opens later, through `switch_workspace`).
-        let prefs = ws
-            .sel
-            .workspace_key()
-            .and_then(|k| config.workspaces.get(k))
-            .map(|w| w.prefs)
-            .unwrap_or_default();
+        // The selected workspace's setting (a signed-out account's stored one).
+        let prefs = workspace::prefs_in(&config, &ws.sel);
         let translate_modifiers = Arc::new(AtomicBool::new(prefs.translate_modifiers));
         let engine = Arc::new(Self {
             config_path,
@@ -348,8 +342,12 @@ impl Engine {
             ice_policy: Mutex::new(IcePolicy::Full),
         });
         // Host passwords the migration did not carry over (automatic sign-in
-        // was off): their OS secret-store items go too.
-        engine.forget_sealed(loaded.forget_sealed);
+        // was off): their OS secret-store items go too — but only once the
+        // migrated file is on disk; until then the old file still refers to
+        // them (P1 review).
+        if loaded.persisted {
+            engine.forget_sealed(loaded.forget_sealed);
+        }
         (engine, ui_rx, sig_rx)
     }
 
@@ -365,6 +363,11 @@ impl Engine {
     /// UI on boot to back-fill the status dot past the startup event race.
     pub fn server_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
+    }
+
+    /// Whether this run may write the config file (see `writable`).
+    pub fn is_writable(&self) -> bool {
+        self.writable.load(Ordering::Relaxed)
     }
 
     /// Persist a change to this computer's own settings (Settings → device
@@ -785,23 +788,14 @@ impl Engine {
 
     /// UI action: connect out to `host_uuid`. Sends the first connect-request.
     ///
-    /// Refused while this computer is hosting or letting a viewer in (D1): the
-    /// two sessions would fight over the one session slot. Checked and claimed
-    /// under the same locks as an incoming request's admission (role →
-    /// admitting → outbound), so the two cannot both get through.
+    /// Refused mid-switch, while the selected account is signed out (I10,
+    /// I13), and while this computer is hosting or letting a viewer in (D1).
+    /// All checked and claimed in one critical section — the workspace state,
+    /// then role → admitting → outbound, the same order everywhere — so a
+    /// switch cannot slip between the check and the claim: either it sees this
+    /// request and ends it, or this request sees the switch and is refused.
+    /// The recent is written to the workspace the request started in.
     pub fn connect_to(&self, host_uuid: String) -> Result<(), ConnectError> {
-        // Not mid-switch, nor while the selected account is signed out.
-        if let Some(e) = self.connect_blocked() {
-            return Err(e);
-        }
-        {
-            let role = self.role.lock();
-            let admitting = self.admitting.lock();
-            if matches!(*role, Role::Host { .. }) || admitting.is_some() {
-                return Err(ConnectError::Hosting);
-            }
-            *self.outbound.lock() = Some(Outbound::sent_to(host_uuid.clone()));
-        }
         // Advertise only codecs this viewer can actually hardware-decode. A
         // hardcoded list (e.g. always claiming AV1) makes the host negotiate a
         // codec we cannot decode → the viewer media loop dies → black screen.
@@ -812,16 +806,33 @@ impl Engine {
             .iter()
             .map(|c| c.as_caps_str().to_string())
             .collect();
-        let _ = self.signaling.send(SignalMsg::ConnectRequest {
-            to: Some(host_uuid.clone()),
-            from: None,
-            password: None,
-            caps: Some(protocol::signaling::Caps {
-                decode,
-                popout: true,
-            }),
-        });
-        self.add_recent(&host_uuid);
+        let started_in = {
+            let ws = self.ws.lock();
+            if let Some(e) = ws.connect_blocked() {
+                return Err(e);
+            }
+            let role = self.role.lock();
+            let admitting = self.admitting.lock();
+            if matches!(*role, Role::Host { .. }) || admitting.is_some() {
+                return Err(ConnectError::Hosting);
+            }
+            *self.outbound.lock() = Some(Outbound::sent_to(host_uuid.clone()));
+            // Queued (not awaited) inside the section, so a switch's
+            // end-session for this request can only follow it, never precede it.
+            let _ = self.signaling.send(SignalMsg::ConnectRequest {
+                to: Some(host_uuid.clone()),
+                from: None,
+                password: None,
+                caps: Some(protocol::signaling::Caps {
+                    decode,
+                    popout: true,
+                }),
+            });
+            ws.sel.workspace_key().map(|k| (k.to_string(), ws.epoch))
+        };
+        if let Some((key, epoch)) = started_in {
+            self.add_recent_in(&key, epoch, &host_uuid);
+        }
         Ok(())
     }
 

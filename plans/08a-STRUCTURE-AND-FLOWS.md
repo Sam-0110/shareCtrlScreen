@@ -58,8 +58,10 @@ src/control.rs           + VPause / VResume
 testdata/sync-vectors.json   merge cases shared with the server (§7.12)
 ```
 
-`Config` gains `config_version: u32` (absent = 1) and a `#[serde(flatten)] extra` map so a
-downgraded binary that rewrites the file cannot silently drop fields it does not know (§6.13).
+`Config` gains `config_version: u32` (absent = 1) and `#[serde(flatten)] extra` maps (on the
+config, each workspace and each account) so a *later* build that rewrites the file cannot
+silently drop fields it does not know. 2.1.x has no such map; a downgrade is handled by a kept
+copy instead (§6.13 step 5).
 
 ### 2.2 `crates/engine`
 
@@ -121,7 +123,7 @@ with per-tab views in `tabs.js`. `host.js` holds the approval modal and the host
 ```
 server/src/sync.js             pure normalizeDoc / mergeDocs / emptyDoc for v2 (no cloudflare:* imports)
 server/test/sync-vectors.mjs   runs ../../native/crates/protocol/testdata/sync-vectors.json
-.github/workflows/native-ci.yml   + a Node job: sync vectors + accounts smoke (wrangler dev)
+.github/workflows/server-tests.yml  Node job: sync vectors + accounts smoke (wrangler dev); runs on PRs
 .github/workflows/deploy-server.yml  deploy job depends on the same tests passing
 ```
 
@@ -495,13 +497,20 @@ emitting `tabs-changed` unless it says otherwise.
    - `translate_modifiers`, `clipboard_sync`, `paste_dropped_files`, `capture_shortcuts` →
      workspace prefs, unchanged values.
 2. [E] write a backup `config.v1.json` (once), then persist v2 atomically.
-3. [E] **token**, in a task: `seal(token)` → `token_ref` → only then remove the plaintext token
-   from the file. `seal` fails (e.g. Linux without a keyring) → keep it in memory for this run,
-   `keep_signed_in = false`, toast "Sign in again next time: this computer has no keyring".
+3. [E] **token**: the migrated file is written **without** it and the token is held in memory;
+   the AccountManager then seals it (`token_ref`) at launch. As built this reverses the order
+   first planned (seal, then remove), because the plaintext must never be written to the new
+   file or the backup: if the app is killed before the seal completes (a keyring prompt left
+   open), the account comes up signed out and its password is asked once. `seal` fails (Linux
+   without a keyring) → the token is used for this run only and the user is told.
 4. **Any migration error** → keep running on the parsed v1 values in memory, **do not persist**,
    log it. The machine `uuid` is **never** regenerated when the old file has one.
-5. Downgrade: an older binary keeps unknown fields via `extra`; a re-upgrade finds
-   `config_version = 2` and skips migration.
+5. Downgrade: 2.1.x has no `extra` map; it reads the file (the `uuid` survives) but rewrites it
+   without `accounts` and `workspaces`. So every launch of this build refreshes a copy,
+   `config.v2.json`; on a re-upgrade the migration finds that copy (same `uuid`), restores the
+   accounts and workspaces from it and merges in what 2.1.x recorded meanwhile. Saved host
+   passwords 2.1.x stored during the downgrade are merged where the workspace has none.
+   Forgotten secret-store items are deleted only once the migrated file is on disk.
 
 ### 6.14 Background pause / resume
 1. [H] advertises `vpause` in the connect-response caps → the viewer learns it per session.

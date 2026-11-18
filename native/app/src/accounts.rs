@@ -207,11 +207,23 @@ impl Features {
     }
 }
 
+/// A sign-in waiting for "bring this computer's tabs and names in?".
+#[derive(Clone)]
+struct Resolving {
+    key: String,
+    /// The username, as the question names it.
+    account: String,
+    tabs: usize,
+    names: usize,
+}
+
 #[derive(Default)]
 struct Inner {
     /// Signed in from local with local data: the account waiting for the
-    /// "bring this computer's tabs and names in?" answer.
-    resolving: Option<String>,
+    /// "bring this computer's tabs and names in?" answer. Part of the state
+    /// the UI is sent, so a reloaded page asks again instead of leaving new
+    /// connections held with no question on screen.
+    resolving: Option<Resolving>,
     /// Per account: what its server stores (learned from each reply).
     features: HashMap<String, Features>,
     /// The last sync problem, shown under the account until the next success.
@@ -265,7 +277,10 @@ impl AccountManager {
             // The 2.1.x file kept this account signed in: move its token into
             // the secret store (08a §6.13 step 3). Without a keyring it works
             // for this run only, and the user is told.
-            if let Err(e) = self.engine.store_token(&key, token, true).await {
+            // Kept only when this run may write the file: otherwise every launch
+            // would seal it again and orphan the previous secret-store item.
+            let keep = self.engine.is_writable();
+            if let Err(e) = self.engine.store_token(&key, token, keep).await {
                 self.toast(&e);
             }
             self.engine
@@ -368,14 +383,17 @@ impl AccountManager {
     /// The token is gone or refused: the account is signed out here and
     /// locked (08a §5.3), and the user is told.
     async fn lose_session(&self, key: &str) -> String {
+        let msg = error_message("unauthorized", 401);
+        // A reply for an account no longer in use (signed out or switched away
+        // while the request was out) changes nothing and is not reported.
+        if self.engine.workspace_sel() != WorkspaceSel::Account(key.to_string()) {
+            return msg;
+        }
         tracing::info!("account: token refused or missing, signed out");
         self.engine.forget_token(key);
-        if self.engine.workspace_sel() == WorkspaceSel::Account(key.to_string()) {
-            self.engine
-                .switch_workspace(WorkspaceSel::Locked(key.to_string()), true)
-                .await;
-        }
-        let msg = error_message("unauthorized", 401);
+        self.engine
+            .switch_workspace(WorkspaceSel::Locked(key.to_string()), true)
+            .await;
         self.inner().error = Some(msg.clone());
         self.emit_state();
         self.toast(&msg);
@@ -398,8 +416,12 @@ impl AccountManager {
         let cfg = self.engine.config();
         let sel = self.engine.workspace_sel();
         let inner = self.inner();
+        let bring_in = inner
+            .resolving
+            .as_ref()
+            .map(|r| serde_json::json!({ "account": r.account, "tabs": r.tabs, "names": r.names }));
         let (state, active) = match (&inner.resolving, &sel) {
-            (Some(k), _) => ("resolving", Some(k.clone())),
+            (Some(r), _) => ("resolving", Some(r.key.clone())),
             (None, WorkspaceSel::Local) => ("local", None),
             (None, WorkspaceSel::Account(k)) => ("signedIn", Some(k.clone())),
             (None, WorkspaceSel::Locked(k)) => ("locked", Some(k.clone())),
@@ -429,6 +451,7 @@ impl AccountManager {
             "active": active,
             "accounts": accounts,
             "error": inner.error,
+            "bringIn": bring_in,
         })
     }
 
@@ -445,6 +468,8 @@ impl AccountManager {
     }
 
     /// Sign in to an existing account (08a §6.10) or create one (§6.9).
+    /// `Ok(Some(warning))`: signed in, but "Keep me signed in" could not be
+    /// honoured (no keyring) — said as such, not as a sync failure.
     async fn sign_in(
         &self,
         server: String,
@@ -452,7 +477,7 @@ impl AccountManager {
         password: &str,
         keep: bool,
         create: bool,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         let op = if create { "signup" } else { "login" };
         let session: SessionBody = post(
             &format!("{server}/api/account/{op}"),
@@ -461,7 +486,11 @@ impl AccountManager {
         )
         .await?;
         let key = self.engine.upsert_account(&server, &session.username);
-        let stored = self.engine.store_token(&key, session.token, keep).await;
+        let warning = self
+            .engine
+            .store_token(&key, session.token, keep)
+            .await
+            .err();
         tracing::info!("account: signed in");
 
         let from = self.engine.workspace_sel();
@@ -478,19 +507,16 @@ impl AccountManager {
             if let Some((tabs, names)) = self.engine.local_data() {
                 // Ask first (§6.10 step 2); connections wait for the answer.
                 self.engine.hold_connects(true);
-                self.inner().resolving = Some(key.clone());
-                if let Some(h) = self.handle.get() {
-                    let _ = h.emit(
-                        "account-bring-in",
-                        serde_json::json!({
-                            "account": session.username,
-                            "tabs": tabs,
-                            "names": names,
-                        }),
-                    );
-                }
+                self.inner().resolving = Some(Resolving {
+                    key: key.clone(),
+                    account: session.username.clone(),
+                    tabs,
+                    names,
+                });
+                // The question rides on the state (`bringIn`), so the UI shows
+                // it now and again after a reload.
                 self.emit_state();
-                return stored;
+                return Ok(warning);
             }
             self.engine
                 .switch_workspace(WorkspaceSel::Account(key.clone()), true)
@@ -503,14 +529,14 @@ impl AccountManager {
         }
         self.emit_state();
         // The first sync runs now, so the account's data appears at once.
-        let synced = self.sync_once().await;
-        stored.and(synced)
+        self.sync_once().await?;
+        Ok(warning)
     }
 
     /// The answer to "bring this computer's tabs and names in?" (§6.10 step 3).
     /// Dismissing the question counts as "separate".
     async fn resolve_local(&self, add: bool) -> Result<(), String> {
-        let Some(key) = self.inner().resolving.take() else {
+        let Some(Resolving { key, .. }) = self.inner().resolving.take() else {
             return Ok(());
         };
         if add {
@@ -556,7 +582,12 @@ impl AccountManager {
     /// on the server (best effort) and forgotten here; the computer goes back
     /// to the local workspace. The account stays listed, locked.
     async fn sign_out(&self) {
-        self.cancel_resolving().await;
+        // Signing out of the account whose question is still open drops the
+        // question and that sign-in only: the local workspace and its
+        // sessions stay as they are (P1 review).
+        if self.abandon_resolving(None).await {
+            return;
+        }
         let Some(key) = self.engine.workspace_sel().account_key().map(String::from) else {
             return;
         };
@@ -571,7 +602,9 @@ impl AccountManager {
     /// "Remove from this computer": sign out, then delete the account, its
     /// workspace and its saved host passwords.
     async fn remove(&self, key: &str) {
-        self.cancel_resolving().await;
+        if !self.abandon_resolving(Some(key)).await {
+            self.cancel_resolving().await;
+        }
         if self.engine.workspace_sel().account_key() == Some(key) {
             self.engine
                 .switch_workspace(WorkspaceSel::Local, true)
@@ -581,6 +614,28 @@ impl AccountManager {
         self.engine.remove_account(key);
         self.inner().features.remove(key);
         self.emit_state();
+    }
+
+    /// Drop an open "bring in" question together with its sign-in (token
+    /// revoked and forgotten), leaving the local workspace and its sessions
+    /// untouched — for `key`'s question, or any when `None`. Returns whether
+    /// there was one to drop.
+    async fn abandon_resolving(&self, key: Option<&str>) -> bool {
+        let pending = {
+            let mut inner = self.inner();
+            match &inner.resolving {
+                Some(r) if key.is_none_or(|k| k == r.key) => inner.resolving.take(),
+                _ => None,
+            }
+        };
+        let Some(r) = pending else {
+            return false;
+        };
+        self.revoke(&r.key).await;
+        self.engine.forget_token(&r.key);
+        self.engine.hold_connects(false);
+        self.emit_state();
+        true
     }
 
     /// A pending "bring in" question is answered "separate" by any other
@@ -666,7 +721,13 @@ async fn sign_in_or_up(
 ) -> Result<serde_json::Value, String> {
     let am = &state.accounts;
     match am.sign_in(server, username, password, keep, create).await {
-        Ok(()) => Ok(am.view()),
+        Ok(warning) => {
+            let mut v = am.view();
+            if let Some(w) = warning {
+                v["warning"] = w.into();
+            }
+            Ok(v)
+        }
         // The account exists and is selected; only a later step failed.
         Err(e) if am.engine.workspace_sel().account_key().is_some() => {
             let mut v = am.view();

@@ -14,7 +14,7 @@
 // all modules have loaded — so the import cycles between them are harmless.
 
 import * as api from './api.js';
-import { wireAccounts } from './accounts.js';
+import { refreshAccount, wireAccounts } from './accounts.js';
 import { reloadConfig, syncNameField, wireConnect } from './connect.js';
 import { wireHost } from './host.js';
 import { wireSession } from './session.js';
@@ -55,6 +55,8 @@ api.on('toast', (e) => toast(e.payload.message || '', 'error'));
 (async () => {
   await reloadConfig();
   syncNameField();
+  // The account's state, including a bring-in question still open after a reload.
+  refreshAccount();
   await applyPlatformInfo();
   render();
   // Back-fill the server status: the engine registers ~0.5 s after launch and
