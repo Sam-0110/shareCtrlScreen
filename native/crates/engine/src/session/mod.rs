@@ -9,6 +9,7 @@
 //! * clipboard sync,
 //! * viewer only: input translation, file push, and optionally shortcut capture.
 
+pub(crate) mod active;
 mod clipboard;
 mod ctl_queue;
 mod driver;
@@ -159,18 +160,56 @@ pub(crate) struct Session {
     clip_on: Arc<AtomicBool>,
     /// The user's clipboard-sync setting at session start.
     clipboard_setting: bool,
-    /// The per-session shared state: on the viewer so [`request_repaint`] can
+    /// The per-session shared state: on the viewer so the ActiveGate can
     /// set the repaint flag when the surface is re-shown (task D12); on the host
     /// so [`request_display`] can hand a monitor switch to the media thread.
     shared: Arc<Shared>,
     /// Viewer: what opening a pop-out window needs. `None` on a host.
     viewer: Option<ViewerCtx>,
     threads: Vec<JoinHandle<()>>,
+    /// Viewer: its main video as the ActiveGate sees it (`None` on a host).
+    view: Option<Arc<active::SessionView>>,
+    /// Viewer: whether it is the active session, and what follows that (the
+    /// clipboard, the shortcut hook). `None` on a host.
+    activity: Option<Arc<Activity>>,
     /// Test hooks (`test-hooks` feature only): the host's rate state, so the
     /// loopback can observe the encoder target / raw link and inject estimates.
     /// `None` on a viewer session.
     #[cfg(feature = "test-hooks")]
     hooks: Option<TestHooks>,
+}
+
+/// Viewer: what follows the session being the active one (plans/08 P3). Only
+/// the active session exchanges the clipboard (B3: otherwise text copied from
+/// one host would be forwarded to another) and holds the shortcut hook (B2).
+pub(crate) struct Activity {
+    active: AtomicBool,
+    /// The clipboard loop's gate: the user's setting AND active.
+    clip_on: Arc<AtomicBool>,
+    clipboard_setting: bool,
+    /// Tells the shortcut thread to uninstall its hook: set while inactive and
+    /// once the session stops.
+    hook_quit: AtomicBool,
+}
+
+impl Activity {
+    fn new(clipboard_setting: bool, active: bool) -> Self {
+        Activity {
+            active: AtomicBool::new(active),
+            clip_on: Arc::new(AtomicBool::new(clipboard_setting && active)),
+            clipboard_setting,
+            hook_quit: AtomicBool::new(!active),
+        }
+    }
+
+    fn set(&self, active: bool) {
+        self.active.store(active, Ordering::SeqCst);
+        // The clipboard loop re-baselines when its gate opens, so text copied
+        // while another tab was active is never forwarded here (08a §6.4 step 4).
+        self.clip_on
+            .store(active && self.clipboard_setting, Ordering::SeqCst);
+        self.hook_quit.store(!active, Ordering::SeqCst);
+    }
 }
 
 /// Host-side rate state exposed to tests under the `test-hooks` feature.
@@ -389,6 +428,7 @@ pub(crate) fn begin_host(
         stop: stop.clone(),
         platform: platform.clone(),
         surface: None,
+        view: None,
         shared: shared.clone(),
         downloads_dir: platform.paths().downloads_dir,
         paste_dropped: prefs.paste_dropped_files,
@@ -436,6 +476,8 @@ pub(crate) fn begin_host(
         clipboard_setting: prefs.clipboard_sync,
         shared: host_shared,
         viewer: None,
+        view: None,
+        activity: None,
         threads,
         #[cfg(feature = "test-hooks")]
         hooks: Some(TestHooks {
@@ -540,7 +582,18 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
 
     // Clipboard sync. The host applies its own permission gate; here the user's
     // setting governs.
-    let clip_on = Arc::new(AtomicBool::new(prefs.clipboard_sync));
+    // Its view (shown only while active, ready, untroubled and uncovered)
+    // and what follows being the active session (clipboard, shortcut hook).
+    let active_now = engine.is_active(id);
+    let view = active::SessionView::new(
+        surface.clone(),
+        shared.clone(),
+        engine.overlay_flag(),
+        engine.view_ops(),
+        active_now,
+    );
+    let activity = Arc::new(Activity::new(prefs.clipboard_sync, active_now));
+    let clip_on = activity.clip_on.clone();
     let (clip_tx, clip_rx) = std::sync::mpsc::channel::<String>();
     {
         let (platform, ctl, gate, stop_c) = (
@@ -608,6 +661,7 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
         stop: stop.clone(),
         platform: platform.clone(),
         surface: Some(surface.clone()),
+        view: Some(view.clone()),
         shared: shared.clone(),
         downloads_dir: platform.paths().downloads_dir,
         paste_dropped: false,
@@ -625,6 +679,7 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
             codec,
             shared: shared.clone(),
             slot: 0,
+            view: Some(view.clone()),
         };
         let (ctl, stop_r, ui) = (ctl_tx.clone(), stop.clone(), ui.clone());
         spawn_or_abort!(engine, id, stop, threads, "viewer-media", move || {
@@ -637,28 +692,33 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
         });
     }
 
-    // OS shortcut capture (Win/Alt+Tab, Cmd+Tab, Super), when the user enabled it.
+    // OS shortcut capture (Win/Alt+Tab, Cmd+Tab, Super), when the user enabled
+    // it — held only while this session is the active one, and by one session
+    // at a time: a Windows hook is process-wide, so a second install would
+    // take over the first and either uninstall would end both (B2). The
+    // engine-wide owner slot makes the next session wait until the previous
+    // one has uninstalled.
     if prefs.capture_shortcuts {
-        let (platform, surface, ctl, keys, stop_k, hook_input) = (
+        let (platform, surface, ctl, keys, stop_k, hook_input, activity, owner) = (
             platform.clone(),
             surface.clone(),
             ctl_tx.clone(),
             keys.clone(),
             stop.clone(),
             input_tx.clone(),
+            activity.clone(),
+            engine.hook_owner(),
         );
         spawn_or_abort!(engine, id, stop, threads, "shortcuts", move || {
-            let Some(mut hook) = platform.create_shortcut_hook() else {
-                tracing::info!("shortcut capture is not available on this platform");
-                return;
-            };
-            let forward = hook_forwarder(hook_input, keys, ctl);
-            if hook.install(surface.as_ref(), forward) {
-                hook.run(&stop_k);
-            } else {
-                tracing::info!("shortcut capture could not be installed");
-            }
-            hook.uninstall();
+            shortcut_loop(
+                id,
+                platform.as_ref(),
+                surface.as_ref(),
+                &activity,
+                &owner,
+                &stop_k,
+                || hook_forwarder(hook_input.clone(), keys.clone(), ctl.clone()),
+            );
         });
     }
 
@@ -682,6 +742,8 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
             keys,
         }),
         threads,
+        view: Some(view),
+        activity: Some(activity.clone()),
         #[cfg(feature = "test-hooks")]
         hooks: None,
     };
@@ -719,6 +781,63 @@ fn send_input(ctl: &Sender<Vec<u8>>, msg: &InputMsg) {
 /// Fallback to the translator directly: a code outside the shared keymap
 /// (cannot be a `&'static str` for [`VideoInput::Key`]), or the input thread
 /// already gone at session end (a release must still reach the host).
+/// Session `id`'s shortcut capture: whenever the session is active and no
+/// other session holds the hook, install it, run it until the session stops
+/// being active (or stops), uninstall it and hand the owner slot back.
+/// Polls at 50 ms: activation is a user action, and a hook a tick late is
+/// invisible.
+fn shortcut_loop(
+    id: SessionId,
+    platform: &dyn platform_api::Platform,
+    surface: &dyn platform_api::VideoSurface,
+    activity: &Activity,
+    owner: &Mutex<Option<SessionId>>,
+    stop: &AtomicBool,
+    forwarder: impl Fn() -> KeyForwarder,
+) {
+    const TICK: Duration = Duration::from_millis(50);
+    while !stop.load(Ordering::SeqCst) {
+        let claimed = activity.active.load(Ordering::SeqCst) && {
+            let mut o = owner.lock();
+            if o.is_none() {
+                *o = Some(id);
+                true
+            } else {
+                *o == Some(id)
+            }
+        };
+        if !claimed {
+            std::thread::sleep(TICK);
+            continue;
+        }
+        match platform.create_shortcut_hook() {
+            Some(mut hook) => {
+                if hook.install(surface, forwarder()) {
+                    hook.run(&activity.hook_quit);
+                } else {
+                    tracing::info!("shortcut capture could not be installed");
+                }
+                hook.uninstall();
+            }
+            None => {
+                tracing::info!("shortcut capture is not available on this platform");
+                *owner.lock() = None;
+                return;
+            }
+        }
+        *owner.lock() = None;
+        // Not straight back in: wait for the session to become inactive (or
+        // stop) before trying again, so a hook that would not install is not
+        // retried in a tight loop.
+        while activity.active.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
+            if activity.hook_quit.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(TICK);
+        }
+    }
+}
+
 fn hook_forwarder(
     input: Sender<VideoInput>,
     keys: Arc<Mutex<KeyTranslator>>,
@@ -861,15 +980,6 @@ impl Session {
             .store(allow && self.clipboard_setting, Ordering::SeqCst);
     }
 
-    /// Viewer (task D12): ask the present loop to repaint the last decoded
-    /// frame once, immediately. Called after the video surface is re-shown
-    /// (e.g. Settings closed mid-session): `show()` does not itself repaint,
-    /// and on a static host screen the surface would otherwise stay black
-    /// until the next frame.
-    pub(crate) fn request_repaint(&self) {
-        self.shared.repaint_requested.store(true, Ordering::SeqCst);
-    }
-
     /// Host: switch the shared monitor to `id`. The media thread picks it up
     /// on its next pass, swaps the capture, re-targets input and announces the
     /// result to both UIs.
@@ -881,7 +991,7 @@ impl Session {
     /// down together) and join them, its pop-out streams and windows too.
     /// Blocking: called on a reaper thread, never under a lock.
     pub(crate) fn stop_and_join(self) {
-        self.stop.store(true, Ordering::SeqCst);
+        self.signal_stop();
         for t in self.threads {
             let _ = t.join();
         }
@@ -899,19 +1009,38 @@ impl Session {
     /// Set the stop flag only (the threads wind down; joining comes later).
     pub(crate) fn signal_stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        if let Some(a) = &self.activity {
+            a.hook_quit.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Viewer: become (or stop being) the active session — its video shown
+    /// (when ready), its clipboard exchanged, its shortcut hook held. A no-op
+    /// on a host.
+    pub(crate) fn set_active(&self, active: bool) {
+        if let Some(a) = &self.activity {
+            a.set(active);
+        }
+        if let Some(v) = &self.view {
+            v.set_active(active);
+        }
+    }
+
+    /// Viewer: its view, for the gate (`None` on a host).
+    pub(crate) fn view(&self) -> Option<Arc<active::SessionView>> {
+        self.view.clone()
     }
 }
 
 /// A viewer session's surface as it ends: input and drops stop at once (held
-/// keys are released first, by the surface contract), the OS cursor is
-/// restored (task D10) and the picture is hidden. Synchronous, so a session
-/// that ends never keeps capturing input or showing a frozen frame while its
-/// threads are being joined.
+/// keys are released first, by the surface contract) and the OS cursor is
+/// restored (task D10). Synchronous, so a session that ends never keeps
+/// capturing input while its threads are being joined. Hiding it is the
+/// gate's (`SessionView::retire`), in order with its other operations.
 pub(crate) fn detach_surface(s: &dyn platform_api::VideoSurface) {
     s.set_input_sink(None);
     s.set_drop_sink(None);
     s.set_cursor_control(false);
-    s.hide();
 }
 
 /// Viewer: no stream known — the next positional input from any window sends
@@ -1001,6 +1130,8 @@ pub(crate) fn open_viewer_popout(
             codec: ctx.codec,
             shared: shared.clone(),
             slot,
+            // A pop-out shows itself: the gate decides the main video only.
+            view: None,
         };
         let (ctl, stop_r) = (ctl_tx.clone(), loop_stop.clone());
         let media_thread = spawn(&format!("popout-{slot}-media"), move || {

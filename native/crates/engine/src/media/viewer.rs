@@ -17,6 +17,10 @@ pub(crate) struct ViewerMedia {
     /// The video stream shown (0 = main window; 1.. = a pop-out, D14). Tags
     /// this loop's keyframe requests and size reports.
     pub slot: u8,
+    /// The main video's gate (P3): it decides when the surface is shown,
+    /// and the loop presents only while it is. `None` for a pop-out, which
+    /// shows itself.
+    pub view: Option<Arc<crate::session::active::SessionView>>,
 }
 
 /// Idle repaint cadence (D11): how long the loop blocks for a new frame before
@@ -38,6 +42,7 @@ pub(crate) fn viewer_media_loop(
         codec,
         shared,
         slot,
+        view,
     } = media;
 
     // Presenter + decoder share one device (zero-copy decode → present). Create
@@ -48,7 +53,10 @@ pub(crate) fn viewer_media_loop(
         .codecs()
         .new_decoder(presenter.device(), codec, 1920, 1080)?;
     tracing::info!("viewer: decoder+presenter ready ({})", codec.as_caps_str());
-    surface.show();
+    match &view {
+        Some(v) => v.set_ready(),
+        None => surface.show(),
+    }
 
     let mut ts = 0i64;
     let mut rendered: u64 = 0;
@@ -183,15 +191,20 @@ pub(crate) fn viewer_media_loop(
                             // video (D10/D11 — instant, no round-trip lag), and
                             // otherwise the host's out-of-band position.
                             let (cursor, shape) = current_cursor(&shared, surface.as_ref());
-                            present_frame(
-                                presenter.as_mut(),
-                                &shared,
-                                &mut sprite,
-                                &frame,
-                                cursor,
-                                shape,
-                                &mut render_errors,
-                            );
+                            // A hidden video (another tab is active, a dialog
+                            // covers it) is decoded, so its reference frames
+                            // stay current, but not presented (B5).
+                            if view.as_ref().is_none_or(|v| v.is_shown()) {
+                                present_frame(
+                                    presenter.as_mut(),
+                                    &shared,
+                                    &mut sprite,
+                                    &frame,
+                                    cursor,
+                                    shape,
+                                    &mut render_errors,
+                                );
+                            }
                             last_cursor = cursor;
                             last_frame = Some(frame);
                         }
@@ -213,7 +226,8 @@ pub(crate) fn viewer_media_loop(
                 match &last_frame {
                     Some(frame) => {
                         let (cursor, shape) = current_cursor(&shared, surface.as_ref());
-                        if should_idle_repaint(repaint, cursor, last_cursor) {
+                        let shown = view.as_ref().is_none_or(|v| v.is_shown());
+                        if shown && should_idle_repaint(repaint, cursor, last_cursor) {
                             present_frame(
                                 presenter.as_mut(),
                                 &shared,

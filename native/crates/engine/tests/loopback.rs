@@ -164,6 +164,17 @@ struct Peer {
 type Announced = (Vec<String>, String, bool);
 
 impl Peer {
+    /// Connect to `host` and make it the tab on screen, as the app's
+    /// `connect_to` does (only the active session shows its video, P3).
+    fn open(&self, host: &str) -> SessionId {
+        let id = self
+            .engine
+            .connect(host, None)
+            .expect("this computer is not hosting");
+        self.engine.set_active(Some(id));
+        id
+    }
+
     /// The latest monitor announcement this side's UI received.
     fn last_displays(&self) -> Option<Announced> {
         self.displays.lock().unwrap().last().cloned()
@@ -384,19 +395,13 @@ async fn a_second_viewer_is_told_busy_while_the_first_awaits_approval() {
     })
     .await;
 
-    first
-        .engine
-        .connect(&host.uuid, None)
-        .expect("this computer is not hosting");
+    first.open(&host.uuid);
     eventually("the host's prompt is open for the first viewer", t, || {
         asked.load(std::sync::atomic::Ordering::SeqCst)
     })
     .await;
 
-    second
-        .engine
-        .connect(&host.uuid, None)
-        .expect("this computer is not hosting");
+    second.open(&host.uuid);
     eventually("the second viewer is told busy", t, || {
         second
             .toasts
@@ -447,9 +452,7 @@ async fn a_cancelled_password_prompt_does_not_leave_this_computer_busy() {
     })
     .await;
 
-    me.engine
-        .connect(&locked.uuid, None)
-        .expect("this computer is not hosting");
+    me.open(&locked.uuid);
     eventually("the password prompt", t, || {
         me.password_prompts
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -458,10 +461,7 @@ async fn a_cancelled_password_prompt_does_not_leave_this_computer_busy() {
     .await;
 
     // The prompt is up: this computer is connecting, so it is busy.
-    other
-        .engine
-        .connect(&me.uuid, None)
-        .expect("this computer is not hosting");
+    other.open(&me.uuid);
     eventually("the other viewer is told busy", t, || {
         other
             .toasts
@@ -472,12 +472,12 @@ async fn a_cancelled_password_prompt_does_not_leave_this_computer_busy() {
     })
     .await;
 
-    // Cancel, as the prompt's Cancel button does.
-    me.engine.end_all();
-    other
-        .engine
-        .connect(&me.uuid, None)
-        .expect("this computer is not hosting");
+    // Cancel, as the prompt's Cancel button does. The ended session keeps
+    // this computer busy until it is released (its threads joined), so wait
+    // for that before the next request: answering "busy" until then is the
+    // design (P2), not the stuck-busy bug this test guards against.
+    me.engine.end_all_and_wait(t).await;
+    other.open(&me.uuid);
     let other_id = other.uuid.clone();
     eventually("the other viewer is let in", t, || {
         matches!(me.engine.role(), Role::Host { ref peer, .. } if *peer == other_id)
@@ -501,10 +501,7 @@ async fn full_session_over_real_webrtc() {
     .await;
 
     // Handshake (approve mode → AllowControl), then WebRTC over loopback UDP.
-    viewer
-        .engine
-        .connect(&host.uuid, None)
-        .expect("this computer is not hosting");
+    viewer.open(&host.uuid);
     eventually("roles set", t, || {
         matches!(
             host.engine.role(),
@@ -667,10 +664,7 @@ async fn host_cursor_image_reaches_the_viewer_and_lands_on_the_hotspot() {
         host.engine.server_connected() && viewer.engine.server_connected()
     })
     .await;
-    viewer
-        .engine
-        .connect(&host.uuid, None)
-        .expect("this computer is not hosting");
+    viewer.open(&host.uuid);
 
     // The mock host reports its image once, with its first frame, before any
     // channel is open: it must still arrive (reliable ctl, buffered until open)
@@ -795,10 +789,7 @@ async fn maximum_size_cursor_images_in_a_burst_all_arrive_intact() {
         host.engine.server_connected() && viewer.engine.server_connected()
     })
     .await;
-    viewer
-        .engine
-        .connect(&host.uuid, None)
-        .expect("this computer is not hosting");
+    viewer.open(&host.uuid);
 
     eventually("the last 256×256 image installed and drawn", t, || {
         let s = viewer.platform.surface.state();
@@ -943,10 +934,7 @@ async fn controlled_session(
         host.engine.server_connected() && viewer.engine.server_connected()
     })
     .await;
-    viewer
-        .engine
-        .connect(&host.uuid, None)
-        .expect("this computer is not hosting");
+    viewer.open(&host.uuid);
     eventually("video presented", t, || {
         matches!(
             host.engine.role(),
@@ -1106,10 +1094,7 @@ async fn constrained_link_tracks_bwe_down_and_recovers() {
         host.engine.server_connected() && viewer.engine.server_connected()
     })
     .await;
-    viewer
-        .engine
-        .connect(&host.uuid, None)
-        .expect("this computer is not hosting");
+    viewer.open(&host.uuid);
 
     // Up and running at full resolution, with frames reaching the viewer, before
     // we touch the link.
@@ -1247,10 +1232,7 @@ async fn noisy_link_stays_steady_but_follows_a_sustained_trend() {
         host.engine.server_connected() && viewer.engine.server_connected()
     })
     .await;
-    viewer
-        .engine
-        .connect(&host.uuid, None)
-        .expect("this computer is not hosting");
+    viewer.open(&host.uuid);
     eventually("video flowing at full size", t, || {
         host.engine.test_encode_dims() == Some((640, 360))
             && !viewer.platform.surface.state().presented.is_empty()
@@ -1406,10 +1388,7 @@ async fn monitor_switch_follows_picture_input_and_the_control_gate() {
         host.engine.server_connected() && viewer.engine.server_connected()
     })
     .await;
-    viewer
-        .engine
-        .connect(&host.uuid, None)
-        .expect("this computer is not hosting");
+    viewer.open(&host.uuid);
 
     // Both UIs learn the host's monitors; the viewer may switch (control).
     let both = vec!["mock-0".to_string(), "mock-1".to_string()];
@@ -1549,10 +1528,7 @@ async fn popout_window_streams_a_second_monitor_with_its_own_input() {
         host.engine.server_connected() && viewer.engine.server_connected()
     })
     .await;
-    viewer
-        .engine
-        .connect(&host.uuid, None)
-        .expect("this computer is not hosting");
+    viewer.open(&host.uuid);
     eventually("main window presenting", t, || {
         viewer.last_displays().is_some_and(|d| d.2)
             && !viewer.platform.surface.state().presented.is_empty()
@@ -1804,10 +1780,7 @@ async fn switching_accounts_ends_the_viewer_session() {
         host.engine.server_connected() && viewer.engine.server_connected()
     })
     .await;
-    viewer
-        .engine
-        .connect(&host.uuid, None)
-        .expect("not hosting");
+    viewer.open(&host.uuid);
     eventually("connected", t, || {
         matches!(viewer.engine.role(), Role::Viewer { .. })
             && matches!(host.engine.role(), Role::Host { .. })
@@ -1867,26 +1840,89 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
     };
 
     // A first, and live.
-    let a = viewer
-        .engine
-        .connect(&host_a.uuid, None)
-        .expect("not hosting");
+    let a = viewer.open(&host_a.uuid);
     eventually("A presents", t, || presented(&surface_a) >= 10).await;
 
-    // B starts while A runs; A keeps presenting throughout.
+    // B starts while A is on screen: B streams and decodes, but only the
+    // active tab is shown and presented (P3, I2); A keeps presenting.
     let a_before_b = presented(&surface_a);
     let b = viewer
         .engine
         .connect(&host_b.uuid, Some(surface_b.clone()))
         .expect("not hosting");
     assert_ne!(a, b);
-    eventually("B presents too", t, || presented(&surface_b) >= 10).await;
+    let viewer_id = viewer.uuid.clone();
+    eventually(
+        "B's host is streaming",
+        t,
+        || matches!(host_b.engine.role(), Role::Host { ref peer, .. } if *peer == viewer_id),
+    )
+    .await;
     eventually("A kept presenting while B started", t, || {
-        presented(&surface_a) > a_before_b + 10
+        presented(&surface_a) > a_before_b + 30
     })
     .await;
+    assert_eq!(presented(&surface_b), 0, "an inactive tab is not presented");
+    assert!(!surface_b.state().visible, "an inactive tab is hidden");
+    assert_eq!(viewer.engine.active_session(), Some(a));
+
+    // Only the active tab exchanges the clipboard (B3).
+    viewer.platform.clipboard.user_copies("for A");
+    eventually("A's host gets the copy", t, || {
+        host_a.platform.clipboard.get_text().as_deref() == Some("for A")
+    })
+    .await;
+
+    // Switching, 20 times: the old tab is hidden and stops presenting, the
+    // new one is shown and presents (I2).
+    let switch_to = |on: SessionId| viewer.engine.set_active(Some(on));
+    for round in 0..20 {
+        for (on, on_s, off_s) in [(b, &surface_b, &surface_a), (a, &surface_a, &surface_b)] {
+            let before = presented(on_s);
+            switch_to(on);
+            eventually("the new tab presents", t, || {
+                on_s.state().visible && presented(on_s) > before + 2
+            })
+            .await;
+            assert!(
+                !off_s.state().visible,
+                "round {round}: the old tab is hidden"
+            );
+            let off_count = presented(off_s);
+            let on_count = presented(on_s);
+            eventually("the new tab keeps presenting", t, || {
+                presented(on_s) > on_count + 3
+            })
+            .await;
+            assert!(
+                presented(off_s) <= off_count + 1,
+                "round {round}: a hidden tab is not presented"
+            );
+        }
+    }
+    assert_eq!(viewer.engine.active_session(), Some(a));
+
+    // The copy made while A was active never reached B, even though B was
+    // active since (the gate re-baselines when it opens); B's own copy does.
+    assert_ne!(
+        host_b.platform.clipboard.get_text().as_deref(),
+        Some("for A")
+    );
+    switch_to(b);
+    viewer.platform.clipboard.user_copies("for B");
+    eventually("B's host gets B's copy", t, || {
+        host_b.platform.clipboard.get_text().as_deref() == Some("for B")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(
+        host_a.platform.clipboard.get_text().as_deref(),
+        Some("for A"),
+        "an inactive tab's host gets nothing"
+    );
+    switch_to(a);
+    eventually("A on screen again", t, || surface_a.state().visible).await;
     assert_eq!(viewer.engine.viewer_sessions(), vec![a, b]);
-    let viewer_id = viewer.uuid.clone();
     assert!(
         matches!(host_a.engine.role(), Role::Host { ref peer, .. } if *peer == viewer_id)
             && matches!(host_b.engine.role(), Role::Host { ref peer, .. } if *peer == viewer_id)
@@ -1971,10 +2007,7 @@ async fn ending_a_session_during_its_start_leaves_nothing_behind() {
     })
     .await;
     viewer.engine.test_delay_viewer_start(1500);
-    let id = viewer
-        .engine
-        .connect(&host.uuid, None)
-        .expect("not hosting");
+    let id = viewer.open(&host.uuid);
     eventually("accepted, the start under way", t, || {
         viewer
             .session_log

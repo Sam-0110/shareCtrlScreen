@@ -75,10 +75,14 @@ impl ClipboardSync {
             }
         }
 
+        let count = clipboard.change_count();
         if !enabled {
+            // Re-baselined while closed: a copy made meanwhile (with another
+            // tab active, or control revoked) is not sent when the gate opens
+            // again (plans/08 B3, 08a §6.4 step 4).
+            self.last_count = count;
             return;
         }
-        let count = clipboard.change_count();
         if count == self.last_count {
             return;
         }
@@ -152,5 +156,12 @@ mod tests {
         // Re-enabling does not replay text that arrived while disabled.
         s.step(&clip, &ctl_tx, &peer_rx, true);
         assert_eq!(clip.get_text().as_deref(), Some("secret"));
+        assert!(
+            sent(&ctl_rx).is_empty(),
+            "nor sends what was copied while it was disabled"
+        );
+        clip.user_copies("after");
+        s.step(&clip, &ctl_tx, &peer_rx, true);
+        assert_eq!(sent(&ctl_rx), ["after"]);
     }
 }

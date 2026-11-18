@@ -196,6 +196,14 @@ pub struct Engine {
     /// key without a reconnect. Kept equal to the workspace's preference.
     translate_modifiers: Arc<AtomicBool>,
     ice_policy: Mutex<IcePolicy>,
+    /// A web dialog (Settings, a confirm) is open over the video: no main
+    /// video is shown meanwhile (08a §6.18). Read by every session's view.
+    overlay: Arc<AtomicBool>,
+    /// The ActiveGate's applier queue (session/active.rs): every main video
+    /// is shown and hidden through it, in the order decided.
+    view_ops: session::active::ViewOps,
+    /// The viewer session holding the shortcut hook, one at a time (B2).
+    hook_owner: Arc<Mutex<Option<SessionId>>>,
     /// Test hook (`test-hooks` feature only): how long a viewer session's
     /// start waits before building anything (ms), so a test can end a session
     /// in the middle of its start.
@@ -252,6 +260,9 @@ impl Engine {
             surface: Mutex::new(None),
             translate_modifiers,
             ice_policy: Mutex::new(IcePolicy::Full),
+            overlay: Arc::new(AtomicBool::new(false)),
+            view_ops: session::active::applier(&tokio::runtime::Handle::current()),
+            hook_owner: Arc::new(Mutex::new(None)),
             #[cfg(feature = "test-hooks")]
             test_start_delay_ms: Default::default(),
         });

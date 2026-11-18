@@ -763,30 +763,72 @@ impl Engine {
         session::close_viewer_popout(self, id, slot, gen, false);
     }
 
-    /// Viewer: hide/show session `id`'s video so web modals (settings) are
-    /// visible mid-session. The stream keeps running; only presentation is
-    /// hidden.
-    pub fn set_video_visible(&self, id: SessionId, visible: bool) {
-        let (surface, live) = {
-            let reg = self.reg.lock();
-            let Some(v) = reg.viewers.get(&id) else {
-                return;
-            };
-            (v.surface.clone(), v.session.is_some())
-        };
-        let Some(s) = surface else { return };
-        if visible {
-            s.show();
-            // D12: re-showing the surface does NOT repaint it — the present
-            // loop only paints on a new decoded frame (or a cursor move,
-            // D11), so a static host screen stays BLACK until the next
-            // frame. Signal the present loop to repaint the held frame now.
-            if live {
-                self.with_viewer(id, |s| s.request_repaint());
-            }
-        } else {
-            s.hide();
+    // ---- the ActiveGate (08a §6.4, §6.18) -----------------------------------------
+
+    /// Make viewer session `id` the one on screen (or none): its video is
+    /// shown once ready, it alone exchanges the clipboard (re-baselined, so
+    /// text copied while another tab was active is never sent) and holds the
+    /// shortcut hook; the previous one is hidden first (I2). The gate does the
+    /// showing and hiding, in this order, on its own thread.
+    pub fn set_active(&self, id: Option<SessionId>) {
+        // Done under `reg` so two racing switches cannot both leave their tab
+        // active; `Session::set_active` only stores atomics and queues to the
+        // gate's thread (never blocks, never touches the OS), so holding the
+        // lock is allowed. Old first: "hide the old tab" is queued before
+        // "show the new one".
+        let mut reg = self.reg.lock();
+        if reg.active == id {
+            return;
         }
+        let id = id.filter(|i| reg.viewers.contains_key(i));
+        let old = std::mem::replace(&mut reg.active, id);
+        for (s, on) in [(old, false), (id, true)] {
+            if let Some(session) = s
+                .and_then(|s| reg.viewers.get(&s))
+                .and_then(|v| v.session.as_ref())
+            {
+                session.set_active(on);
+            }
+        }
+    }
+
+    /// The viewer session on screen, if any.
+    pub fn active_session(&self) -> Option<SessionId> {
+        self.reg.lock().active
+    }
+
+    /// A web dialog opened over the video (`true`) or the last one closed
+    /// (`false`): every main video is hidden meanwhile, then the active one is
+    /// shown and repainted again (08a §6.18).
+    pub fn set_overlay(&self, open: bool) {
+        self.overlay.store(open, Ordering::SeqCst);
+        let views: Vec<_> = {
+            let reg = self.reg.lock();
+            reg.viewers
+                .values()
+                .filter_map(|v| v.session.as_ref())
+                .filter_map(|s| s.view())
+                .collect()
+        };
+        for v in views {
+            v.refresh();
+        }
+    }
+
+    pub(crate) fn is_active(&self, id: SessionId) -> bool {
+        self.reg.lock().active == Some(id)
+    }
+
+    pub(crate) fn overlay_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.overlay)
+    }
+
+    pub(crate) fn view_ops(&self) -> session::active::ViewOps {
+        self.view_ops.clone()
+    }
+
+    pub(crate) fn hook_owner(&self) -> Arc<parking_lot::Mutex<Option<SessionId>>> {
+        Arc::clone(&self.hook_owner)
     }
 
     // ---- ending --------------------------------------------------------------------
@@ -941,6 +983,10 @@ impl Engine {
                 Some(Taken::Host(h)) => (h.peer, true, h.ended, None, h.session),
                 Some(Taken::Viewer(v)) => (v.peer, false, v.ended, v.surface, v.session),
             };
+            // No tab is on screen until the UI picks the next one (08a §6.4).
+            if reg.active == Some(id) {
+                reg.active = None;
+            }
             reg.reaping.insert(
                 id,
                 session::registry::Reaping {
@@ -956,6 +1002,11 @@ impl Engine {
         // re-show the surface) while it winds down; then the surface lets go.
         if let Some(s) = &session {
             s.signal_stop();
+        }
+        // Hidden through the gate, after any show it queued before, and never
+        // shown again.
+        if let Some(v) = session.as_ref().and_then(|s| s.view()) {
+            v.retire();
         }
         if let Some(s) = &surface {
             session::detach_surface(s.as_ref());
@@ -984,12 +1035,18 @@ impl Engine {
     ) {
         let ui = self.session_ui(id, peer, host);
         let reg = Arc::clone(&self.reg);
+        let view = session.as_ref().and_then(|s| s.view());
         let release = move || {
             if let Some(s) = session {
                 s.stop_and_join();
             }
-            if let Some(s) = &surface {
-                s.hide();
+            // Retired again after the join: the last op the gate performs on
+            // this surface is a hide. A session that never started has no
+            // view (nothing showed its surface): hide it directly.
+            match (&view, &surface) {
+                (Some(v), _) => v.retire(),
+                (None, Some(s)) => s.hide(),
+                (None, None) => {}
             }
             reg.lock().reaping.remove(&id);
             ui.send(SessionEvent::Released);
@@ -1086,8 +1143,13 @@ impl Engine {
     pub(crate) fn store_viewer_session(&self, id: SessionId, s: session::Session) -> bool {
         let requested = {
             let mut reg = self.reg.lock();
+            let active = reg.active == Some(id);
             match reg.viewers.get_mut(&id) {
                 Some(v) => {
+                    // A switch while it was starting could not reach it (no
+                    // session yet): it takes the registry's answer now, under
+                    // the same lock every switch holds.
+                    s.set_active(active);
                     v.phase = ViewerPhase::Live;
                     v.session = Some(s);
                     v.starting = false;

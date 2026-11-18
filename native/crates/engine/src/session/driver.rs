@@ -128,6 +128,9 @@ pub(super) struct Driver {
     pub(super) platform: Arc<dyn Platform>,
     /// Viewer: the video surface (hidden on link trouble / death).
     pub(super) surface: Option<Arc<dyn VideoSurface>>,
+    /// Viewer: the main video's gate. The link-trouble hide and the restore
+    /// go through it, never straight to the surface (B4).
+    pub(super) view: Option<Arc<super::active::SessionView>>,
     /// Per-session state shared with the media threads.
     pub(super) shared: Arc<Shared>,
     /// Host: where received files are written.
@@ -190,6 +193,7 @@ pub(super) fn transport_driver(d: Driver) {
         stop,
         platform,
         surface,
+        view,
         shared,
         downloads_dir,
         paste_dropped,
@@ -204,6 +208,7 @@ pub(super) fn transport_driver(d: Driver) {
     let notify_dead = {
         let ended = ended.clone();
         let surface = surface.clone();
+        let view = view.clone();
         let shared = shared.clone();
         move |reason: &str| {
             let first = ended
@@ -216,7 +221,10 @@ pub(super) fn transport_driver(d: Driver) {
                 // "it just froze instead of disconnecting" report. Input capture
                 // goes with it so a dead session can't still grab keystrokes.
                 if let Some(s) = &surface {
-                    s.hide();
+                    // Through the gate, so it is ordered after any show it queued.
+                    if let Some(v) = &view {
+                        v.retire();
+                    }
                     s.set_input_sink(None);
                     s.set_drop_sink(None);
                 }
@@ -399,8 +407,8 @@ pub(super) fn transport_driver(d: Driver) {
                     // Stop presenting a stale frame while we wait. Without this
                     // the viewer sees a frozen picture that is indistinguishable
                     // from a working session, which is the whole complaint.
-                    if let Some(s) = &surface {
-                        s.hide();
+                    if let Some(v) = &view {
+                        v.set_trouble(true);
                     }
                     for s in popout_surfaces(&shared) {
                         s.hide();
@@ -416,8 +424,9 @@ pub(super) fn transport_driver(d: Driver) {
                 // Answered again within the grace period — carry on.
                 link_trouble = false;
                 tracing::info!("transport: peer responded again — session continues");
-                if let Some(s) = &surface {
-                    s.show();
+                if let Some(v) = &view {
+                    // Shown again only if it is still the active tab.
+                    v.set_trouble(false);
                     // The stream may have advanced without us; get a clean start.
                     ctl.send(
                         serialize(&protocol::ControlMsg::KeyframeRequest { s: 0 }),

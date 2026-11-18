@@ -118,11 +118,10 @@ pub fn get_role(state: tauri::State<'_, AppState>) -> String {
 
 #[tauri::command]
 pub fn connect_to(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-    state
-        .engine
-        .connect(&id, None)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    let session = state.engine.connect(&id, None).map_err(|e| e.to_string())?;
+    // The new tab is the one on screen (08a §6.1).
+    state.engine.set_active(Some(session));
+    Ok(())
 }
 
 #[tauri::command]
@@ -237,13 +236,12 @@ pub(crate) fn display_label(d: &protocol::RemoteDisplay) -> String {
     format!("{name} ({}\u{d7}{}{primary})", d.width, d.height)
 }
 
-/// Viewer: hide/show the native video surface so web modals (settings) are
-/// visible mid-session — the native surface otherwise covers them.
+/// A web dialog (Settings, a confirm) opened over the video (`visible` false)
+/// or the last one closed: the native surface would otherwise cover it, so
+/// the engine's gate hides every main video meanwhile (08a §6.18).
 #[tauri::command]
 pub fn set_video_visible(state: tauri::State<'_, AppState>, visible: bool) {
-    if let Some(id) = current_viewer(&state) {
-        state.engine.set_video_visible(id, visible);
-    }
+    state.engine.set_overlay(!visible);
 }
 
 #[tauri::command]
