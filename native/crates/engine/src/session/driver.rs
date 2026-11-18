@@ -823,6 +823,24 @@ pub(super) fn transport_driver(d: Driver) {
                                     host_force_key(s, &force_key, &shared);
                                     continue;
                                 }
+                                // Background tab (P6): the main stream stops; a
+                                // resume restarts it with a keyframe, the only
+                                // thing the viewer can decode from after a gap.
+                                Ok(protocol::ControlMsg::VideoPause) if host_side => {
+                                    tracing::info!(
+                                        "viewer paused the main stream (background tab)"
+                                    );
+                                    shared.video_paused.store(true, Ordering::SeqCst);
+                                    continue;
+                                }
+                                Ok(protocol::ControlMsg::VideoResume) if host_side => {
+                                    tracing::info!("viewer resumed the main stream");
+                                    // Keyframe first, so the first frame after the
+                                    // pause is one.
+                                    host_force_key(0, &force_key, &shared);
+                                    shared.video_paused.store(false, Ordering::SeqCst);
+                                    continue;
+                                }
                                 // The viewer told us its display size — encode to
                                 // exactly that so it presents 1:1 (no resampling
                                 // blur) and we don't spend bits on unseen pixels.

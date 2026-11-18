@@ -29,6 +29,10 @@ use platform_api::{CaptureError, Codec, DisplayInfo, EncoderConfig, Platform, Sc
 use crate::session::Shared;
 use crate::tuning::{MAX_FPS, MAX_FPS_INTERVAL};
 
+/// How often a paused main stream (a background tab, P6) checks for its
+/// resume.
+const PAUSED_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// What every host media thread of a session shares: the main stream's and
 /// each pop-out stream's (D14). The transport thread holds one too, to start
 /// pop-out streams.
@@ -458,6 +462,16 @@ pub(crate) fn host_media_loop(
         }
         last_frame_at = std::time::Instant::now();
 
+        // Paused by the viewer (its tab is in the background, P6): no capture,
+        // no encode, nothing on the wire for the main stream. Pop-out streams
+        // go on. Checked at a relaxed pace — resuming within a frame or two
+        // of the request is plenty, the resume's keyframe is what the viewer
+        // waits for.
+        if main && shared.video_paused.load(Ordering::SeqCst) {
+            std::thread::sleep(PAUSED_POLL);
+            continue;
+        }
+
         // A monitor switch (host UI, or a controlling viewer). The new capture
         // is opened next to the old one and only replaces it once it AND an
         // encoder on its device both exist, so a failed switch keeps sharing
@@ -713,6 +727,10 @@ pub(crate) fn host_media_loop(
                     Ok(units) => {
                         for u in units {
                             sent += 1;
+                            #[cfg(feature = "test-hooks")]
+                            if main {
+                                shared.main_units.fetch_add(1, Ordering::SeqCst);
+                            }
                             // Attribute every IDR. An IDR we did NOT ask for is
                             // the encoder's own doing (Media Foundation runs its
                             // own scene-change detection and honours GOPSize), and

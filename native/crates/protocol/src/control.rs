@@ -25,6 +25,17 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "is_zero")]
         s: u8,
     },
+    /// Viewer → Host: this session went to the background (another tab is on
+    /// screen) — stop capturing and encoding the main stream; the control
+    /// channel, cursor and liveness stay up, pop-out streams keep going.
+    /// Sent only to a host that advertised [`crate::HostCaps::vpause`]
+    /// (plans/08 §3.7, 08a §6.14).
+    #[serde(rename = "vpause")]
+    VideoPause,
+    /// Viewer → Host: back on screen — resume the main stream, starting with a
+    /// keyframe.
+    #[serde(rename = "vresume")]
+    VideoResume,
     /// Host → Viewer: out-of-band cursor position + optional shape id
     /// (Plan 04 §5a/§7 — cursor rendered client-side so it feels instant).
     /// `x`/`y` normalized `[0,1]`: the pointer's hotspot. `shape` names the
@@ -159,6 +170,18 @@ mod tests {
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"t\":\"perm\""));
         assert!(s.contains("\"value\":\"control\""));
+    }
+
+    #[test]
+    fn pause_and_resume_wire_shape() {
+        assert_eq!(
+            serde_json::to_string(&ControlMsg::VideoPause).unwrap(),
+            r#"{"t":"vpause"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<ControlMsg>(r#"{"t":"vresume"}"#).unwrap(),
+            ControlMsg::VideoResume
+        ));
     }
 
     #[test]

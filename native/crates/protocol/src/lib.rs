@@ -23,7 +23,7 @@ pub use config::{
 };
 pub use control::{ControlMsg, PopoutStream, RemoteDisplay};
 pub use input::{Button, InputMsg};
-pub use signaling::{IceCandidate, IceServers, SignalData, SignalMsg};
+pub use signaling::{HostCaps, IceCandidate, IceServers, SignalData, SignalMsg};
 pub use sync::{Stamper, SyncDoc, SyncEntry};
 pub use transfer::{BulkFrame, FileMeta};
 

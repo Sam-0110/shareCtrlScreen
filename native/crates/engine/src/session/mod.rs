@@ -61,6 +61,9 @@ pub(crate) struct Shared {
     /// held frame once and clears it (or, with nothing decoded yet, asks for a
     /// keyframe so a fresh frame arrives to show).
     pub repaint_requested: AtomicBool,
+    /// Host: the viewer put this session in the background (`vpause`, P6):
+    /// the main stream neither captures nor encodes until `vresume`.
+    pub video_paused: AtomicBool,
     /// Host: a monitor switch (a `DisplayInfo::id`) waiting for the media
     /// thread, which owns the capture. Set by the host UI or by a controlling
     /// viewer's `seldisp`; the newest request wins.
@@ -98,6 +101,10 @@ pub(crate) struct Shared {
     /// link varies (V2 has no resolution ladder).
     #[cfg(feature = "test-hooks")]
     pub encode_dims: AtomicU64,
+    /// Test hook (`test-hooks` feature only): encoded units the main stream
+    /// has sent, so the loopback can see a paused stream send nothing (P6).
+    #[cfg(feature = "test-hooks")]
+    pub main_units: AtomicU64,
     /// Test hook (`test-hooks` feature only): a forced bandwidth estimate in bps
     /// (0 = none). While set, the driver re-applies it every tick and ignores
     /// str0m's real estimate, so a loopback test can drive a constrained-then-
@@ -187,13 +194,51 @@ pub(crate) struct Session {
 pub(crate) struct TabGate {
     pub(crate) view: Arc<active::SessionView>,
     activity: Arc<Activity>,
+    /// The control channel, for pausing the host's main stream while the
+    /// tab is in the background (plans/08 P6).
+    ctl: Sender<Vec<u8>>,
+    /// The host advertised `vpause`.
+    host_vpause: bool,
+    /// Whether the host is (to be) streaming the main video to this tab: it
+    /// starts streaming, so a session born active sends nothing.
+    streaming: AtomicBool,
 }
 
 impl TabGate {
-    /// Only atomics and a non-blocking queue send: safe under `reg`.
+    pub(crate) fn new(
+        view: Arc<active::SessionView>,
+        activity: Arc<Activity>,
+        ctl: Sender<Vec<u8>>,
+        host_vpause: bool,
+    ) -> Self {
+        TabGate {
+            view,
+            activity,
+            ctl,
+            host_vpause,
+            streaming: AtomicBool::new(true),
+        }
+    }
+
+    /// Only atomics and non-blocking queue sends: safe under `reg`.
     pub(crate) fn set_active(&self, active: bool) {
         self.activity.set(active);
         self.view.set_active(active);
+        // Background tabs pause (08a §6.14). Ordered on the reliable control
+        // channel, so a quick back-and-forth ends in the right state; queued
+        // until the channel opens when the session is still starting.
+        if self.streaming.swap(active, Ordering::SeqCst) == active {
+            return;
+        }
+        let msg = match (self.host_vpause, active) {
+            (true, false) => ControlMsg::VideoPause,
+            (true, true) => ControlMsg::VideoResume,
+            // An older host keeps streaming; the viewer just stops decoding
+            // (media/viewer.rs) and asks for a fresh start when back.
+            (false, false) => return,
+            (false, true) => ControlMsg::KeyframeRequest { s: 0 },
+        };
+        let _ = self.ctl.send(serialize(&msg));
     }
 }
 
@@ -541,6 +586,8 @@ pub(crate) struct ViewerStart {
     pub(crate) surface: Option<Arc<dyn platform_api::VideoSurface>>,
     pub(crate) codec: platform_api::Codec,
     pub(crate) host_os: OsFamily,
+    /// The host pauses a background tab's video on request (P6).
+    pub(crate) host_vpause: bool,
     pub(crate) permission: Permission,
     pub(crate) ended: Arc<AtomicBool>,
 }
@@ -556,6 +603,7 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
         surface,
         codec,
         host_os,
+        host_vpause,
         permission,
         ended,
     } = start;
@@ -632,10 +680,12 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
     let activity = Arc::new(activity);
     engine.attach_gate(
         id,
-        Arc::new(TabGate {
-            view: view.clone(),
-            activity: activity.clone(),
-        }),
+        Arc::new(TabGate::new(
+            view.clone(),
+            activity.clone(),
+            ctl_tx.clone(),
+            host_vpause,
+        )),
     );
     let clip_on = activity.clip_on.clone();
     let (clip_tx, clip_rx) = std::sync::mpsc::channel::<String>();
@@ -1315,6 +1365,12 @@ impl Session {
             ((v >> 32) as u32, v as u32)
         })
     }
+    /// Encoded units the main stream has sent, or `None` on a viewer session.
+    pub(crate) fn main_units(&self) -> Option<u64> {
+        self.hooks
+            .as_ref()
+            .map(|h| h.shared.main_units.load(Ordering::SeqCst))
+    }
     /// Force the bandwidth estimate to `bps` (0 = release to the real estimate).
     pub(crate) fn inject_bwe(&self, bps: u32) {
         if let Some(h) = &self.hooks {
@@ -1337,6 +1393,45 @@ mod tests {
             slot: 0,
             current: Arc::default(),
         }
+    }
+
+    /// What a tab's host is told as it goes to the background and back (P6):
+    /// pause / resume to a host that offers it, a keyframe request to an older
+    /// one when back; never a repeat of the same state.
+    #[test]
+    fn background_tabs_pause_their_host() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let sent_for = |vpause: bool, steps: &[bool]| -> Vec<String> {
+            let surface = platform_api::mock::MockSurface::new((64, 64));
+            let view = active::SessionView::new(
+                surface,
+                Arc::default(),
+                Arc::default(),
+                active::applier(rt.handle()),
+                false,
+            );
+            let (activity, _wake) = Activity::new(true, false);
+            let (ctl_tx, ctl_rx) = std::sync::mpsc::channel();
+            let gate = TabGate::new(view, Arc::new(activity), ctl_tx, vpause);
+            for &on in steps {
+                gate.set_active(on);
+            }
+            ctl_rx
+                .try_iter()
+                .map(|b| String::from_utf8(b).unwrap())
+                .collect()
+        };
+        // Born active: the host streams already, nothing to say.
+        assert!(sent_for(true, &[true, true]).is_empty());
+        assert_eq!(
+            sent_for(true, &[false, false, true, false]),
+            [
+                r#"{"t":"vpause"}"#,
+                r#"{"t":"vresume"}"#,
+                r#"{"t":"vpause"}"#
+            ]
+        );
+        assert_eq!(sent_for(false, &[false, true]), [r#"{"t":"kf"}"#]);
     }
 
     /// D14: a pop-out window's pointer input is preceded by ONE switch of the

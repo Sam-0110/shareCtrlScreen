@@ -77,6 +77,11 @@ pub enum SignalMsg {
         /// opaquely by the server, like `codec`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         os: Option<String>,
+        /// What the host supports beyond the base contract (plans/08 P6). Absent
+        /// (older hosts) means nothing; older viewers ignore it. Relayed
+        /// opaquely by the server.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caps: Option<HostCaps>,
     },
 
     /// WebRTC negotiation (contract §3.2 step 4). `data` is opaque to the server.
@@ -140,6 +145,18 @@ pub struct Caps {
     /// single-track session they understand; older hosts ignore it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub popout: bool,
+}
+
+/// The host's capabilities, in its connect-response (the counterpart of the
+/// viewer's [`Caps`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostCaps {
+    /// The host pauses the main video on [`crate::ControlMsg::VideoPause`] and
+    /// resumes it with a keyframe on [`crate::ControlMsg::VideoResume`]
+    /// (background tabs, plans/08 §3.7). Without it the viewer keeps
+    /// receiving and simply does not decode a background tab.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vpause: bool,
 }
 
 /// The opaque WebRTC negotiation payload carried inside `signal.data`
@@ -234,6 +251,7 @@ mod tests {
             reason: None,
             codec: Some("H264".into()),
             os: Some("macos".into()),
+            caps: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
@@ -253,8 +271,39 @@ mod tests {
             reason: Some("busy".into()),
             codec: None,
             os: None,
+            caps: None,
         };
-        assert!(!serde_json::to_string(&none).unwrap().contains("\"os\""));
+        let text = serde_json::to_string(&none).unwrap();
+        assert!(!text.contains("\"os\"") && !text.contains("\"caps\""));
+    }
+
+    #[test]
+    fn host_caps_are_optional_and_additive() {
+        let m = SignalMsg::ConnectResponse {
+            to: None,
+            from: None,
+            accepted: true,
+            permission: Some("view".into()),
+            reason: None,
+            codec: None,
+            os: None,
+            caps: Some(HostCaps { vpause: true }),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(v["caps"]["vpause"], true);
+        // An older host sends none; an empty object reads as no capabilities.
+        let old: SignalMsg = serde_json::from_str(
+            r#"{"type":"connect-response","from":"h","accepted":true,"caps":{}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            old,
+            SignalMsg::ConnectResponse {
+                caps: Some(HostCaps { vpause: false }),
+                ..
+            }
+        ));
     }
 
     #[test]

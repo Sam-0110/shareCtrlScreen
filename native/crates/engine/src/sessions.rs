@@ -43,6 +43,16 @@ impl Drop for Admission<'_> {
     }
 }
 
+/// What a host says about itself in an accepting connect-response.
+pub(crate) struct HostTraits {
+    /// The codec it will stream (absent: H.264).
+    pub(crate) codec: Option<String>,
+    /// Its OS family, for modifier translation (absent: unknown).
+    pub(crate) os: Option<String>,
+    /// Its capabilities beyond the base contract.
+    pub(crate) caps: Option<protocol::HostCaps>,
+}
+
 fn refuse(engine: &Engine, to: String, reason: &str) {
     let _ = engine.signaling.send(SignalMsg::ConnectResponse {
         to: Some(to),
@@ -52,6 +62,7 @@ fn refuse(engine: &Engine, to: String, reason: &str) {
         reason: Some(reason.into()),
         codec: None,
         os: None,
+        caps: None,
     });
 }
 
@@ -283,6 +294,8 @@ impl Engine {
             os: modifiers::OsFamily::from_name(self.platform.info().name)
                 .wire_name()
                 .map(String::from),
+            // It pauses a background tab's main stream on request (P6).
+            caps: Some(protocol::HostCaps { vpause: true }),
         });
         self.emit(
             id,
@@ -566,15 +579,16 @@ impl Engine {
         );
     }
 
+    /// `host`: what an accepting host said about itself.
     pub(crate) async fn on_connect_response(
         &self,
         from: String,
         accepted: bool,
         permission: Option<String>,
         reason: Option<String>,
-        codec: Option<String>,
-        os: Option<String>,
+        host: HostTraits,
     ) {
+        let HostTraits { codec, os, caps } = host;
         let perm = match permission.as_deref() {
             Some("control") => Permission::Control,
             _ => Permission::View,
@@ -615,6 +629,7 @@ impl Engine {
                 v.host_os = os
                     .as_deref()
                     .map_or(modifiers::OsFamily::Unknown, modifiers::OsFamily::from_name);
+                v.host_vpause = caps.is_some_and(|c| c.vpause);
             }
             (id, blocked, pending, auto)
         };
@@ -1135,6 +1150,7 @@ impl Engine {
             surface: v.surface.clone(),
             codec: v.codec,
             host_os: v.host_os,
+            host_vpause: v.host_vpause,
             permission: v.permission,
             ended: v.ended.clone(),
         })

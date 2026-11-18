@@ -80,6 +80,9 @@ pub(crate) struct ViewerSlot {
     pub(crate) codec: Codec,
     /// The host's OS, for modifier translation (D8).
     pub(crate) host_os: OsFamily,
+    /// The host pauses a background tab's video on request (from its
+    /// connect-response caps, P6).
+    pub(crate) host_vpause: bool,
     /// Where its video is presented.
     pub(crate) surface: Option<Arc<dyn VideoSurface>>,
     /// The workspace the connection was started in and its epoch, so the
@@ -112,6 +115,7 @@ impl ViewerSlot {
             permission: Permission::View,
             codec: Codec::H264,
             host_os: OsFamily::Unknown,
+            host_vpause: false,
             surface,
             workspace: None,
             starting: false,

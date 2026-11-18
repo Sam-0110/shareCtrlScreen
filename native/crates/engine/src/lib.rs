@@ -437,9 +437,11 @@ impl Engine {
                 reason,
                 codec,
                 os,
+                caps,
                 ..
             } => {
-                self.on_connect_response(from, accepted, permission, reason, codec, os)
+                let host = sessions::HostTraits { codec, os, caps };
+                self.on_connect_response(from, accepted, permission, reason, host)
                     .await;
             }
             SignalMsg::PasswordRequired {
@@ -631,6 +633,12 @@ impl Engine {
         self.with_host_session(|s| s.raw_link_bps())
     }
 
+    /// Encoded units the host session's main stream has sent.
+    #[doc(hidden)]
+    pub fn test_main_units(&self) -> Option<u64> {
+        self.with_host_session(|s| s.main_units())
+    }
+
     /// The host session's current encode size `(w, h)`.
     #[doc(hidden)]
     pub fn test_encode_dims(&self) -> Option<(u32, u32)> {
@@ -645,18 +653,6 @@ impl Engine {
             s.inject_bwe(bps);
             Some(())
         });
-    }
-
-    /// Whether viewer session `id` has decoded video (its view is ready to
-    /// show), whether or not it is shown.
-    #[doc(hidden)]
-    pub fn test_view_ready(&self, id: SessionId) -> bool {
-        self.reg
-            .lock()
-            .viewers
-            .get(&id)
-            .and_then(|v| v.gate.as_ref())
-            .is_some_and(|g| g.view.is_ready())
     }
 
     /// Cut session `id`'s link as a dead network would: its transport declares

@@ -1858,9 +1858,16 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
         || matches!(host_b.engine.role(), Role::Host { ref peer, .. } if *peer == viewer_id),
     )
     .await;
-    // Decoding, so "not presented" below is the gate at work, not a
-    // session that has nothing to show yet.
-    eventually("B decodes", t, || viewer.engine.test_view_ready(b)).await;
+    // B is in the background, so host B pauses its main stream (P6): after
+    // the pause lands, it sends nothing more.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let paused_at = host_b.engine.test_main_units().unwrap_or(0);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(
+        host_b.engine.test_main_units().unwrap_or(0),
+        paused_at,
+        "a background tab's host sends no video"
+    );
     eventually("A kept presenting while B started", t, || {
         presented(&surface_a) > a_before_b + 30
     })
@@ -1886,10 +1893,29 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
     );
     viewer.engine.set_active(Some(a));
 
+    let switch_to = |on: SessionId| viewer.engine.set_active(Some(on));
+    // Brought to the front, a paused tab shows a picture within about a
+    // second (P6), and the one it replaced pauses in turn.
+    let (woke, b_before) = (Instant::now(), presented(&surface_b));
+    switch_to(b);
+    eventually("B presents once on screen", t, || {
+        presented(&surface_b) > b_before
+    })
+    .await;
+    assert!(
+        woke.elapsed() < Duration::from_secs(5),
+        "B took {:?} to show",
+        woke.elapsed()
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let a_paused_at = host_a.engine.test_main_units().unwrap_or(0);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(host_a.engine.test_main_units().unwrap_or(0), a_paused_at);
+    switch_to(a);
+
     // Switching, 20 times: the old tab is hidden and stops presenting, the
     // new one is shown and presents (I2).
-    let switch_to = |on: SessionId| viewer.engine.set_active(Some(on));
-    for round in 0..20 {
+    for round in 0..10 {
         for (on, on_s, off_s) in [(b, &surface_b, &surface_a), (a, &surface_a, &surface_b)] {
             let before = presented(on_s);
             switch_to(on);

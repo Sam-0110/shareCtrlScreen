@@ -122,6 +122,18 @@ pub(crate) fn viewer_media_loop(
                     pending.push(next);
                 }
 
+                // A background tab (P6): dropped unseen, not decoded. When it is
+                // back on screen the decoder restarts from a keyframe — the
+                // gate asks the host for one (resume, or a keyframe request to
+                // an older host), and `awaiting_keyframe` keeps deltas out and
+                // asks again each second until it comes.
+                if view.as_ref().is_some_and(|v| !v.is_active()) {
+                    skipped += pending.len() as u64;
+                    awaiting_keyframe = true;
+                    last_kf_req = std::time::Instant::now();
+                    continue;
+                }
+
                 if let Some(k) = pending.iter().rposition(|(_, kf)| *kf) {
                     // A keyframe is queued: decoding from the NEWEST one is
                     // always valid — everything older is pure latency. Skip it.
