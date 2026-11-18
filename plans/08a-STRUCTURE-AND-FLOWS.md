@@ -85,6 +85,17 @@ src/media/viewer.rs       no self-show(); drop-without-decode while inactive (ol
 src/media/host.rs         honours VPause/VResume for slot 0
 ```
 
+As built in P2: the registry is `session/registry.rs` (one host slot, the viewer slots, the
+admission in progress, all under one lock `reg`, taken after `ws`); the lifecycle is
+`sessions.rs`; the events are `events.rs` (`UiEvent::Session { id, peer, host, ev }`; the host
+session has a `SessionId` too). `Engine::connect(peer, surface)` reserves and connects in one
+call (the app's `TabManager` in P4 may split it again with `reserve_session`); `disconnect(id)`,
+`end_all()` and `end_viewer_sessions(reason)` end sessions, each emitting `Phase(Ended)` at
+once and `Released` from a reaper thread after the join. A dead link is reported by the
+transport thread over the engine's ended channel. `set_active`/`set_overlay` (the ActiveGate)
+arrive with P3; until then the app shows one session and `bridge.rs` translates the tagged
+events into the single-session UI events.
+
 Signaling: `app/src/main.rs`'s one `while … handle_signaling(event).await` loop stays the
 **dispatcher** only. Per-message work that can wait (secret-store opens, the host approval
 decision, bad-password delay, ICE gathering, `begin_host`, `start_viewer`) runs in a task

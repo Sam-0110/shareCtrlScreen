@@ -43,7 +43,7 @@ pub(crate) struct HostCtx {
     pub ctl_tx: Sender<Vec<u8>>,
     /// The host's own UI: the monitor list for its picker, and why a monitor
     /// switch failed.
-    pub ui: tokio::sync::mpsc::UnboundedSender<crate::UiEvent>,
+    pub ui: crate::SessionUi,
     /// Encoded AUs to the transport, tagged with their video stream slot.
     pub frame_tx: Sender<(u8, Vec<u8>, bool)>,
     /// Cursor positions to the transport (unreliable-latest channel).
@@ -170,7 +170,7 @@ fn announce_displays(
     current: &str,
     popouts: &[protocol::PopoutStream],
     ctl_tx: &Sender<Vec<u8>>,
-    ui: &tokio::sync::mpsc::UnboundedSender<crate::UiEvent>,
+    ui: &crate::SessionUi,
 ) {
     let list: Vec<protocol::RemoteDisplay> = displays
         .iter()
@@ -188,7 +188,7 @@ fn announce_displays(
         popouts: popouts.to_vec(),
     };
     let _ = ctl_tx.send(serde_json::to_vec(&msg).unwrap_or_default());
-    let _ = ui.send(crate::UiEvent::Displays {
+    ui.send(crate::SessionEvent::Displays {
         list,
         current: current.to_string(),
         can_switch: true,
@@ -243,7 +243,7 @@ pub(crate) fn start_popout(ctx: &HostCtx, id: &str) -> bool {
             let stream_stop = spec.stream_stop.clone();
             if let Err(e) = host_media_loop(thread_ctx.clone(), spec) {
                 tracing::warn!("host pop-out stream {slot} ended: {e}");
-                let _ = thread_ctx.ui.send(crate::UiEvent::Toast(format!(
+                thread_ctx.ui.send(crate::SessionEvent::Toast(format!(
                     "Could not show that monitor in a separate window: {e}"
                 )));
             }
@@ -473,7 +473,7 @@ pub(crate) fn host_media_loop(
             match displays.iter().find(|d| d.id == want_id) {
                 None => {
                     tracing::warn!("host: monitor switch to {want_id:?}: no such display");
-                    let _ = ui.send(crate::UiEvent::Toast(
+                    ui.send(crate::SessionEvent::Toast(
                         "That monitor is no longer connected".into(),
                     ));
                 }
@@ -536,7 +536,7 @@ pub(crate) fn host_media_loop(
                                         "host: monitor switch to {:?}: no encoder ({e})",
                                         d.id
                                     );
-                                    let _ = ui.send(crate::UiEvent::Toast(format!(
+                                    ui.send(crate::SessionEvent::Toast(format!(
                                         "Could not switch monitors: {e}"
                                     )));
                                 }
@@ -544,7 +544,7 @@ pub(crate) fn host_media_loop(
                         }
                         Err(e) => {
                             tracing::warn!("host: monitor switch to {:?}: {e}", d.id);
-                            let _ = ui.send(crate::UiEvent::Toast(format!(
+                            ui.send(crate::SessionEvent::Toast(format!(
                                 "Could not switch monitors: {e}"
                             )));
                         }

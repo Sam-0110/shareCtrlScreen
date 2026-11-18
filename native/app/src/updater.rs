@@ -256,7 +256,7 @@ pub async fn updater_install(
         return Ok(());
     }
 
-    state.engine.end_session();
+    state.engine.end_all();
 
     let updater = app.updater().map_err(|e| e.to_string())?;
     let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {

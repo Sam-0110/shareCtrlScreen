@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use platform_api::{InputInjector, Platform, Rect, VideoSurface};
 use protocol::SignalData;
 
@@ -109,11 +108,15 @@ pub(super) struct Driver {
     /// telemetry and loopback observation; V2 does not steer the encode size from
     /// it (no resolution ladder), so it only tracks what the estimate read.
     pub(super) link: Option<Arc<std::sync::atomic::AtomicU32>>,
-    /// Notify the UI + reset the role when the transport dies unexpectedly (the
-    /// driver thread has no `&Engine`). This is the fix for "you get disconnected
-    /// but the controller thinks it's still alive with no notification."
-    pub(super) ui: tokio::sync::mpsc::UnboundedSender<crate::UiEvent>,
-    pub(super) role: Arc<Mutex<crate::Role>>,
+    /// Where its events go, tagged with this session (the driver thread has
+    /// no `&Engine`).
+    pub(super) ui: crate::SessionUi,
+    /// Set once the session ends, by whichever side notices first: this
+    /// thread on a dead link, or the engine on a disconnect.
+    pub(super) ended: Arc<AtomicBool>,
+    /// Where a dead link is reported, for the engine to end this session.
+    pub(super) end_tx: tokio::sync::mpsc::UnboundedSender<(crate::SessionId, crate::EndReason)>,
+    pub(super) id: crate::SessionId,
     /// The bound UDP socket (candidates were gathered from it before the SDP was
     /// generated, so the peer receives them embedded in the offer/answer).
     pub(super) socket: std::net::UdpSocket,
@@ -179,7 +182,9 @@ pub(super) fn transport_driver(d: Driver) {
         bitrate,
         link: link_bw,
         ui,
-        role,
+        ended,
+        end_tx,
+        id,
         socket,
         mut turn,
         stop,
@@ -193,18 +198,18 @@ pub(super) fn transport_driver(d: Driver) {
     } = d;
     use transport::{Inbound, Transport};
 
-    // Liveness: report the disconnect to the UI and reset the role exactly once,
-    // however the loop exits (ICE dead, consent lost, inactivity, error). Without
-    // this the controller sits on a dead session with no notification.
+    // Liveness: end the session exactly once, however the loop exits (ICE dead,
+    // consent lost, inactivity, error) — unless something ended it first.
+    // Without this the controller sits on a dead session with no notification.
     let notify_dead = {
-        let ui = ui.clone();
-        let role = role.clone();
+        let ended = ended.clone();
         let surface = surface.clone();
         let shared = shared.clone();
         move |reason: &str| {
-            let was_active = !matches!(&*role.lock(), crate::Role::Idle);
-            if was_active {
-                *role.lock() = crate::Role::Idle;
+            let first = ended
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+            if first {
                 // Take the native video surface down FIRST. It sits on top of the
                 // web UI, so leaving it up means the user keeps staring at the
                 // last decoded frame while the app thinks it is idle — the
@@ -219,10 +224,11 @@ pub(super) fn transport_driver(d: Driver) {
                     s.hide();
                     s.set_input_sink(None);
                 }
-                let _ = ui.send(crate::UiEvent::Toast(format!("Disconnected: {reason}")));
-                let _ = ui.send(crate::UiEvent::RoleChanged(crate::Role::Idle));
+                // The engine ends it (events, teardown) — the flag is already
+                // set, so it does not run twice.
+                let _ = end_tx.send((id, crate::EndReason::LinkLost(reason.to_string())));
             }
-            was_active
+            first
         }
     };
 
@@ -238,7 +244,7 @@ pub(super) fn transport_driver(d: Driver) {
             }
             Err(e) => {
                 tracing::warn!("remote control unavailable: {e}");
-                let _ = ui.send(crate::UiEvent::Toast(format!(
+                ui.send(crate::SessionEvent::Toast(format!(
                     "Remote control is unavailable on this computer: {e}"
                 )));
                 None
@@ -351,6 +357,13 @@ pub(super) fn transport_driver(d: Driver) {
     let mut buf = [0u8; 2048];
     let mut video_count: u64 = 0;
     while !stop.load(Ordering::SeqCst) {
+        // Test hook: a link that dies right now, as a dead network would
+        // make it (the loopback has no network to cut).
+        #[cfg(feature = "test-hooks")]
+        if shared.sever.load(Ordering::SeqCst) {
+            notify_dead("severed by a test");
+            break;
+        }
         // Liveness: once connected, no traffic for DEAD_AFTER ⇒ declare it dead.
         if connected && last_rx.elapsed() > DEAD_AFTER {
             tracing::warn!("transport: no data for {DEAD_AFTER:?} — declaring dead");
@@ -393,7 +406,7 @@ pub(super) fn transport_driver(d: Driver) {
                 if last_trouble_tick.elapsed() >= std::time::Duration::from_millis(900) {
                     last_trouble_tick = std::time::Instant::now();
                     let left = PONG_GRACE.saturating_sub(silent).as_secs() as u32;
-                    let _ = ui.send(crate::UiEvent::LinkTrouble { secs_left: left });
+                    ui.send(crate::SessionEvent::LinkTrouble { secs_left: left });
                 }
             } else if link_trouble {
                 // Answered again within the grace period — carry on.
@@ -420,7 +433,7 @@ pub(super) fn transport_driver(d: Driver) {
                         |b| tp.send_ctl(b),
                     );
                 }
-                let _ = ui.send(crate::UiEvent::LinkRestored);
+                ui.send(crate::SessionEvent::LinkRestored);
             }
         }
         // Field-test telemetry: one INFO line per 5s per side.
@@ -843,7 +856,7 @@ pub(super) fn transport_driver(d: Driver) {
                                     }
                                     // The monitor picker follows control.
                                     if let Some((list, current, popouts)) = &remote_displays {
-                                        let _ = ui.send(crate::UiEvent::Displays {
+                                        ui.send(crate::SessionEvent::Displays {
                                             list: list.clone(),
                                             current: current.clone(),
                                             can_switch: control,
@@ -861,7 +874,7 @@ pub(super) fn transport_driver(d: Driver) {
                                     popouts,
                                 }) => {
                                     if !host_side {
-                                        let _ = ui.send(crate::UiEvent::Displays {
+                                        ui.send(crate::SessionEvent::Displays {
                                             list: list.clone(),
                                             current: current.clone(),
                                             can_switch: shared.control.load(Ordering::SeqCst),
@@ -1024,7 +1037,7 @@ pub(super) fn transport_driver(d: Driver) {
                                                 meta.name,
                                                 meta.size
                                             );
-                                            let _ = ui.send(crate::UiEvent::Toast(format!(
+                                            ui.send(crate::SessionEvent::Toast(format!(
                                                 "Receiving {}…",
                                                 meta.name
                                             )));
@@ -1032,7 +1045,7 @@ pub(super) fn transport_driver(d: Driver) {
                                         }
                                         Err(e) => {
                                             tracing::warn!("refused file {}: {e}", meta.name);
-                                            let _ = ui.send(crate::UiEvent::Toast(format!(
+                                            ui.send(crate::SessionEvent::Toast(format!(
                                                 "Refused file: {e}"
                                             )));
                                         }
@@ -1042,7 +1055,7 @@ pub(super) fn transport_driver(d: Driver) {
                                     if let Some(inc) = incoming.as_mut() {
                                         if let Err(e) = inc.write(&data) {
                                             tracing::warn!("file transfer failed: {e}");
-                                            let _ = ui.send(crate::UiEvent::Toast(format!(
+                                            ui.send(crate::SessionEvent::Toast(format!(
                                                 "Transfer failed: {e}"
                                             )));
                                             if let Some(bad) = incoming.take() {
@@ -1072,7 +1085,7 @@ pub(super) fn transport_driver(d: Driver) {
                                                     platform.as_ref(),
                                                     paste_dropped,
                                                 );
-                                                let _ = ui.send(crate::UiEvent::Toast(if pasted {
+                                                ui.send(crate::SessionEvent::Toast(if pasted {
                                                     format!("Pasted {name}")
                                                 } else {
                                                     format!(
@@ -1082,7 +1095,7 @@ pub(super) fn transport_driver(d: Driver) {
                                                 }));
                                             }
                                             Err(e) => {
-                                                let _ = ui.send(crate::UiEvent::Toast(format!(
+                                                ui.send(crate::SessionEvent::Toast(format!(
                                                     "Transfer failed: {e}"
                                                 )));
                                             }
@@ -1094,7 +1107,7 @@ pub(super) fn transport_driver(d: Driver) {
                                         inc.abort();
                                     }
                                     tracing::warn!("sender aborted transfer: {reason}");
-                                    let _ = ui.send(crate::UiEvent::Toast(
+                                    ui.send(crate::SessionEvent::Toast(
                                         "Transfer cancelled by sender".into(),
                                     ));
                                 }
@@ -1170,11 +1183,10 @@ pub(super) fn transport_driver(d: Driver) {
         }
     }
 
-    // If the transport died (role still active), also stop the session's other
-    // threads so nothing keeps running behind a dead connection.
-    if !matches!(&*role.lock(), crate::Role::Idle) {
-        stop.store(true, Ordering::SeqCst);
-    }
+    // However the transport ended, the rest of the session stops with it, so
+    // nothing keeps running behind a dead connection (a no-op when the session
+    // was already being stopped).
+    stop.store(true, Ordering::SeqCst);
     // Host: whatever ends the session (disconnect, teardown, transport error),
     // never leave remotely-injected keys/buttons held down on this machine.
     if let Some(inj) = injector.as_mut() {

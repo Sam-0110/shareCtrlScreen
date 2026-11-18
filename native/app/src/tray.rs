@@ -83,7 +83,7 @@ pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     api.prevent_close();
     let engine = &window.app_handle().state::<AppState>().engine;
     if !matches!(engine.role(), Role::Idle) {
-        engine.end_session();
+        engine.end_all();
     }
     if let Err(e) = window.hide() {
         tracing::warn!("hiding the window to the tray failed: {e}");
@@ -109,7 +109,7 @@ pub fn handle_menu_event(app: &tauri::AppHandle, id: &str) -> bool {
         OPEN_ID => crate::raise_main_window(app),
         QUIT_ID => {
             tracing::info!("Quit from the tray: ending any session and exiting");
-            app.state::<AppState>().engine.end_session();
+            app.state::<AppState>().engine.end_all();
             app.exit(0);
         }
         _ => return false,

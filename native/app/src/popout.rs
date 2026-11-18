@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use engine::Engine;
+use engine::{Engine, SessionId};
 use protocol::{PopoutStream, RemoteDisplay};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -50,6 +50,8 @@ const ATTACH_WAIT: Duration = Duration::from_secs(3);
 
 /// One pop-out window.
 struct Entry {
+    /// The viewer session it belongs to.
+    session: SessionId,
     /// The monitor id it shows.
     id: String,
     label: String,
@@ -104,10 +106,11 @@ fn wanted(popouts: &[PopoutStream]) -> Vec<PopoutStream> {
 }
 
 /// Make the open pop-out windows match the host's latest announcement
-/// (viewer only; the caller checks the role).
+/// for viewer session `session` (the caller checks it is a viewer session).
 pub fn reconcile(
     app: &AppHandle,
     engine: &Arc<Engine>,
+    session: SessionId,
     list: &[RemoteDisplay],
     popouts: &[PopoutStream],
 ) {
@@ -138,6 +141,7 @@ pub fn reconcile(
             open.insert(
                 p.s,
                 Entry {
+                    session,
                     id: p.id.clone(),
                     label: label.clone(),
                     gen: None,
@@ -152,7 +156,14 @@ pub fn reconcile(
         close_window(app, engine, slot, e, false);
     }
     for (p, label) in new {
-        open_window(app, engine, &p, label, list.iter().find(|d| d.id == p.id));
+        open_window(
+            app,
+            engine,
+            session,
+            &p,
+            label,
+            list.iter().find(|d| d.id == p.id),
+        );
     }
 }
 
@@ -192,6 +203,7 @@ pub fn on_close_requested(app: &AppHandle, engine: &Arc<Engine>, label: &str) ->
 fn open_window(
     app: &AppHandle,
     engine: &Arc<Engine>,
+    session: SessionId,
     p: &PopoutStream,
     label: String,
     display: Option<&RemoteDisplay>,
@@ -218,7 +230,7 @@ fn open_window(
             }
             // Stop the stream nobody can see.
             let engine = engine.clone();
-            std::thread::spawn(move || engine.close_popout(slot, None));
+            std::thread::spawn(move || engine.close_popout(session, slot, None));
             return;
         }
     };
@@ -227,11 +239,12 @@ fn open_window(
     let (engine, app) = (engine.clone(), app.clone());
     std::thread::spawn(move || {
         let deadline = Instant::now() + ATTACH_WAIT;
-        while engine.popout_attached(slot) && Instant::now() < deadline {
+        while engine.popout_attached(session, slot) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         let app2 = app.clone();
-        let queued = app.run_on_main_thread(move || attach(&app2, &engine, &win, slot, &label));
+        let queued =
+            app.run_on_main_thread(move || attach(&app2, &engine, &win, session, slot, &label));
         if let Err(e) = queued {
             tracing::warn!("pop-out window {slot}: {e}");
         }
@@ -245,6 +258,7 @@ fn attach(
     app: &AppHandle,
     engine: &Arc<Engine>,
     win: &tauri::WebviewWindow,
+    session: SessionId,
     slot: u8,
     label: &str,
 ) {
@@ -260,7 +274,7 @@ fn attach(
         let _ = win.destroy();
         return;
     };
-    match make_surface(engine, win, slot).and_then(|s| engine.attach_popout(slot, s)) {
+    match make_surface(engine, win, slot).and_then(|s| engine.attach_popout(session, slot, s)) {
         Some(gen) => {
             entry.gen = Some(gen);
             tracing::info!("pop-out window {slot} attached");
@@ -270,7 +284,7 @@ fn attach(
             open.remove(&slot);
             let (engine, win) = (engine.clone(), win.clone());
             std::thread::spawn(move || {
-                engine.close_popout(slot, None);
+                engine.close_popout(session, slot, None);
                 let _ = win.destroy();
             });
         }
@@ -313,9 +327,9 @@ fn close_window(app: &AppHandle, engine: &Arc<Engine>, slot: u8, e: Entry, tell_
     let engine = engine.clone();
     std::thread::spawn(move || {
         if tell_host {
-            engine.close_popout(slot, e.gen);
+            engine.close_popout(e.session, slot, e.gen);
         } else {
-            engine.detach_popout(slot, e.gen);
+            engine.detach_popout(e.session, slot, e.gen);
         }
         if let Some(win) = win {
             let _ = win.destroy();

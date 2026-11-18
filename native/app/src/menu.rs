@@ -169,17 +169,19 @@ pub(crate) fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::Menu
             let _ = app.emit("menu://check-updates", ());
         }
         "menu-end-session" => {
-            app.state::<AppState>().engine.end_session();
+            app.state::<AppState>().engine.end_all();
         }
         other => {
+            // The Monitor menu belongs to the viewer session on screen (one
+            // until the tab UI, plans/08 P4).
+            let engine = &app.state::<AppState>().engine;
+            let Some(session) = engine.viewer_sessions().first().copied() else {
+                return;
+            };
             if let Some(id) = other.strip_prefix(MENU_DISPLAY_PREFIX) {
-                app.state::<AppState>()
-                    .engine
-                    .select_display(id.to_string());
+                engine.select_display(session, id.to_string());
             } else if let Some(id) = other.strip_prefix(MENU_POPOUT_PREFIX) {
-                app.state::<AppState>()
-                    .engine
-                    .popout_display(id.to_string());
+                engine.popout_display(session, id.to_string());
             }
         }
     }

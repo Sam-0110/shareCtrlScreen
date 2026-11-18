@@ -118,7 +118,11 @@ pub fn get_role(state: tauri::State<'_, AppState>) -> String {
 
 #[tauri::command]
 pub fn connect_to(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-    state.engine.connect_to(id).map_err(|e| e.to_string())
+    state
+        .engine
+        .connect(&id, None)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -128,9 +132,23 @@ pub fn submit_password(
     password: String,
     remember: Option<bool>,
 ) {
-    state
+    // The session waiting for this host's password.
+    let id = state
         .engine
-        .submit_password(host, password, remember.unwrap_or(false));
+        .viewer_sessions()
+        .into_iter()
+        .find(|id| state.engine.session_peer(*id).as_deref() == Some(host.as_str()));
+    if let Some(id) = id {
+        state
+            .engine
+            .submit_password(id, password, remember.unwrap_or(true));
+    }
+}
+
+/// The viewer session the UI is showing. Until the tab UI (plans/08 P4) there
+/// is at most one.
+fn current_viewer(state: &AppState) -> Option<engine::SessionId> {
+    state.engine.viewer_sessions().into_iter().next()
 }
 
 #[tauri::command]
@@ -145,20 +163,25 @@ pub fn set_permission(state: tauri::State<'_, AppState>, value: String) {
 
 #[tauri::command]
 pub fn end_session(state: tauri::State<'_, AppState>) {
-    state.engine.end_session();
+    state.engine.end_all();
 }
 
 /// Viewer: ask the host for a fresh keyframe (clears smear after packet loss).
 #[tauri::command]
 pub fn request_refresh(state: tauri::State<'_, AppState>) {
-    state.engine.request_refresh();
+    if let Some(id) = current_viewer(&state) {
+        state.engine.request_refresh(id);
+    }
 }
 
 /// Switch the shared monitor mid-session (host: directly; viewer: asks the
 /// host, which needs control). The result arrives as a `displays` event.
 #[tauri::command]
 pub fn select_display(state: tauri::State<'_, AppState>, id: String) {
-    state.engine.select_display(id);
+    match current_viewer(&state) {
+        Some(viewer) => state.engine.select_display(viewer, id),
+        None => state.engine.host_select_display(id),
+    }
 }
 
 /// The `displays` event payload: the host's monitors, the one shared now, and
@@ -197,7 +220,9 @@ pub(crate) fn displays_json(
 /// needs control). The window opens when the host's `displays` lists it.
 #[tauri::command]
 pub fn popout_display(state: tauri::State<'_, AppState>, id: String) {
-    state.engine.popout_display(id);
+    if let Some(viewer) = current_viewer(&state) {
+        state.engine.popout_display(viewer, id);
+    }
 }
 
 /// How a monitor is labelled in the pickers and pop-out titles (the web UI
@@ -216,7 +241,9 @@ pub(crate) fn display_label(d: &protocol::RemoteDisplay) -> String {
 /// visible mid-session — the native surface otherwise covers them.
 #[tauri::command]
 pub fn set_video_visible(state: tauri::State<'_, AppState>, visible: bool) {
-    state.engine.set_video_visible(visible);
+    if let Some(id) = current_viewer(&state) {
+        state.engine.set_video_visible(id, visible);
+    }
 }
 
 #[tauri::command]

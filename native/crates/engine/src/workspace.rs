@@ -15,10 +15,9 @@
 //! which resolves the active workspace, stamps with the engine's [`Stamper`],
 //! persists, and wakes the account sync.
 //!
-//! **Lock order.** `ws` (this module's state) is taken before `config`, never
-//! the other way round; the session locks (`role`, `admitting`, `outbound`)
-//! are never held while either is taken here, and no event is sent and no
-//! secret store is called under them.
+//! **Lock order.** `ws` (this module's state) → `reg` (the sessions) →
+//! `config`, never the other way round. No event is sent and no secret store
+//! is called while any of them is held.
 //!
 //! ## References
 //! - plans/08a-STRUCTURE-AND-FLOWS.md §3 (types), §5.3 (account states),
@@ -34,7 +33,7 @@ use protocol::config::{AccountRef, Prefs, Workspace, LOCAL_WORKSPACE};
 use protocol::sync::{now_ms, Stamper, SyncDoc};
 use protocol::Config;
 
-use crate::{Engine, Role, UiEvent, SECRET_PROMPT_TIMEOUT};
+use crate::{Engine, UiEvent, SECRET_PROMPT_TIMEOUT};
 
 /// Which workspace this computer is using.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,7 +228,7 @@ impl Engine {
     pub async fn switch_workspace(&self, to: WorkspaceSel, end_viewer: bool) -> u64 {
         self.ws.lock().switching += 1;
         if end_viewer {
-            self.end_viewer_session();
+            self.end_viewer_sessions(crate::EndReason::AccountSwitch);
         }
         let epoch = {
             let mut ws = self.ws.lock();
@@ -458,16 +457,6 @@ impl Engine {
         }
         let _ = self.ui.send(UiEvent::WorkspaceChanged);
         true
-    }
-
-    /// End the viewer side only: a viewer session, or a connect-request still
-    /// waiting for its answer. A host session is left alone.
-    fn end_viewer_session(&self) {
-        let viewing = matches!(*self.role.lock(), Role::Viewer { .. });
-        let requesting = self.outbound.lock().is_some();
-        if viewing || requesting {
-            self.end_session();
-        }
     }
 
     fn set_token_ref(&self, account: &str, sealed: Option<String>, keep: bool) {

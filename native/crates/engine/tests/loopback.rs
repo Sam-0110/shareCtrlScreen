@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engine::handshake::{ApprovalDecision, Decider};
-use engine::{Engine, IcePolicy, Role, UiEvent};
+use engine::{Engine, IcePolicy, PwReason, Role, SessionEvent, SessionId, SessionPhase, UiEvent};
 use futures_util::{SinkExt, StreamExt};
 use platform_api::mock::MockPlatform;
 use platform_api::{Clipboard, FileDrop, VideoInput};
@@ -156,6 +156,8 @@ struct Peer {
     displays: Arc<std::sync::Mutex<Vec<Announced>>>,
     /// The pop-out streams `(slot, monitor id)` the latest announcement listed.
     popouts: Arc<std::sync::Mutex<Vec<(u8, String)>>>,
+    /// Every session event this side received: (session, what happened).
+    session_log: Arc<std::sync::Mutex<Vec<(SessionId, String)>>>,
 }
 
 /// One monitor announcement: `(ids, current, can_switch)`.
@@ -235,6 +237,8 @@ fn start_peer_full(
     let pp = password_prompts.clone();
     let displays: Arc<std::sync::Mutex<Vec<Announced>>> = Arc::default();
     let popouts: Arc<std::sync::Mutex<Vec<(u8, String)>>> = Arc::default();
+    let session_log: Arc<std::sync::Mutex<Vec<(SessionId, String)>>> = Arc::default();
+    let sl = session_log.clone();
     let (t, r, lt, ds, po) = (
         toasts.clone(),
         roles.clone(),
@@ -246,25 +250,50 @@ fn start_peer_full(
         while let Some(ev) = ui_rx.recv().await {
             match ev {
                 UiEvent::Toast(msg) => t.lock().unwrap().push(msg),
-                UiEvent::RoleChanged(role) => r.lock().unwrap().push(role),
-                UiEvent::PasswordRequired { .. } => {
-                    pp.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                UiEvent::LinkTrouble { .. } => {
-                    lt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                UiEvent::Displays {
-                    list,
-                    current,
-                    can_switch,
-                    popouts,
-                } => {
-                    *po.lock().unwrap() = popouts.into_iter().map(|p| (p.s, p.id)).collect();
-                    ds.lock().unwrap().push((
-                        list.into_iter().map(|d| d.id).collect(),
-                        current,
-                        can_switch,
-                    ))
+                UiEvent::Session { id, peer, host, ev } => {
+                    sl.lock().unwrap().push((id, event_kind(&ev)));
+                    match ev {
+                        SessionEvent::Toast(msg) => t.lock().unwrap().push(msg),
+                        SessionEvent::Phase(SessionPhase::Negotiating { permission }) => {
+                            r.lock().unwrap().push(if host {
+                                Role::Host { peer, permission }
+                            } else {
+                                Role::Viewer { peer, permission }
+                            })
+                        }
+                        SessionEvent::Phase(SessionPhase::Ended(reason)) => {
+                            if let Some(msg) = reason.message() {
+                                t.lock().unwrap().push(msg);
+                            }
+                            r.lock().unwrap().push(Role::Idle);
+                        }
+                        SessionEvent::Phase(SessionPhase::PasswordRequired { reason }) => {
+                            if reason == PwReason::SavedRejected {
+                                t.lock()
+                                    .unwrap()
+                                    .push("Saved password no longer works".into());
+                            }
+                            pp.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        SessionEvent::LinkTrouble { .. } => {
+                            lt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        SessionEvent::Displays {
+                            list,
+                            current,
+                            can_switch,
+                            popouts,
+                        } => {
+                            *po.lock().unwrap() =
+                                popouts.into_iter().map(|p| (p.s, p.id)).collect();
+                            ds.lock().unwrap().push((
+                                list.into_iter().map(|d| d.id).collect(),
+                                current,
+                                can_switch,
+                            ))
+                        }
+                        _ => {}
+                    }
                 }
                 _ => {}
             }
@@ -280,6 +309,7 @@ fn start_peer_full(
         link_trouble,
         displays,
         popouts,
+        session_log,
     }
 }
 
@@ -292,6 +322,28 @@ async fn eventually(what: &str, timeout: Duration, mut cond: impl FnMut() -> boo
     }
 }
 
+/// A short label for a session event, for the session log.
+fn event_kind(ev: &SessionEvent) -> String {
+    match ev {
+        SessionEvent::Phase(SessionPhase::Requesting) => "requesting".into(),
+        SessionEvent::Phase(SessionPhase::PasswordRequired { .. }) => "password".into(),
+        SessionEvent::Phase(SessionPhase::Negotiating { .. }) => "negotiating".into(),
+        SessionEvent::Phase(SessionPhase::Ended(r)) => format!("ended:{r:?}"),
+        SessionEvent::LinkTrouble { .. } => "trouble".into(),
+        SessionEvent::LinkRestored => "restored".into(),
+        SessionEvent::Displays { .. } => "displays".into(),
+        SessionEvent::Toast(_) => "toast".into(),
+        SessionEvent::Released => "released".into(),
+    }
+}
+/// The one viewer session of `p` (the tests start at most one per engine,
+/// except the multi-session test, which names its sessions).
+fn sid(p: &Peer) -> SessionId {
+    *p.engine
+        .viewer_sessions()
+        .first()
+        .expect("a viewer session")
+}
 fn injected(p: &Peer) -> Vec<InputMsg> {
     p.platform.injector.lock().unwrap().events.clone()
 }
@@ -334,7 +386,7 @@ async fn a_second_viewer_is_told_busy_while_the_first_awaits_approval() {
 
     first
         .engine
-        .connect_to(host.uuid.clone())
+        .connect(&host.uuid, None)
         .expect("this computer is not hosting");
     eventually("the host's prompt is open for the first viewer", t, || {
         asked.load(std::sync::atomic::Ordering::SeqCst)
@@ -343,7 +395,7 @@ async fn a_second_viewer_is_told_busy_while_the_first_awaits_approval() {
 
     second
         .engine
-        .connect_to(host.uuid.clone())
+        .connect(&host.uuid, None)
         .expect("this computer is not hosting");
     eventually("the second viewer is told busy", t, || {
         second
@@ -396,7 +448,7 @@ async fn a_cancelled_password_prompt_does_not_leave_this_computer_busy() {
     .await;
 
     me.engine
-        .connect_to(locked.uuid.clone())
+        .connect(&locked.uuid, None)
         .expect("this computer is not hosting");
     eventually("the password prompt", t, || {
         me.password_prompts
@@ -408,7 +460,7 @@ async fn a_cancelled_password_prompt_does_not_leave_this_computer_busy() {
     // The prompt is up: this computer is connecting, so it is busy.
     other
         .engine
-        .connect_to(me.uuid.clone())
+        .connect(&me.uuid, None)
         .expect("this computer is not hosting");
     eventually("the other viewer is told busy", t, || {
         other
@@ -421,10 +473,10 @@ async fn a_cancelled_password_prompt_does_not_leave_this_computer_busy() {
     .await;
 
     // Cancel, as the prompt's Cancel button does.
-    me.engine.end_session();
+    me.engine.end_all();
     other
         .engine
-        .connect_to(me.uuid.clone())
+        .connect(&me.uuid, None)
         .expect("this computer is not hosting");
     let other_id = other.uuid.clone();
     eventually("the other viewer is let in", t, || {
@@ -433,7 +485,7 @@ async fn a_cancelled_password_prompt_does_not_leave_this_computer_busy() {
     })
     .await;
     // And while hosting, this computer cannot connect out (D1).
-    assert!(me.engine.connect_to(locked.uuid.clone()).is_err());
+    assert!(me.engine.connect(&locked.uuid, None).is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -451,7 +503,7 @@ async fn full_session_over_real_webrtc() {
     // Handshake (approve mode → AllowControl), then WebRTC over loopback UDP.
     viewer
         .engine
-        .connect_to(host.uuid.clone())
+        .connect(&host.uuid, None)
         .expect("this computer is not hosting");
     eventually("roles set", t, || {
         matches!(
@@ -572,7 +624,7 @@ async fn full_session_over_real_webrtc() {
     );
 
     // ---- teardown from the viewer; the host follows
-    viewer.engine.end_session();
+    viewer.engine.end_all();
     eventually("both idle", t, || {
         host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
     })
@@ -581,6 +633,21 @@ async fn full_session_over_real_webrtc() {
         !viewer.platform.surface.state().visible,
         "surface hidden after the session"
     );
+    // The session's own events: accepted, then ended by the user and
+    // released once its threads were joined (08a §5.2).
+    eventually("the viewer session is released", t, || {
+        let log = viewer.session_log.lock().unwrap();
+        let id = log.first().map(|(s, _)| *s);
+        let kinds: Vec<&str> = log
+            .iter()
+            .filter(|(s, _)| Some(*s) == id)
+            .map(|(_, k)| k.as_str())
+            .collect();
+        kinds.contains(&"negotiating")
+            && kinds.contains(&"ended:UserClosed")
+            && kinds.last() == Some(&"released")
+    })
+    .await;
     let toasts = host.toasts.lock().unwrap().clone();
     assert!(
         !toasts.iter().any(|t| t.contains("unavailable")),
@@ -602,7 +669,7 @@ async fn host_cursor_image_reaches_the_viewer_and_lands_on_the_hotspot() {
     .await;
     viewer
         .engine
-        .connect_to(host.uuid.clone())
+        .connect(&host.uuid, None)
         .expect("this computer is not hosting");
 
     // The mock host reports its image once, with its first frame, before any
@@ -674,7 +741,7 @@ async fn host_cursor_image_reaches_the_viewer_and_lands_on_the_hotspot() {
         assert!(checked >= 5, "only {checked} unclipped frames to check");
     }
 
-    viewer.engine.end_session();
+    viewer.engine.end_all();
     eventually("both idle", t, || {
         host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
     })
@@ -730,7 +797,7 @@ async fn maximum_size_cursor_images_in_a_burst_all_arrive_intact() {
     .await;
     viewer
         .engine
-        .connect_to(host.uuid.clone())
+        .connect(&host.uuid, None)
         .expect("this computer is not hosting");
 
     eventually("the last 256×256 image installed and drawn", t, || {
@@ -769,7 +836,7 @@ async fn maximum_size_cursor_images_in_a_burst_all_arrive_intact() {
         );
     }
 
-    viewer.engine.end_session();
+    viewer.engine.end_all();
     eventually("both idle", t, || {
         host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
     })
@@ -878,7 +945,7 @@ async fn controlled_session(
     .await;
     viewer
         .engine
-        .connect_to(host.uuid.clone())
+        .connect(&host.uuid, None)
         .expect("this computer is not hosting");
     eventually("video presented", t, || {
         matches!(
@@ -977,7 +1044,7 @@ async fn mac_viewer_keys_mean_the_same_on_a_windows_host() {
         .unwrap()
         .held_keys()
         .is_empty());
-    viewer.engine.end_session();
+    viewer.engine.end_all();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1005,7 +1072,7 @@ async fn windows_viewer_ctrl_c_is_cmd_c_on_a_mac_host() {
         ],
     )
     .await;
-    viewer.engine.end_session();
+    viewer.engine.end_all();
 }
 
 // ---- V2: the host follows the bandwidth estimate down in BITRATE, full res -----
@@ -1041,7 +1108,7 @@ async fn constrained_link_tracks_bwe_down_and_recovers() {
     .await;
     viewer
         .engine
-        .connect_to(host.uuid.clone())
+        .connect(&host.uuid, None)
         .expect("this computer is not hosting");
 
     // Up and running at full resolution, with frames reaching the viewer, before
@@ -1149,7 +1216,7 @@ async fn constrained_link_tracks_bwe_down_and_recovers() {
         );
     }
 
-    viewer.engine.end_session();
+    viewer.engine.end_all();
     eventually("both idle", t, || {
         host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
     })
@@ -1182,7 +1249,7 @@ async fn noisy_link_stays_steady_but_follows_a_sustained_trend() {
     .await;
     viewer
         .engine
-        .connect_to(host.uuid.clone())
+        .connect(&host.uuid, None)
         .expect("this computer is not hosting");
     eventually("video flowing at full size", t, || {
         host.engine.test_encode_dims() == Some((640, 360))
@@ -1282,7 +1349,7 @@ async fn noisy_link_stays_steady_but_follows_a_sustained_trend() {
         );
     }
 
-    viewer.engine.end_session();
+    viewer.engine.end_all();
     eventually("both idle", t, || {
         host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
     })
@@ -1306,7 +1373,7 @@ async fn same_os_and_linux_windows_pairs_are_untouched() {
         let tag = format!("{viewer_os}-{host_os}");
         let (viewer, host) = controlled_session(&tag, &relay, viewer_os, host_os).await;
         press(&viewer, &host, &literal, &literal).await;
-        viewer.engine.end_session();
+        viewer.engine.end_all();
         eventually("both idle", Duration::from_secs(15), || {
             host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
         })
@@ -1341,7 +1408,7 @@ async fn monitor_switch_follows_picture_input_and_the_control_gate() {
     .await;
     viewer
         .engine
-        .connect_to(host.uuid.clone())
+        .connect(&host.uuid, None)
         .expect("this computer is not hosting");
 
     // Both UIs learn the host's monitors; the viewer may switch (control).
@@ -1372,7 +1439,7 @@ async fn monitor_switch_follows_picture_input_and_the_control_gate() {
 
     // Viewer switches. (The mock encoder emits the captured size; the encode
     // size the host chose is read from its test hook.)
-    viewer.engine.select_display("mock-1".into());
+    viewer.engine.select_display(sid(&viewer), "mock-1".into());
     eventually("viewer told the switch happened", t, || {
         viewer.last_displays() == Some((both.clone(), "mock-1".into(), true))
     })
@@ -1413,7 +1480,7 @@ async fn monitor_switch_follows_picture_input_and_the_control_gate() {
     })
     .await;
     let announced = host.displays.lock().unwrap().len();
-    viewer.engine.select_display("mock-0".into());
+    viewer.engine.select_display(sid(&viewer), "mock-0".into());
     tokio::time::sleep(Duration::from_millis(1000)).await;
     assert_eq!(
         host.displays.lock().unwrap().len(),
@@ -1423,7 +1490,7 @@ async fn monitor_switch_follows_picture_input_and_the_control_gate() {
 
     // The host can always switch, from its own side; input goes back to the
     // primary path.
-    host.engine.select_display("mock-0".into());
+    host.engine.host_select_display("mock-0".into());
     eventually("viewer told the host switched back", t, || {
         viewer.last_displays() == Some((both.clone(), "mock-0".into(), false))
     })
@@ -1434,7 +1501,7 @@ async fn monitor_switch_follows_picture_input_and_the_control_gate() {
     .await;
 
     // An unknown id changes nothing and says why.
-    host.engine.select_display("gone".into());
+    host.engine.host_select_display("gone".into());
     eventually("toast for an unknown monitor", t, || {
         host.toasts
             .lock()
@@ -1448,7 +1515,7 @@ async fn monitor_switch_follows_picture_input_and_the_control_gate() {
         Some("mock-0".to_string())
     );
 
-    viewer.engine.end_session();
+    viewer.engine.end_all();
     eventually("both idle", t, || {
         host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
     })
@@ -1484,7 +1551,7 @@ async fn popout_window_streams_a_second_monitor_with_its_own_input() {
     .await;
     viewer
         .engine
-        .connect_to(host.uuid.clone())
+        .connect(&host.uuid, None)
         .expect("this computer is not hosting");
     eventually("main window presenting", t, || {
         viewer.last_displays().is_some_and(|d| d.2)
@@ -1493,7 +1560,7 @@ async fn popout_window_streams_a_second_monitor_with_its_own_input() {
     .await;
 
     // Ask for the second monitor in its own window; the host assigns stream 1.
-    viewer.engine.popout_display("mock-1".into());
+    viewer.engine.popout_display(sid(&viewer), "mock-1".into());
     eventually("pop-out announced", t, || {
         *viewer.popouts.lock().unwrap() == vec![(1, "mock-1".to_string())]
     })
@@ -1505,10 +1572,13 @@ async fn popout_window_streams_a_second_monitor_with_its_own_input() {
     );
     // The app opens the window and hands its surface over.
     let pop = platform_api::mock::MockSurface::new((800, 600));
-    let gen1 = viewer.engine.attach_popout(1, pop.clone());
+    let gen1 = viewer.engine.attach_popout(sid(&viewer), 1, pop.clone());
     assert!(gen1.is_some());
     assert!(
-        viewer.engine.attach_popout(1, pop.clone()).is_none(),
+        viewer
+            .engine
+            .attach_popout(sid(&viewer), 1, pop.clone())
+            .is_none(),
         "one window per stream"
     );
     eventually("second monitor presented in the pop-out", t, || {
@@ -1571,8 +1641,8 @@ async fn popout_window_streams_a_second_monitor_with_its_own_input() {
     .await;
 
     // Closing the window stops the stream on the host.
-    viewer.engine.close_popout(1, gen1);
-    assert!(!viewer.engine.popout_attached(1));
+    viewer.engine.close_popout(sid(&viewer), 1, gen1);
+    assert!(!viewer.engine.popout_attached(sid(&viewer), 1));
     eventually("host stopped the pop-out stream", t, || {
         host.popouts.lock().unwrap().is_empty() && viewer.popouts.lock().unwrap().is_empty()
     })
@@ -1586,32 +1656,34 @@ async fn popout_window_streams_a_second_monitor_with_its_own_input() {
     );
 
     // Pop it out again, then revoke control: the host closes it.
-    viewer.engine.popout_display("mock-1".into());
+    viewer.engine.popout_display(sid(&viewer), "mock-1".into());
     eventually("pop-out announced again", t, || {
         !viewer.popouts.lock().unwrap().is_empty()
     })
     .await;
     let pop2 = platform_api::mock::MockSurface::new((800, 600));
     let slot = viewer.popouts.lock().unwrap()[0].0;
-    let gen2 = viewer.engine.attach_popout(slot, pop2.clone());
+    let gen2 = viewer
+        .engine
+        .attach_popout(sid(&viewer), slot, pop2.clone());
     assert!(gen2.is_some() && gen2 != gen1);
     // A late close of the OLD window (same slot) must not touch the new one.
-    viewer.engine.close_popout(slot, gen1);
-    assert!(viewer.engine.popout_attached(slot));
+    viewer.engine.close_popout(sid(&viewer), slot, gen1);
+    assert!(viewer.engine.popout_attached(sid(&viewer), slot));
     host.engine.set_permission(Permission::View);
     eventually("revoking control closes pop-outs", t, || {
         viewer.popouts.lock().unwrap().is_empty() && host.popouts.lock().unwrap().is_empty()
     })
     .await;
     // A view-only viewer cannot open one.
-    viewer.engine.popout_display("mock-1".into());
+    viewer.engine.popout_display(sid(&viewer), "mock-1".into());
     tokio::time::sleep(Duration::from_millis(1000)).await;
     assert!(host.popouts.lock().unwrap().is_empty());
     // (The app closes the window when the list drops it.)
-    viewer.engine.detach_popout(slot, gen2);
-    assert!(!viewer.engine.popout_attached(slot));
+    viewer.engine.detach_popout(sid(&viewer), slot, gen2);
+    assert!(!viewer.engine.popout_attached(sid(&viewer), slot));
 
-    viewer.engine.end_session();
+    viewer.engine.end_all();
     eventually("both idle", t, || {
         host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
     })
@@ -1663,7 +1735,7 @@ async fn accounts_keep_their_own_workspaces() {
         .await;
     assert!(e.workspace().is_none());
     assert!(e.set_remote_name(X, "nope").is_empty());
-    assert_eq!(e.connect_to(X.into()), Err(ConnectError::SignedOut));
+    assert_eq!(e.connect(X, None), Err(ConnectError::SignedOut));
     // Its settings still apply while it is signed out (a host keeps the
     // clipboard off when that was chosen).
     assert!(!e.prefs().clipboard_sync);
@@ -1721,7 +1793,7 @@ async fn switching_accounts_ends_the_viewer_session() {
     .await;
     viewer
         .engine
-        .connect_to(host.uuid.clone())
+        .connect(&host.uuid, None)
         .expect("not hosting");
     eventually("connected", t, || {
         matches!(viewer.engine.role(), Role::Viewer { .. })
@@ -1747,4 +1819,108 @@ async fn switching_accounts_ends_the_viewer_session() {
         matches!(host.engine.role(), Role::Idle)
     })
     .await;
+}
+
+/// plans/08 P2: one viewer engine holds sessions with two hosts at once, each
+/// on its own surface; events are tagged with the right session; a second
+/// connect to the same host is refused and never tears the first down; ending
+/// one leaves the other live; and a link death in one ends only that one.
+#[cfg(feature = "test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
+    use engine::ConnectError;
+    let relay = start_relay().await;
+    let host_a = start_peer("multi-host-a", &relay);
+    let host_b = start_peer("multi-host-b", &relay);
+    let viewer = start_peer("multi-viewer", &relay);
+    let t = Duration::from_secs(20);
+    eventually("all registered", t, || {
+        host_a.engine.server_connected()
+            && host_b.engine.server_connected()
+            && viewer.engine.server_connected()
+    })
+    .await;
+
+    let surface_b = platform_api::mock::MockSurface::new((640, 360));
+    let a = viewer
+        .engine
+        .connect(&host_a.uuid, None)
+        .expect("not hosting");
+    let b = viewer
+        .engine
+        .connect(&host_b.uuid, Some(surface_b.clone()))
+        .expect("not hosting");
+    assert_ne!(a, b);
+    let viewer_id = viewer.uuid.clone();
+    eventually("both hosts accepted the one viewer", t, || {
+        matches!(host_a.engine.role(), Role::Host { ref peer, .. } if *peer == viewer_id)
+            && matches!(host_b.engine.role(), Role::Host { ref peer, .. } if *peer == viewer_id)
+    })
+    .await;
+    eventually(
+        "both sessions present video on their own surface",
+        t,
+        || {
+            viewer.platform.surface.state().presented.len() >= 10
+                && surface_b.state().presented.len() >= 10
+        },
+    )
+    .await;
+    assert_eq!(viewer.engine.viewer_sessions(), vec![a, b]);
+    {
+        let log = viewer.session_log.lock().unwrap();
+        for id in [a, b] {
+            assert!(
+                log.iter().any(|(s, k)| *s == id && k == "negotiating"),
+                "{id} has its own events: {log:?}"
+            );
+        }
+    }
+
+    // One session per remote: a second connect is refused, the first lives on.
+    assert_eq!(
+        viewer.engine.connect(&host_a.uuid, None),
+        Err(ConnectError::AlreadyConnected(a))
+    );
+    assert_eq!(viewer.engine.viewer_sessions(), vec![a, b]);
+
+    // Ending A leaves B live.
+    viewer.engine.disconnect(a);
+    eventually("host A's session ended", t, || {
+        matches!(host_a.engine.role(), Role::Idle)
+    })
+    .await;
+    assert_eq!(viewer.engine.viewer_sessions(), vec![b]);
+    let before = surface_b.state().presented.len();
+    eventually("B keeps presenting", t, || {
+        surface_b.state().presented.len() > before + 10
+    })
+    .await;
+    assert!(matches!(host_b.engine.role(), Role::Host { .. }));
+
+    // A link death in B ends B, with its own Ended and Released.
+    eventually("A is released", t, || {
+        let log = viewer.session_log.lock().unwrap();
+        log.iter().any(|(s, k)| *s == a && k == "released")
+    })
+    .await;
+    viewer.engine.test_sever(b);
+    eventually("B ended on its own link", t, || {
+        let log = viewer.session_log.lock().unwrap();
+        log.iter()
+            .any(|(s, k)| *s == b && k.starts_with("ended:LinkLost"))
+            && log.iter().any(|(s, k)| *s == b && k == "released")
+    })
+    .await;
+    assert!(viewer.engine.viewer_sessions().is_empty());
+    let log = viewer.session_log.lock().unwrap();
+    assert_eq!(
+        log.iter().filter(|(_, k)| k.starts_with("ended:")).count(),
+        2,
+        "each session ended exactly once: {log:?}"
+    );
+    assert!(
+        log.iter().any(|(s, k)| *s == a && k == "ended:UserClosed"),
+        "{log:?}"
+    );
 }
