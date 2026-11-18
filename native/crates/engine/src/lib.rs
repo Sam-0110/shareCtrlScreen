@@ -31,7 +31,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) use events::SessionUi;
-pub use events::{EndReason, PwReason, SessionEvent, SessionId, SessionPhase, TabStep, UiEvent};
+pub use events::{
+    EndReason, PwReason, SessionEvent, SessionId, SessionPhase, TabStep, UiEvent, WindowId,
+};
 pub use handshake::{ApprovalDecision, Decider};
 pub use workspace::WorkspaceSel;
 
@@ -192,9 +194,10 @@ pub struct Engine {
     /// key without a reconnect. Kept equal to the workspace's preference.
     translate_modifiers: Arc<AtomicBool>,
     ice_policy: Mutex<IcePolicy>,
-    /// A web dialog (Settings, a confirm) is open over the video: no main
-    /// video is shown meanwhile (08a §6.18). Read by every session's view.
-    overlay: Arc<AtomicBool>,
+    /// The windows with a web dialog (Settings, a confirm) open over their
+    /// video: their video is hidden meanwhile (08a §6.18, plans/09 J4). Read
+    /// by every session's view.
+    overlays: session::active::Overlays,
     /// The ActiveGate's applier queue (session/active.rs): every main video
     /// is shown and hidden through it, in the order decided.
     view_ops: session::active::ViewOps,
@@ -259,7 +262,7 @@ impl Engine {
             platform,
             translate_modifiers,
             ice_policy: Mutex::new(IcePolicy::Full),
-            overlay: Arc::new(AtomicBool::new(false)),
+            overlays: Default::default(),
             view_ops: session::active::applier(&tokio::runtime::Handle::current()),
             hook_owner: Arc::new(Mutex::new(None)),
             tab_chord_keys: Default::default(),

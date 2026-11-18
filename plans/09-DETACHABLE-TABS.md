@@ -11,7 +11,7 @@ to `native/` unless they start with `server/` or `plans/`). Structure, contracts
 | Step | What | Status |
 |---|---|---|
 | S | This plan + structure ([09a](09a-STRUCTURE-AND-FLOWS.md)), adversarial review folded in | **complete**: review folded in (§7), owner's answers recorded (§5, §7), 09a rewritten from them |
-| W1 | Engine: several sessions on screen, one with the keyboard | not started |
+| W1 | Engine: several sessions on screen, one with the keyboard | **complete** (this commit): `set_screen(on_screen, focused)` replaces `set_active`; overlays per window (`set_overlay(window, open)`); the shortcut claim needs the window uncovered; loopback `several_sessions_on_screen_one_focused`. The app still puts one tab on screen (W3 adds windows) |
 | W2 | Engine: hand a live session to another surface | not started |
 | W3 | App: detached windows (Detach / Dock / close, focus, minimise), saved on this computer | not started |
 | W4 | Sync: which tabs are detached and where, through the account | not started |

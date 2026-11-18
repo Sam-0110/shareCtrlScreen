@@ -173,9 +173,11 @@ pub(crate) struct Registry {
     /// start (D1).
     pub(crate) admitting: Option<String>,
     pub(crate) viewers: BTreeMap<SessionId, ViewerSlot>,
-    /// The viewer session on screen (plans/08 P3): the only one whose video is
-    /// shown and which exchanges the clipboard and holds the shortcut hook.
-    pub(crate) active: Option<SessionId>,
+    /// The viewer sessions on screen (plans/09 W1): their video is shown and
+    /// their host streams; every other one is hidden and paused.
+    pub(crate) on_screen: std::collections::BTreeSet<SessionId>,
+    /// The one with the keyboard, the clipboard and the shortcut hook.
+    pub(crate) focused: Option<SessionId>,
     /// Ended sessions not released yet.
     pub(crate) reaping: BTreeMap<SessionId, Reaping>,
 }

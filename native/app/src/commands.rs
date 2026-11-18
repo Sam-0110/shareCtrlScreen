@@ -208,7 +208,7 @@ pub(crate) fn end_current(app: &tauri::AppHandle) {
     let engine = &app.state::<AppState>().engine;
     if matches!(engine.role(), Role::Host { .. }) {
         engine.end_hosting();
-    } else if let Some(id) = engine.active_session() {
+    } else if let Some(id) = engine.focused_session() {
         engine.disconnect(id);
     }
 }
@@ -231,7 +231,7 @@ pub fn end_session(app: tauri::AppHandle) {
 /// Viewer: ask the host for a fresh keyframe (clears smear after packet loss).
 #[tauri::command]
 pub fn request_refresh(state: tauri::State<'_, AppState>) {
-    if let Some(id) = state.engine.active_session() {
+    if let Some(id) = state.engine.focused_session() {
         state.engine.request_refresh(id);
     }
 }
@@ -240,7 +240,7 @@ pub fn request_refresh(state: tauri::State<'_, AppState>) {
 /// host, which needs control). The result arrives as a `displays` event.
 #[tauri::command]
 pub fn select_display(state: tauri::State<'_, AppState>, id: String) {
-    match state.engine.active_session() {
+    match state.engine.focused_session() {
         Some(viewer) => state.engine.select_display(viewer, id),
         None => state.engine.host_select_display(id),
     }
@@ -282,7 +282,7 @@ pub(crate) fn displays_json(
 /// needs control). The window opens when the host's `displays` lists it.
 #[tauri::command]
 pub fn popout_display(state: tauri::State<'_, AppState>, id: String) {
-    if let Some(viewer) = state.engine.active_session() {
+    if let Some(viewer) = state.engine.focused_session() {
         state.engine.popout_display(viewer, id);
     }
 }
@@ -309,7 +309,10 @@ pub async fn set_video_visible(
     state: tauri::State<'_, AppState>,
     visible: bool,
 ) -> Result<(), String> {
-    state.engine.set_overlay(!visible).await;
+    state
+        .engine
+        .set_overlay(engine::WindowId::MAIN, !visible)
+        .await;
     Ok(())
 }
 

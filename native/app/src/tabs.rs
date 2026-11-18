@@ -666,7 +666,8 @@ impl TabManager {
             // Read and applied under `inner`, so a click and a session event
             // deciding at the same time cannot cross (the later decision is
             // the one on screen). `set_active` never blocks.
-            self.engine.set_active(session);
+            let on_screen: Vec<SessionId> = session.into_iter().collect();
+            self.engine.set_screen(&on_screen, session);
             // The Monitor menu belongs to the tab on screen — or, hosting, to
             // this computer's own monitors, whose events keep it. Rebuilt only
             // when it changes: it is a round trip to the UI thread.

@@ -217,7 +217,7 @@ pub(crate) fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::Menu
             // The Monitor menu belongs to the tab on screen — or, when
             // hosting, to this computer's own shared monitor.
             let engine = &app.state::<AppState>().engine;
-            let viewer = engine.active_session();
+            let viewer = engine.focused_session();
             if let Some(id) = other.strip_prefix(MENU_DISPLAY_PREFIX) {
                 match viewer {
                     Some(session) => engine.select_display(session, id.to_string()),

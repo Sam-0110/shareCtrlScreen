@@ -171,7 +171,7 @@ impl Peer {
             .engine
             .connect(host, self.platform.surface.clone())
             .expect("this computer is not hosting");
-        self.engine.set_active(Some(id));
+        self.engine.set_screen(&[id], Some(id));
         id
     }
 
@@ -1887,7 +1887,7 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
     .await;
     assert_eq!(presented(&surface_b), 0, "an inactive tab is not presented");
     assert!(!surface_b.state().visible, "an inactive tab is hidden");
-    assert_eq!(viewer.engine.active_session(), Some(a));
+    assert_eq!(viewer.engine.focused_session(), Some(a));
 
     // Only the active tab exchanges the clipboard (B3).
     viewer.platform.clipboard.user_copies("for A");
@@ -1898,15 +1898,15 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
     // A copy made right before switching (B's loop has not polled since)
     // is still never sent to B: the gate re-baselines when it opens.
     viewer.platform.clipboard.user_copies("also for A");
-    viewer.engine.set_active(Some(b));
+    viewer.engine.set_screen(&[b], Some(b));
     tokio::time::sleep(Duration::from_millis(900)).await;
     assert_ne!(
         host_b.platform.clipboard.get_text().as_deref(),
         Some("also for A")
     );
-    viewer.engine.set_active(Some(a));
+    viewer.engine.set_screen(&[a], Some(a));
 
-    let switch_to = |on: SessionId| viewer.engine.set_active(Some(on));
+    let switch_to = |on: SessionId| viewer.engine.set_screen(&[on], Some(on));
     // Brought to the front, a paused tab's host streams again and new
     // pictures appear promptly (P6); the tab it replaced pauses in turn.
     eventually("host B paused again", t, || {
@@ -1968,7 +1968,7 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
             );
         }
     }
-    assert_eq!(viewer.engine.active_session(), Some(a));
+    assert_eq!(viewer.engine.focused_session(), Some(a));
 
     // The copy made while A was active never reached B, even though B was
     // active since (the gate re-baselines when it opens); B's own copy does.
@@ -2064,6 +2064,90 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
     );
 }
 
+/// plans/09 W1: several sessions on screen at once, one focused. Two of three
+/// hosts stream and present; the third is paused. Only the focused session
+/// exchanges the clipboard, also when the other on-screen one presents.
+#[cfg(feature = "test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn several_sessions_on_screen_one_focused() {
+    let relay = start_relay().await;
+    let hosts = [
+        start_peer("screen-host-a", &relay),
+        start_peer("screen-host-b", &relay),
+        start_peer("screen-host-c", &relay),
+    ];
+    let viewer = start_peer("screen-viewer", &relay);
+    let t = Duration::from_secs(20);
+    eventually("all registered", t, || {
+        hosts.iter().all(|h| h.engine.server_connected()) && viewer.engine.server_connected()
+    })
+    .await;
+    let surfaces: Vec<_> = (0..3)
+        .map(|_| platform_api::mock::MockSurface::new((640, 360)))
+        .collect();
+    let presented = |s: &Arc<platform_api::mock::MockSurface>| s.state().presented.len();
+    let mut ids = Vec::new();
+    for (h, s) in hosts.iter().zip(&surfaces) {
+        ids.push(
+            viewer
+                .engine
+                .connect(&h.uuid, s.clone())
+                .expect("not hosting"),
+        );
+    }
+    let (a, b, c) = (ids[0], ids[1], ids[2]);
+    viewer.engine.set_screen(&[a, b], Some(b));
+    for (i, h) in hosts.iter().enumerate().take(2) {
+        eventually("on screen: presenting", t, || presented(&surfaces[i]) > 10).await;
+        assert_eq!(h.engine.test_video_paused(), Some(false));
+    }
+    eventually("off screen: its host paused", t, || {
+        hosts[2].engine.test_video_paused() == Some(true)
+    })
+    .await;
+    assert_eq!(
+        presented(&surfaces[2]),
+        0,
+        "an off-screen session is not presented"
+    );
+    assert_eq!(viewer.engine.focused_session(), Some(b));
+
+    // The clipboard goes to the focused session only.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    viewer.platform.clipboard.user_copies("for B");
+    eventually("B's host gets it", t, || {
+        hosts[1].platform.clipboard.get_text().as_deref() == Some("for B")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_ne!(
+        hosts[0].platform.clipboard.get_text().as_deref(),
+        Some("for B")
+    );
+
+    // Focus moves to A; both stay on screen and presenting.
+    viewer.engine.set_screen(&[a, b], Some(a));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    viewer.platform.clipboard.user_copies("for A");
+    eventually("A's host gets it", t, || {
+        hosts[0].platform.clipboard.get_text().as_deref() == Some("for A")
+    })
+    .await;
+    let (pa, pb) = (presented(&surfaces[0]), presented(&surfaces[1]));
+    eventually("both keep presenting", t, || {
+        presented(&surfaces[0]) > pa + 5 && presented(&surfaces[1]) > pb + 5
+    })
+    .await;
+
+    // C comes on screen, A goes off: A pauses, C resumes.
+    viewer.engine.set_screen(&[b, c], Some(c));
+    eventually("A paused", t, || {
+        hosts[0].engine.test_video_paused() == Some(true)
+    })
+    .await;
+    eventually("C presents", t, || presented(&surfaces[2]) > 3).await;
+    viewer.engine.end_all_and_wait(Duration::from_secs(3)).await;
+}
 /// Ending a session while its start is still building it (a slow ICE gather)
 /// waits for the start to finish, then ends it for real: its threads are
 /// joined before `Released`, its surface is hidden, its sinks are gone and the

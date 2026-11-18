@@ -45,6 +45,15 @@ pub enum UiEvent {
     },
 }
 
+/// An app window a session's video can be in (plans/09): `WindowId::MAIN`
+/// is the main window; the app numbers the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WindowId(pub u32);
+
+impl WindowId {
+    pub const MAIN: WindowId = WindowId(0);
+}
+
 /// Which way a tab-switch chord goes (Ctrl+Alt+PageDown / PageUp; Cmd+Option
 /// on a Mac).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

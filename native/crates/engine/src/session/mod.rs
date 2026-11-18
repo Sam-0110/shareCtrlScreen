@@ -220,20 +220,34 @@ impl TabGate {
         }
     }
 
-    /// A web dialog opened over the video, or the last one closed: the video
-    /// is hidden meanwhile (the flag is engine-wide; this re-decides), and so
-    /// is shortcut capture — a dialog's typing and Ctrl+Tab are this
-    /// computer's, not the hidden session's.
+    /// A web dialog opened over this session's window, or the last one
+    /// closed: its video is hidden meanwhile (the overlay set changed
+    /// already; this re-decides), and so is shortcut capture — a dialog's
+    /// typing and Ctrl+Tab are this computer's, not the hidden session's.
     pub(crate) fn set_overlay(&self, open: bool) {
         self.activity.overlay(open);
         self.view.refresh();
     }
 
-    /// Only atomics and non-blocking queue sends: safe under `reg`.
-    pub(crate) fn set_active(&self, active: bool) {
-        self.activity.set(active);
-        self.view.set_active(active);
-        // Background tabs pause (08a §6.14). Ordered on the reliable control
+    /// The session's window (`WindowId` value) — the view reads it.
+    pub(crate) fn window(&self) -> u32 {
+        self.view.window()
+    }
+
+    /// Became (or stopped being) the focused session: the keyboard, the
+    /// clipboard and the shortcut hook follow it (plans/09 W1). Only atomics
+    /// and non-blocking queue sends: safe under `reg`.
+    pub(crate) fn set_focused(&self, focused: bool) {
+        self.activity.set(focused);
+        self.view.set_focused(focused);
+    }
+
+    /// Came on screen (shown when ready, streaming) or went off it (hidden,
+    /// its host paused). Only atomics and non-blocking queue sends: safe
+    /// under `reg`.
+    pub(crate) fn set_on_screen(&self, active: bool) {
+        self.view.set_on_screen(active);
+        // Off-screen sessions pause (08a §6.14). Ordered on the reliable control
         // channel, so a quick back-and-forth ends in the right state; queued
         // until the channel opens when the session is still starting.
         if self.streaming.swap(active, Ordering::SeqCst) == active {
@@ -253,9 +267,10 @@ impl TabGate {
     }
 }
 
-/// Viewer: what follows the session being the active one (plans/08 P3). Only
-/// the active session exchanges the clipboard (B3: otherwise text copied from
-/// one host would be forwarded to another) and holds the shortcut hook (B2).
+/// Viewer: what follows the session being the **focused** one (plans/08 P3,
+/// plans/09 W1; `active` below means focused). Only the focused session
+/// exchanges the clipboard (B3: otherwise text copied from one host would be
+/// forwarded to another) and holds the shortcut hook (B2).
 pub(crate) struct Activity {
     active: AtomicBool,
     /// The clipboard loop's gate: the user's setting AND active.
@@ -688,16 +703,15 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
 
     // Clipboard sync. The host applies its own permission gate; here the user's
     // setting governs.
-    // Its view (shown only while active, ready, untroubled and uncovered)
+    // Its view (shown only while on screen, ready, untroubled and uncovered)
     // and what follows being the active session (clipboard, shortcut hook).
     // Inactive until the registry says otherwise: `attach_gate` applies the
     // current answer under the same lock every switch takes.
     let view = active::SessionView::new(
         surface.clone(),
         shared.clone(),
-        engine.overlay_flag(),
+        engine.overlays(),
         engine.view_ops(),
-        false,
     );
     let (activity, clip_wake) = Activity::new(prefs.clipboard_sync, false);
     let activity = Arc::new(activity);
@@ -831,14 +845,14 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
             activity.clone(),
             engine.hook_owner(),
         );
-        let overlay = engine.overlay_flag();
+        let covered = view.clone();
         spawn_or_abort!(engine, id, stop, threads, "shortcuts", move || {
             shortcut_loop(
                 id,
                 platform.as_ref(),
                 surface.as_ref(),
                 &activity,
-                &overlay,
+                &covered,
                 &owner,
                 &stop_k,
                 || hook_forwarder(hook_input.clone(), keys.clone(), ctl.clone()),
@@ -898,7 +912,7 @@ fn shortcut_loop(
     platform: &dyn platform_api::Platform,
     surface: &dyn platform_api::VideoSurface,
     activity: &Activity,
-    overlay: &AtomicBool,
+    view: &active::SessionView,
     owner: &Mutex<Option<SessionId>>,
     stop: &AtomicBool,
     forwarder: impl Fn() -> KeyForwarder,
@@ -907,16 +921,15 @@ fn shortcut_loop(
     while !stop.load(Ordering::SeqCst) {
         // Not while a web dialog is open over the video (its keys are this
         // computer's).
-        let claimed =
-            activity.active.load(Ordering::SeqCst) && !overlay.load(Ordering::SeqCst) && {
-                let mut o = owner.lock();
-                if o.is_none() {
-                    *o = Some(id);
-                    true
-                } else {
-                    *o == Some(id)
-                }
-            };
+        let claimed = activity.active.load(Ordering::SeqCst) && !view.covered() && {
+            let mut o = owner.lock();
+            if o.is_none() {
+                *o = Some(id);
+                true
+            } else {
+                *o == Some(id)
+            }
+        };
         if !claimed {
             std::thread::sleep(TICK);
             continue;
@@ -1449,13 +1462,12 @@ mod tests {
                 Arc::default(),
                 Arc::default(),
                 active::applier(rt.handle()),
-                false,
             );
             let (activity, _wake) = Activity::new(true, false);
             let (ctl_tx, ctl_rx) = std::sync::mpsc::channel();
             let gate = TabGate::new(view, Arc::new(activity), ctl_tx, vpause);
             for &on in steps {
-                gate.set_active(on);
+                gate.set_on_screen(on);
             }
             ctl_rx
                 .try_iter()
