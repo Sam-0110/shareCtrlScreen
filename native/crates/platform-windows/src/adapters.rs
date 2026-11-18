@@ -611,6 +611,11 @@ impl VideoSurface for ChildWindowSurface {
             render::window::set_top_inset(h, css_px);
         }
     }
+    fn focus(&self) {
+        if let Some(h) = self.live() {
+            render::window::take_focus(h);
+        }
+    }
     fn destroy(&self) {
         if !self.destroyed.swap(true, Ordering::SeqCst) {
             render::window::destroy(self.hwnd);
@@ -634,14 +639,19 @@ impl Presenter for D3dPresenter {
         cursor: Option<(f64, f64)>,
     ) -> Result<(), SurfaceError> {
         // B5: a hidden window is not drawn to (the engine skips it too; this
-        // also covers a present racing a hide). The frame stays decoded.
-        // SAFETY: `IsWindowVisible` only reads the window's style bits.
-        if !unsafe {
-            windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(HWND(self.hwnd as *mut _))
-        }
-        .as_bool()
+        // also covers a present racing a hide). The frame stays decoded. Its
+        // OWN `WS_VISIBLE` bit, not `IsWindowVisible`: that one is also false
+        // while the app window is hidden to the tray, and frames skipped then
+        // would leave a stale picture on restore (nothing repaints).
         {
-            return Ok(());
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetWindowLongPtrW, GWL_STYLE, WS_VISIBLE,
+            };
+            // SAFETY: reads the style of a window this presenter draws into.
+            let style = unsafe { GetWindowLongPtrW(HWND(self.hwnd as *mut _), GWL_STYLE) };
+            if style as u32 & WS_VISIBLE.0 == 0 {
+                return Ok(());
+            }
         }
         let render = |r: &mut render::Renderer, tex: &_, slice| {
             r.render_frame(tex, slice, cursor)

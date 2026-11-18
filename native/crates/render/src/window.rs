@@ -107,6 +107,9 @@ struct WinState {
     /// the reveal clip: the client size (and so the input mapping and the
     /// host's encode size) is the area below it.
     top_inset_css: AtomicI32,
+    /// This window hid the OS cursor last (and did not show it since), so a
+    /// refresh after it was hidden still owes the arrow back (B11).
+    cursor_hidden: AtomicBool,
 }
 
 impl Default for WinState {
@@ -124,6 +127,7 @@ impl Default for WinState {
             focused: AtomicBool::new(false),
             leave_tracked: AtomicBool::new(false),
             top_inset_css: AtomicI32::new(0),
+            cursor_hidden: AtomicBool::new(false),
         }
     }
 }
@@ -378,7 +382,7 @@ const MAX_INSET_CSS_PX: u32 = 4096;
 /// mouse move — so a stationary pointer would keep the stale cursor).
 const WM_REFRESH_CURSOR: u32 = WM_APP + 1;
 
-/// A private message posted from [`show`]: take the keyboard focus on the UI
+/// A private message posted from [`take_focus`]: take the keyboard focus on the UI
 /// thread (`SetFocus` only works on the thread that owns the window), so an
 /// activated tab gets the keys without a click first (plans/08 §3.5).
 const WM_TAKE_FOCUS: u32 = WM_APP + 2;
@@ -479,7 +483,9 @@ fn reevaluate_pointer_inside(st: &WinState, hwnd: HWND) {
 
 /// Apply the OS cursor: hidden (null) or the standard arrow. Call only on the
 /// UI thread (a wndproc handler), where `SetCursor` affects our window.
-fn apply_os_cursor(hidden: bool) {
+/// Records which this window set last (`WinState::cursor_hidden`).
+fn apply_os_cursor(st: &WinState, hidden: bool) {
+    st.cursor_hidden.store(hidden, Ordering::Relaxed);
     // SAFETY: `SetCursor`/`LoadCursorW` on the UI thread; a null cursor hides
     // it, the system arrow restores it. `IDC_ARROW` is a built-in resource.
     unsafe {
@@ -634,7 +640,20 @@ pub fn show(hwnd_raw: isize) {
                                     // Raise above the WebView2 sibling AND show in one call.
         let _ = SetWindowPos(hwnd, Some(HWND_TOP), 0, y, w, h, SWP_SHOWWINDOW);
         let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = PostMessageW(Some(hwnd), WM_TAKE_FOCUS, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Give video window `hwnd_raw` the keyboard (its tab was activated), on its
+/// own thread — see [`WM_TAKE_FOCUS`].
+pub fn take_focus(hwnd_raw: isize) {
+    // SAFETY: valid child HWND; posting a message is safe across threads.
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(hwnd_raw as *mut _)),
+            WM_TAKE_FOCUS,
+            WPARAM(0),
+            LPARAM(0),
+        );
     }
 }
 
@@ -719,6 +738,9 @@ pub fn hide(hwnd_raw: isize) {
     st.pointer_inside.store(false, Ordering::Relaxed);
     st.leave_tracked.store(false, Ordering::Relaxed);
     st.focused.store(false, Ordering::Relaxed);
+    // A hidden window takes no input (see `wndproc`), so its held keys and
+    // buttons are released now: their real ups would never be forwarded.
+    release_all_held(&st);
 
     // Clip the surface to NOTHING as well as hiding it.
     //
@@ -734,6 +756,9 @@ pub fn hide(hwnd_raw: isize) {
     // SAFETY: valid child HWND.
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
+        // Give back a cursor this window hid (B11: the refresh restores it
+        // even though the window is hidden now).
+        let _ = PostMessageW(Some(hwnd), WM_REFRESH_CURSOR, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -788,6 +813,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         let py = ((lp.0 >> 16) & 0xffff) as i16 as f64;
         normalize_client(hwnd, px, py)
     };
+
+    // A hidden window (a background tab) takes no input: hiding a focused
+    // window does not move the focus, so keys could still arrive here and
+    // reach a session that is not on screen (I2). Its held input was released
+    // when it was hidden.
+    let input_msg = matches!(
+        msg,
+        WM_MOUSEMOVE
+            | WM_LBUTTONDOWN
+            | WM_RBUTTONDOWN
+            | WM_MBUTTONDOWN
+            | WM_LBUTTONUP
+            | WM_RBUTTONUP
+            | WM_MBUTTONUP
+            | WM_MOUSEWHEEL
+            | WM_MOUSEHWHEEL
+            | WM_KEYDOWN
+            | WM_SYSKEYDOWN
+            | WM_KEYUP
+            | WM_SYSKEYUP
+    );
+    // SAFETY: valid HWND (this is its wndproc).
+    if input_msg && !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        // SAFETY: default handling.
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
 
     match msg {
         WM_MOUSEMOVE => {
@@ -845,7 +896,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // TRUE stops Windows from setting the class cursor afterwards.
                 let hide =
                     st.cursor_control.load(Ordering::Relaxed) && st.focused.load(Ordering::Relaxed);
-                apply_os_cursor(hide);
+                apply_os_cursor(st, hide);
                 return LRESULT(1);
             }
             // Non-client area (resize borders): let Windows set that cursor.
@@ -854,10 +905,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // changed, without waiting for the next mouse move.
         WM_REFRESH_CURSOR => {
             // B11: `SetCursor` is thread-wide, so a hidden tab's window (a
-            // control change in a background session) must not touch the
-            // cursor the visible one set.
+            // control change in a background session) must not hide the
+            // cursor the visible one shows. It still gives back a cursor it
+            // hid itself (control ended, or it was hidden while controlling):
+            // a stationary pointer would otherwise stay invisible.
             // SAFETY: valid HWND (this is its wndproc).
             if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                if st.cursor_hidden.load(Ordering::Relaxed) {
+                    apply_os_cursor(st, false);
+                }
                 return LRESULT(0);
             }
             // Task D11: control may have just turned ON while the pointer was
@@ -866,7 +922,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if st.cursor_control.load(Ordering::Relaxed) {
                 reevaluate_pointer_inside(st, hwnd);
             }
-            apply_os_cursor(cursor_should_hide(st));
+            apply_os_cursor(st, cursor_should_hide(st));
             return LRESULT(0);
         }
         // The tab was shown: take the keys. Not if it was hidden again since
@@ -894,7 +950,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // with no move since the focus loss, leaving `pointer_inside` stuck
             // `false`; re-evaluate so the sprite doesn't drop to the host spot.
             reevaluate_pointer_inside(st, hwnd);
-            apply_os_cursor(cursor_should_hide(st));
+            apply_os_cursor(st, cursor_should_hide(st));
             return LRESULT(0);
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
@@ -981,7 +1037,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // region must never be left cursor-less, even with the pointer
             // still inside it.
             st.focused.store(false, Ordering::Relaxed);
-            apply_os_cursor(false);
+            apply_os_cursor(st, false);
             return LRESULT(0);
         }
         // Files dropped on the video surface: the viewer pushes them to the host.

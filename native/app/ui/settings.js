@@ -76,10 +76,7 @@ function openSettings() {
 
 function closeSettings() {
   $('modal-settings').classList.add('hidden');
-  // If settings were opened mid-session (viewer OR host), the native video
-  // surface was hidden so the modal could be seen (it sits above the WebView) —
-  // bring it back. On the host the surface is absent, so this is a no-op.
-  if (sessionLive()) api.setVideoVisible(true);
+  restoreVideo();
 }
 
 async function saveSettings() {
@@ -247,21 +244,17 @@ async function grantPermission(key) {
 async function openPermissions(intro) {
   // Same ordering rule as Settings: the native video must be down before the
   // modal paints, or the modal appears underneath it.
-  if (S.state === 'VIEW_ACTIVE') {
-    try {
-      await api.setVideoVisible(false);
-    } catch (_) {
-      /* fall through — the dialog is still better than nothing */
-    }
+  try {
+    await api.setVideoVisible(false);
+  } catch (_) {
+    /* fall through — the dialog is still better than nothing */
   }
   let report;
   try {
     report = await api.getPermissions();
   } catch (err) {
     toast(errorText(err), 'error');
-    if (S.state === 'VIEW_ACTIVE' && $('modal-settings').classList.contains('hidden')) {
-      api.setVideoVisible(true).catch(() => {});
-    }
+    restoreVideo();
     return;
   }
   $('perm-intro').textContent = intro || '';
@@ -273,10 +266,7 @@ async function openPermissions(intro) {
 function closePermissions() {
   stopPermPoll();
   $('modal-permissions').classList.add('hidden');
-  // Settings (if it is what opened us) restores the video when it closes.
-  if (S.state === 'VIEW_ACTIVE' && $('modal-settings').classList.contains('hidden')) {
-    api.setVideoVisible(true).catch(() => {});
-  }
+  restoreVideo();
 }
 
 // Show the modal on its own when `keys` still need granting. Returns whether it
@@ -456,4 +446,17 @@ export function wireSettings() {
       if (el) el.scrollIntoView({ block: 'center' });
     });
   });
+}
+
+// The last dialog over the video closed: give the video back. Always, whatever
+// the session state: the engine's "a dialog is open" flag is app-wide, and a
+// session that ended (or started) while a dialog was open must not leave it set
+// — every later session would then stay hidden. Without a session it is a no-op.
+function restoreVideo() {
+  if (
+    $('modal-settings').classList.contains('hidden') &&
+    $('modal-permissions').classList.contains('hidden')
+  ) {
+    api.setVideoVisible(true).catch(() => {});
+  }
 }

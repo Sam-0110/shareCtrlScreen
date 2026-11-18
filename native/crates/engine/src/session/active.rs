@@ -27,7 +27,14 @@ use super::Shared;
 pub(crate) enum ViewOp {
     /// Show, then ask the present loop to repaint the held frame (D12):
     /// re-showing does not repaint, and a static screen would stay black.
-    Show(Arc<dyn VideoSurface>, Arc<Shared>),
+    /// `focus`: the first show since the tab was activated also gives it the
+    /// keyboard; a re-show (link restored, a dialog closed) does not, so it
+    /// never takes the keys from a web field the user is typing in.
+    Show {
+        surface: Arc<dyn VideoSurface>,
+        shared: Arc<Shared>,
+        focus: bool,
+    },
     Hide(Arc<dyn VideoSurface>),
     /// Answered once every op queued before it has been performed.
     Barrier(tokio::sync::oneshot::Sender<()>),
@@ -55,8 +62,15 @@ pub(crate) fn applier(rt: &tokio::runtime::Handle) -> ViewOps {
 
 fn perform(op: ViewOp) {
     match op {
-        ViewOp::Show(surface, shared) => {
+        ViewOp::Show {
+            surface,
+            shared,
+            focus,
+        } => {
             surface.show();
+            if focus {
+                surface.focus();
+            }
             shared.repaint_requested.store(true, Ordering::SeqCst);
         }
         ViewOp::Hide(surface) => surface.hide(),
@@ -75,6 +89,8 @@ struct ViewState {
     gone: bool,
     /// What was last queued.
     shown: bool,
+    /// Activated and not shown since: the next show takes the keyboard.
+    focus_owed: bool,
 }
 
 /// One viewer session's main video, as the gate sees it.
@@ -117,6 +133,12 @@ impl SessionView {
         self.shown.load(Ordering::SeqCst)
     }
 
+    /// Test hooks: the decoder and presenter exist.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn is_ready(&self) -> bool {
+        self.state.lock().ready
+    }
+
     /// Decoder and presenter exist: the video may be shown.
     pub(crate) fn set_ready(&self) {
         self.update(|s| s.ready = true);
@@ -129,7 +151,12 @@ impl SessionView {
     }
 
     pub(crate) fn set_active(&self, active: bool) {
-        self.update(|s| s.active = active);
+        self.update(|s| {
+            if active != s.active {
+                s.focus_owed = active;
+            }
+            s.active = active;
+        });
     }
 
     /// An overlay opened or closed (the engine-wide flag changed already).
@@ -157,7 +184,11 @@ impl SessionView {
         s.shown = want;
         self.shown.store(want, Ordering::SeqCst);
         let op = if want {
-            ViewOp::Show(self.surface.clone(), self.shared.clone())
+            ViewOp::Show {
+                surface: self.surface.clone(),
+                shared: self.shared.clone(),
+                focus: std::mem::take(&mut s.focus_owed),
+            }
         } else {
             ViewOp::Hide(self.surface.clone())
         };

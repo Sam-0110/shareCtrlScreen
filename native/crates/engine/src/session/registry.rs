@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use platform_api::{Codec, VideoSurface};
 use protocol::Permission;
 
-use super::Session;
+use super::{Session, TabGate};
 use crate::events::{EndReason, SessionId};
 use crate::modifiers::OsFamily;
 
@@ -94,6 +94,9 @@ pub(crate) struct ViewerSlot {
     /// Ended by whichever side notices first (a death on the transport
     /// thread, a user disconnect): set once.
     pub(crate) ended: Arc<AtomicBool>,
+    /// What the ActiveGate switches, from the moment `start_viewer` builds
+    /// it (see [`TabGate`]).
+    pub(crate) gate: Option<Arc<TabGate>>,
     pub(crate) session: Option<Session>,
 }
 
@@ -114,6 +117,7 @@ impl ViewerSlot {
             starting: false,
             end_requested: None,
             ended: Arc::new(AtomicBool::new(false)),
+            gate: None,
             session: None,
         }
     }

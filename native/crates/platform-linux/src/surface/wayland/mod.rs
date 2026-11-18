@@ -499,6 +499,9 @@ impl SinkSlot {
 
 impl Drop for SinkSlot {
     fn drop(&mut self) {
+        // Destroyed explicitly: an undestroyed toplevel GdkWindow losing its
+        // last reference makes GDK warn and destroy it itself.
+        self.sink.destroy();
         // SAFETY: same key and value type as `create_sink`'s `set_data`.
         let stolen = unsafe { self.toplevel.steal_data::<gdk::Window>(&self.key) };
         drop(stolen);

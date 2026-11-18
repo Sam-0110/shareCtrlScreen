@@ -647,6 +647,18 @@ impl Engine {
         });
     }
 
+    /// Whether viewer session `id` has decoded video (its view is ready to
+    /// show), whether or not it is shown.
+    #[doc(hidden)]
+    pub fn test_view_ready(&self, id: SessionId) -> bool {
+        self.reg
+            .lock()
+            .viewers
+            .get(&id)
+            .and_then(|v| v.gate.as_ref())
+            .is_some_and(|g| g.view.is_ready())
+    }
+
     /// Cut session `id`'s link as a dead network would: its transport declares
     /// it dead on its next pass and the session ends with `LinkLost`.
     #[doc(hidden)]

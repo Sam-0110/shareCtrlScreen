@@ -151,8 +151,6 @@ impl VideoSurface for MacVideoSurface {
             view.raise();
             view.apply_layout();
             view.setHidden(false);
-            // The tab on screen takes the keys without a click first.
-            view.take_focus();
         });
     }
 
@@ -226,6 +224,10 @@ impl VideoSurface for MacVideoSurface {
         // so the OS cursor can never leak onto the desktop.
         self.on_main("cursor control", |view| view.refresh_cursor());
     }
+    fn focus(&self) {
+        self.on_main("focus", |view| view.take_focus());
+    }
+
     fn set_top_inset(&self, css_px: u32) {
         if self.state.top_inset() == css_px {
             return;

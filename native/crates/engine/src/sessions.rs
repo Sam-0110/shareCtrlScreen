@@ -783,11 +783,11 @@ impl Engine {
         let id = id.filter(|i| reg.viewers.contains_key(i));
         let old = std::mem::replace(&mut reg.active, id);
         for (s, on) in [(old, false), (id, true)] {
-            if let Some(session) = s
+            if let Some(gate) = s
                 .and_then(|s| reg.viewers.get(&s))
-                .and_then(|v| v.session.as_ref())
+                .and_then(|v| v.gate.as_ref())
             {
-                session.set_active(on);
+                gate.set_active(on);
             }
         }
     }
@@ -809,8 +809,8 @@ impl Engine {
             let reg = self.reg.lock();
             reg.viewers
                 .values()
-                .filter_map(|v| v.session.as_ref())
-                .filter_map(|s| s.view())
+                .filter_map(|v| v.gate.as_ref())
+                .map(|g| g.view.clone())
                 .collect()
         };
         for v in views {
@@ -830,8 +830,19 @@ impl Engine {
         }
     }
 
-    pub(crate) fn is_active(&self, id: SessionId) -> bool {
-        self.reg.lock().active == Some(id)
+    /// Put viewer session `id`'s [`session::TabGate`] in its slot and apply
+    /// whether it is the active session now — under `reg`, like every switch,
+    /// so no switch can fall between the two.
+    pub(crate) fn attach_gate(&self, id: SessionId, gate: Arc<session::TabGate>) {
+        let mut reg = self.reg.lock();
+        let active = reg.active == Some(id);
+        // The slot stays while its start runs (an end then waits for the
+        // starter), so it is always there; a missing one only means nothing
+        // can switch it, and it stays inactive.
+        if let Some(v) = reg.viewers.get_mut(&id) {
+            gate.set_active(active);
+            v.gate = Some(gate);
+        }
     }
 
     pub(crate) fn overlay_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
@@ -1158,13 +1169,8 @@ impl Engine {
     pub(crate) fn store_viewer_session(&self, id: SessionId, s: session::Session) -> bool {
         let requested = {
             let mut reg = self.reg.lock();
-            let active = reg.active == Some(id);
             match reg.viewers.get_mut(&id) {
                 Some(v) => {
-                    // A switch while it was starting could not reach it (no
-                    // session yet): it takes the registry's answer now, under
-                    // the same lock every switch holds.
-                    s.set_active(active);
                     v.phase = ViewerPhase::Live;
                     v.session = Some(s);
                     v.starting = false;

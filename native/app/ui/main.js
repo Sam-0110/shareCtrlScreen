@@ -53,6 +53,9 @@ api.on('toast', (e) => toast(e.payload.message || '', 'error'));
 
 // ---- boot ------------------------------------------------------------------
 (async () => {
+  // A fresh page has no dialog open: clear the engine's app-wide "a dialog
+  // covers the video" flag in case the page reloaded with one open.
+  api.setVideoVisible(true).catch(() => {});
   await reloadConfig();
   syncNameField();
   // The account's state, including a bring-in question still open after a reload.

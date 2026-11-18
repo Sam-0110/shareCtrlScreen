@@ -179,6 +179,24 @@ pub(crate) struct Session {
     hooks: Option<TestHooks>,
 }
 
+/// Viewer: what the ActiveGate switches for one session — its view and its
+/// [`Activity`]. Put in the session's registry slot by `start_viewer` as soon
+/// as it exists, before any thread runs, so a switch or an overlay change
+/// reaches a session that is still being built (it would otherwise start
+/// from a stale "active" and show over the tab on screen).
+pub(crate) struct TabGate {
+    pub(crate) view: Arc<active::SessionView>,
+    activity: Arc<Activity>,
+}
+
+impl TabGate {
+    /// Only atomics and a non-blocking queue send: safe under `reg`.
+    pub(crate) fn set_active(&self, active: bool) {
+        self.activity.set(active);
+        self.view.set_active(active);
+    }
+}
+
 /// Viewer: what follows the session being the active one (plans/08 P3). Only
 /// the active session exchanges the clipboard (B3: otherwise text copied from
 /// one host would be forwarded to another) and holds the shortcut hook (B2).
@@ -190,16 +208,28 @@ pub(crate) struct Activity {
     /// Tells the shortcut thread to uninstall its hook: set while inactive and
     /// once the session stops.
     hook_quit: AtomicBool,
+    /// Bumped on every activation, so the shortcut thread can tell "still the
+    /// same activation" from "deactivated and activated again since".
+    generation: AtomicU64,
+    /// Wakes the clipboard loop when its gate changes, so it re-baselines at
+    /// once rather than up to a poll later — a copy made right after switching
+    /// to this tab then counts as new (and is sent), not as the baseline.
+    clip_wake: std::sync::mpsc::Sender<()>,
 }
 
 impl Activity {
-    fn new(clipboard_setting: bool, active: bool) -> Self {
-        Activity {
+    /// The activity and the clipboard loop's wake-up receiver.
+    fn new(clipboard_setting: bool, active: bool) -> (Self, std::sync::mpsc::Receiver<()>) {
+        let (clip_wake, wake_rx) = std::sync::mpsc::channel();
+        let activity = Activity {
             active: AtomicBool::new(active),
             clip_on: Arc::new(AtomicBool::new(clipboard_setting && active)),
             clipboard_setting,
             hook_quit: AtomicBool::new(!active),
-        }
+            generation: AtomicU64::new(0),
+            clip_wake,
+        };
+        (activity, wake_rx)
     }
 
     fn set(&self, active: bool) {
@@ -208,7 +238,12 @@ impl Activity {
         // while another tab was active is never forwarded here (08a §6.4 step 4).
         self.clip_on
             .store(active && self.clipboard_setting, Ordering::SeqCst);
+        if active {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
         self.hook_quit.store(!active, Ordering::SeqCst);
+        // Never blocks; fails only once the loop is gone (session over).
+        let _ = self.clip_wake.send(());
     }
 }
 
@@ -399,7 +434,7 @@ pub(crate) fn begin_host(
             stop.clone(),
         );
         spawn_or_abort!(engine, id, stop, threads, "clipboard", move || {
-            clipboard::clipboard_loop(platform, ctl, clip_rx, gate, stop_c)
+            clipboard::clipboard_loop(platform, ctl, clip_rx, None, gate, stop_c)
         });
     }
 
@@ -584,15 +619,24 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
     // setting governs.
     // Its view (shown only while active, ready, untroubled and uncovered)
     // and what follows being the active session (clipboard, shortcut hook).
-    let active_now = engine.is_active(id);
+    // Inactive until the registry says otherwise: `attach_gate` applies the
+    // current answer under the same lock every switch takes.
     let view = active::SessionView::new(
         surface.clone(),
         shared.clone(),
         engine.overlay_flag(),
         engine.view_ops(),
-        active_now,
+        false,
     );
-    let activity = Arc::new(Activity::new(prefs.clipboard_sync, active_now));
+    let (activity, clip_wake) = Activity::new(prefs.clipboard_sync, false);
+    let activity = Arc::new(activity);
+    engine.attach_gate(
+        id,
+        Arc::new(TabGate {
+            view: view.clone(),
+            activity: activity.clone(),
+        }),
+    );
     let clip_on = activity.clip_on.clone();
     let (clip_tx, clip_rx) = std::sync::mpsc::channel::<String>();
     {
@@ -603,7 +647,7 @@ pub(crate) fn start_viewer(engine: &Engine, id: SessionId, offer_sdp: String) {
             stop.clone(),
         );
         spawn_or_abort!(engine, id, stop, threads, "clipboard", move || {
-            clipboard::clipboard_loop(platform, ctl, clip_rx, gate, stop_c)
+            clipboard::clipboard_loop(platform, ctl, clip_rx, Some(clip_wake), gate, stop_c)
         });
     }
 
@@ -793,6 +837,9 @@ fn shortcut_loop(
             std::thread::sleep(TICK);
             continue;
         }
+        // This activation. Taken before installing, so an activation that
+        // comes and goes while the hook runs is seen below, however quick.
+        let generation = activity.generation.load(Ordering::SeqCst);
         match platform.create_shortcut_hook() {
             Some(mut hook) => {
                 if hook.install(surface, forwarder()) {
@@ -809,13 +856,15 @@ fn shortcut_loop(
             }
         }
         *owner.lock() = None;
-        // Not straight back in: wait for the session to become inactive (or
-        // stop) before trying again, so a hook that would not install is not
-        // retried in a tight loop.
-        while activity.active.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
-            if activity.hook_quit.load(Ordering::SeqCst) {
-                break;
-            }
+        // Ended with this activation (the tab went inactive — even if it is
+        // active again already — or the session stopped): straight back to
+        // the top. Ended while this activation lasts (it would not install,
+        // or the OS dropped it): not straight back in, so it is not retried
+        // in a tight loop — wait for the next activation.
+        while activity.active.load(Ordering::SeqCst)
+            && !stop.load(Ordering::SeqCst)
+            && activity.generation.load(Ordering::SeqCst) == generation
+        {
             std::thread::sleep(TICK);
         }
     }
@@ -1011,18 +1060,6 @@ impl Session {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(a) = &self.activity {
             a.hook_quit.store(true, Ordering::SeqCst);
-        }
-    }
-
-    /// Viewer: become (or stop being) the active session — its video shown
-    /// (when ready), its clipboard exchanged, its shortcut hook held. A no-op
-    /// on a host.
-    pub(crate) fn set_active(&self, active: bool) {
-        if let Some(a) = &self.activity {
-            a.set(active);
-        }
-        if let Some(v) = &self.view {
-            v.set_active(active);
         }
     }
 

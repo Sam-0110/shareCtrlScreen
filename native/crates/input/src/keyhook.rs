@@ -272,9 +272,20 @@ pub fn install(forward: Forward) -> bool {
 /// Remove the hook. Safe to call when not installed.
 pub fn uninstall() {
     set_focus_root(0);
-    SYNTH_ALT.store(false, std::sync::atomic::Ordering::SeqCst);
-    if let Ok(mut held) = HOOK_HELD.lock() {
-        held.clear(); // host releases everything at session end anyway
+    // Every key-up the remote is owed is forwarded BEFORE the forwarder goes:
+    // the hook is also removed mid-session (another tab became active), and
+    // that host would otherwise keep Alt or Win held — nothing else sends
+    // those ups, the keys never reached the video window. Taken out of the
+    // lock first: forwarding takes `STATE`.
+    let held: Vec<&'static str> = HOOK_HELD
+        .lock()
+        .map(|mut held| held.drain(..).collect())
+        .unwrap_or_default();
+    for code in held {
+        forward_key(code, false);
+    }
+    if SYNTH_ALT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        forward_key("AltLeft", false);
     }
     if let Ok(mut state) = STATE.lock() {
         if state.hook != 0 {

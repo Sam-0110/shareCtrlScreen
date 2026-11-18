@@ -158,6 +158,15 @@ pub trait VideoSurface: Send + Sync {
     /// (the pre-tabs layout).
     fn set_top_inset(&self, _css_px: u32) {}
 
+    /// Give the surface the keyboard: its tab was just activated and shown, so
+    /// keys go to it without a click first (plans/08 §3.5). Only inside the
+    /// app window the user is in: it never brings the app to the front. Not
+    /// called on a re-show (link restored, a dialog closed), so a web field the
+    /// user is typing in keeps the keys.
+    ///
+    /// Default: nothing (the user clicks the video to type into it).
+    fn focus(&self) {}
+
     /// Tear the native view down now (plans/08 B6). Call **on the UI
     /// thread**, once the session that used it was released; afterwards the
     /// surface is inert (every other method does nothing). Pop-out surfaces

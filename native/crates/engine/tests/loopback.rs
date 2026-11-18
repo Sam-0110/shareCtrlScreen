@@ -1858,6 +1858,9 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
         || matches!(host_b.engine.role(), Role::Host { ref peer, .. } if *peer == viewer_id),
     )
     .await;
+    // Decoding, so "not presented" below is the gate at work, not a
+    // session that has nothing to show yet.
+    eventually("B decodes", t, || viewer.engine.test_view_ready(b)).await;
     eventually("A kept presenting while B started", t, || {
         presented(&surface_a) > a_before_b + 30
     })
@@ -1872,6 +1875,16 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
         host_a.platform.clipboard.get_text().as_deref() == Some("for A")
     })
     .await;
+    // A copy made right before switching (B's loop has not polled since)
+    // is still never sent to B: the gate re-baselines when it opens.
+    viewer.platform.clipboard.user_copies("also for A");
+    viewer.engine.set_active(Some(b));
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_ne!(
+        host_b.platform.clipboard.get_text().as_deref(),
+        Some("also for A")
+    );
+    viewer.engine.set_active(Some(a));
 
     // Switching, 20 times: the old tab is hidden and stops presenting, the
     // new one is shown and presents (I2).
@@ -1909,6 +1922,9 @@ async fn one_viewer_holds_two_sessions_and_ends_them_separately() {
         Some("for A")
     );
     switch_to(b);
+    // Copied once B's clipboard gate has opened (it wakes at once; this
+    // waits a full poll so the test does not depend on that).
+    tokio::time::sleep(Duration::from_millis(500)).await;
     viewer.platform.clipboard.user_copies("for B");
     eventually("B's host gets B's copy", t, || {
         host_b.platform.clipboard.get_text().as_deref() == Some("for B")

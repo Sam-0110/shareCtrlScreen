@@ -135,6 +135,18 @@ it after the surface's `wl_surface`s are destroyed (B8). The tabs (P4) call `set
 and `destroy`; until then the app opens one main surface, so the device checklist
 (`checklists/TABS-P3.md`) runs on the P4 build.
 
+After the P3 review: each viewer slot holds its `TabGate` (view + activity) from the moment
+`start_viewer` builds it, so a switch or an overlay change reaches a session still starting.
+A show gives the keyboard only when it is the first since the tab was activated (new
+defaulted `VideoSurface::focus`), never on a re-show after link trouble or a dialog. The
+clipboard loop is woken when its gate changes and re-baselines on the rising edge (a copy
+made after switching is sent, one made before is not); it does not read the clipboard while
+closed. The UI clears the overlay flag whenever its last dialog closes and on page load,
+whatever the session state. Removing the Windows hook on a switch forwards the key-ups it
+owes; a hidden Windows video window takes no input and releases what it held. X11 removes
+`XdndProxy` only if it still names its own window, with a round trip. Wayland destroys a
+sink window when it frees it.
+
 Signaling: `app/src/main.rs`'s one `while … handle_signaling(event).await` loop stays the
 **dispatcher** only. Per-message work that can wait (secret-store opens, the host approval
 decision, bad-password delay, ICE gathering, `begin_host`, `start_viewer`) runs in a task
