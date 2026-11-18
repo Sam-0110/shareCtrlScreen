@@ -263,8 +263,15 @@ impl Engine {
                 caps,
                 ..
             } => {
-                if caps.as_ref().is_some_and(|c| c.popout) {
-                    self.popout_peers.lock().insert(from.clone());
+                // Only a first attempt carries caps (a password retry sends
+                // none, and keeps what the first said); each first attempt
+                // replaces what an earlier, possibly declined one said.
+                if let Some(c) = &caps {
+                    if c.popout {
+                        self.popout_peers.lock().insert(from.clone());
+                    } else {
+                        self.popout_peers.lock().remove(&from);
+                    }
                 }
                 let decode = caps.map(|c| c.decode).unwrap_or_default();
                 self.on_connect_request(from, password, decode).await;
