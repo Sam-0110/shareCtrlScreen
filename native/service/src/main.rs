@@ -1,7 +1,8 @@
 //! The SYSTEM Windows service binary (Plan 04 §4, §8b). Thin: it wires the
 //! `elevation` primitives into the SCM dispatcher and the session-follow launch
 //! loop. It does NOT host UI (Microsoft warns against it) — it launches the
-//! host app into the active user session and relaunches on session change.
+//! host app into the active user session, relaunches on session change, and
+//! relaunches a host that dies (`supervise`).
 //!
 //! The NSIS installer ships this binary next to `sharectrl.exe` and drives it
 //! from its hooks (`native/app/installer-hooks.nsh`, task W4); the same
@@ -13,6 +14,11 @@
 //!   sharectrl-service --stop-service      stop, wait until the process exits
 //!   sharectrl-service --uninstall-service stop, then remove
 //!   sharectrl-service --run-service       (invoked by the SCM)
+
+// The relaunch policy is plain logic, built (and tested) on every OS; only the
+// Windows service uses it.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod supervise;
 
 // The service is a Windows concept (SCM, sessions, the secure desktop). On other
 // platforms the binary only explains that, so the workspace builds everywhere.
@@ -30,7 +36,9 @@ fn main() {
 #[cfg(windows)]
 mod windows_service {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    use crate::supervise::{Exit, Supervisor};
 
     use elevation::service::{Installed, Stopped, Uninstalled, SERVICE_NAME};
 
@@ -242,45 +250,69 @@ mod windows_service {
         )
     }
 
-    /// Follow the active session and keep the engine running there (§8b). Relaunch
-    /// whenever the active console session changes (login, fast-user-switch, RDP).
+    /// Follow the active session and keep the engine running there (§8b).
+    /// Launch whenever the active console session changes (login,
+    /// fast-user-switch, RDP), and launch again when the host this service
+    /// started dies. A host that exits cleanly (Quit, an update, a duplicate
+    /// stepping aside) stays down; [`crate::supervise`] has the policy.
     fn session_loop() {
         let engine_exe = engine_path();
         let args = host_args();
-        let mut last_session: Option<u32> = None;
+        let mut policy = Supervisor::new();
+        // The host this service started in the current session, while running.
+        let mut host: Option<elevation::HostProcess> = None;
 
         while !STOP.load(Ordering::SeqCst) {
-            match elevation::active_console_session() {
-                Some(session) if Some(session) != last_session => {
-                    match elevation::user_token(session) {
-                        Ok(token) => {
-                            // Owned so the handle is closed after every launch
-                            // attempt — this loop runs for the life of the
-                            // machine and relaunches on every session change.
-                            // (W4 closed the raw handle here; OwnedToken does the
-                            // same by RAII, and the child has its own copy once
-                            // CreateProcessAsUser returns.)
-                            let token = elevation::OwnedToken::from_raw(token);
-                            // W4 launch args (`--autostart --service-host`); the
-                            // UIAccess flag is set inside launch_in_session (W5).
-                            match elevation::launch_in_session(token.handle(), &engine_exe, &args) {
-                                Ok(launched) => {
-                                    log_launch(&launched, session);
-                                    last_session = Some(session);
-                                }
-                                Err(e) => tracing::warn!("launch failed: {e}"),
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("user token unavailable for session {session}: {e}")
-                        }
+            if let Some(code) = host.as_ref().and_then(elevation::HostProcess::exit_code) {
+                host = None;
+                match policy.exited(code, Instant::now()) {
+                    Exit::Clean => tracing::info!(
+                        "the host exited cleanly (Quit, an update, or another host already \
+                         runs); not relaunching until the session changes"
+                    ),
+                    Exit::Abnormal { code, retry_in } => tracing::warn!(
+                        "the host exited abnormally (exit code {code:#x}); relaunching in {}s",
+                        retry_in.as_secs()
+                    ),
+                }
+            }
+            let active = elevation::active_console_session();
+            if let Some(session) = policy.poll(active, Instant::now()) {
+                match launch(&engine_exe, &args, session) {
+                    Ok(launched) => {
+                        log_launch(&launched, session);
+                        host = Some(launched.process);
+                        policy.launched(Instant::now());
+                    }
+                    Err(e) => {
+                        let retry_in = policy.launch_failed(Instant::now());
+                        tracing::warn!("{e}; retrying in {}s", retry_in.as_secs());
                     }
                 }
-                Some(_) => {}
-                None => last_session = None, // logged out; relaunch on next login
+            }
+            // Only the current session's running host is watched. After a
+            // session change (sign-out, user switch) the previous host's
+            // handle is dropped here, so its exit is never mistaken for a
+            // crash of this session's host.
+            if !policy.watching() {
+                host = None;
             }
             std::thread::sleep(Duration::from_secs(2));
         }
+    }
+
+    /// Start the host in `session` as that session's user.
+    fn launch(engine_exe: &str, args: &str, session: u32) -> Result<elevation::Launched, String> {
+        let token = elevation::user_token(session)
+            .map_err(|e| format!("user token unavailable for session {session}: {e}"))?;
+        // Owned so the handle is closed after every launch attempt — this loop
+        // runs for the life of the machine. The child has its own copy once
+        // CreateProcessAsUser returns.
+        let token = elevation::OwnedToken::from_raw(token);
+        // W4 launch args (`--autostart --service-host`); the UIAccess flag is
+        // set inside launch_in_session (W5).
+        elevation::launch_in_session(token.handle(), engine_exe, args)
+            .map_err(|e| format!("launch failed: {e}"))
     }
 
     /// One line per launch, saying whether the host got the UIAccess flag and,

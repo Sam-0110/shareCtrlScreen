@@ -16,6 +16,8 @@
 // On Windows release builds, don't spawn a console window.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+#[cfg(windows)]
+mod tray;
 mod uiaccess;
 mod updater;
 
@@ -487,7 +489,8 @@ fn attach_video_surface(engine: &Engine, win: &tauri::WebviewWindow) {
     }
 }
 
-/// Bring the main window up for a launch that handed over to this host.
+/// Bring the main window up: for a launch that handed over to this host, and
+/// from the tray.
 #[cfg(windows)]
 fn raise_main_window(app: &tauri::AppHandle) {
     let Some(win) = app.get_webview_window("main") else {
@@ -548,9 +551,13 @@ fn install_native_menu(app: &tauri::App) -> tauri::Result<()> {
 /// "Check for updates" go to the webview as events — the same `openSettings`
 /// flow the gear buttons use; "Check for updates" additionally runs the quiet
 /// updater check in the Updates panel. Disconnect ends the session straight
-/// through the engine, exactly as the `end_session` command does. A no-op on
-/// Windows (no menu is installed there, so this never fires).
+/// through the engine, exactly as the `end_session` command does. On Windows
+/// only the service host's tray menu fires ([`tray`]).
 fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
+    #[cfg(windows)]
+    if tray::handle_menu_event(app, event.id().as_ref()) {
+        return;
+    }
     match event.id().as_ref() {
         "menu-settings" => {
             let _ = app.emit("menu://settings", ());
@@ -590,6 +597,10 @@ fn main() {
         }
         platform_windows::instance::Gate::Run { marker, note } => (marker, note),
     };
+    // The service host lives in the tray: closing its window hides it
+    // (`tray.rs`). Read now: `service_host` is taken in `setup`.
+    #[cfg(windows)]
+    let lives_in_tray = service_host.is_some();
 
     let (platform, openh264, h264_problem) = make_platform();
     init_logging(&platform.paths().log_dir, APP_LOG);
@@ -643,9 +654,17 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(state)
-        // Native menu clicks (macOS + Linux). Harmless on Windows: no menu is
-        // installed there, so it never fires.
+        // Native menu clicks (macOS + Linux), and the Windows service host's
+        // tray menu.
         .on_menu_event(handle_menu_event)
+        // Windows service host: closing the window hides it to the tray (a
+        // no-op until the tray icon exists, so other instances still quit).
+        .on_window_event(|window, event| {
+            #[cfg(windows)]
+            tray::on_window_event(window, event);
+            #[cfg(not(windows))]
+            let _ = (window, event);
+        })
         .invoke_handler(tauri::generate_handler![
             get_config,
             get_platform_info,
@@ -679,6 +698,16 @@ fn main() {
                 tracing::warn!("native menu: {e}");
             }
 
+            // The service host keeps running when its window is closed, so
+            // it needs a way back and a way out: the tray icon. Not fatal:
+            // without it the window closes the app, as before.
+            #[cfg(windows)]
+            if lives_in_tray {
+                if let Err(e) = tray::install(app) {
+                    tracing::warn!("tray icon: {e}; closing the window will quit");
+                }
+            }
+
             // Another launch in this session asks the service host to show
             // its window instead of starting a second host.
             #[cfg(windows)]
@@ -695,6 +724,8 @@ fn main() {
                             ("server-status", serde_json::json!({ "status": s }))
                         }
                         UiEvent::ApprovalRequest { from } => {
+                            #[cfg(windows)]
+                            tray::show_for_approval(&handle);
                             ("approval-request", serde_json::json!({ "from": from }))
                         }
                         UiEvent::PasswordRequired { from } => {

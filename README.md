@@ -34,6 +34,12 @@ Run the installer from the Releases page.
   registers and starts the `ShareCtrlScreenHost` service (one administrator consent). The
   service launches the host at every sign-in and reaches the lock screen and UAC prompts.
   Uninstalling removes the service.
+- The host the service starts lives in the notification area. **Closing its window does
+  not disconnect the machine**: it ends any live session and hides the window, and the
+  machine stays reachable. Click the tray icon to bring the window back, or right-click
+  it → **Quit** to stop the host. After Quit the host stays stopped until you sign in
+  again or start the app. If the host crashes or is ended from Task Manager, the service
+  starts it again within seconds.
 - Because the service already starts the host at sign-in, the installed app does **not**
   add its own "Start at sign-in" entry (one host, not two). The setting has no effect while
   the service is installed.

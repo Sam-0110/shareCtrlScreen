@@ -44,6 +44,9 @@ raw-window-handle = "0.6"
 platform-api = { path = "../crates/platform-api", features = ["mock"] }
 
 [target.'cfg(windows)'.dependencies]
+# The service host's notification-area icon (tray.rs). Windows only: the other
+# OSes have no service host, and Linux would gain an appindicator dependency.
+tauri = { version = "2", features = ["tray-icon"] }
 platform-windows = { path = "../crates/platform-windows" }
 # The UIAccess token query for the startup line and `--print-uiaccess` (W5).
 elevation = { path = "../crates/elevation" }
