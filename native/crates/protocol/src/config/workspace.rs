@@ -383,6 +383,27 @@ impl Workspace {
         true
     }
 
+    /// Record whether `id`'s open tab is in a window of its own, stamped
+    /// only when it changes. Unlike [`detach_tab`](Self::detach_tab) /
+    /// [`dock_tab`](Self::dock_tab) it does not look at what the account
+    /// last said: a computer's own windows are its own until the next
+    /// sign-in (plans/09 J6), so the app records what it did. `false` when
+    /// it is not an open tab.
+    pub fn set_detached(&mut self, id: &str, detached: bool, now: u64) -> bool {
+        let Some(tab) = tab_key(id).and_then(|k| self.tabs.get_mut(&k)) else {
+            return false;
+        };
+        if !tab.is_open() {
+            return false;
+        }
+        // A detach counts only when stamped after the opening (`is_detached`).
+        if tab.detached != detached || (detached && tab.detached_at <= tab.opened_at) {
+            tab.detached = detached;
+            tab.detached_at = now.max(tab.detached_at).max(tab.opened_at + 1);
+        }
+        true
+    }
+
     /// Put `id`'s detached tab back in the strip, at its end, as the active
     /// tab. `false` when it is not an open, detached tab.
     pub fn dock_tab(&mut self, id: &str, now: u64) -> bool {
@@ -434,11 +455,21 @@ impl Workspace {
         if !tab.is_open() {
             return false;
         }
-        if tab.size != Some(size) {
+        // Within a rounding step of what is saved: unchanged. A window put
+        // back from its saved shares can read back a share off by one; that
+        // must not re-stamp (and re-sync) it on every launch.
+        if !tab
+            .size
+            .is_some_and(|s| near(s.w, size.w) && near(s.h, size.h))
+        {
             tab.size = Some(size);
             tab.size_at = now.max(tab.size_at);
         }
-        if let Some(pos) = pos.filter(|p| tab.pos != Some(*p)) {
+        let moved = |p: &Pos| {
+            !tab.pos
+                .is_some_and(|q| q.monitor == p.monitor && near(q.x, p.x) && near(q.y, p.y))
+        };
+        if let Some(pos) = pos.filter(moved) {
             tab.pos = Some(pos);
             tab.pos_at = now.max(tab.pos_at);
         }
@@ -733,6 +764,11 @@ impl Workspace {
             }
         }
     }
+}
+
+/// Two placement shares that differ by at most a rounding step.
+fn near(a: u16, b: u16) -> bool {
+    a.abs_diff(b) <= 2
 }
 
 /// A tab's key: the remote ID, lower-cased; `None` for anything else.

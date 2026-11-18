@@ -477,6 +477,9 @@ async fn a_cancelled_password_prompt_does_not_leave_this_computer_busy() {
     // for that before the next request: answering "busy" until then is the
     // design (P2), not the stuck-busy bug this test guards against.
     me.engine.end_all_and_wait(t).await;
+    // The other viewer's refused request is still being released too (it
+    // holds that host and surface until then, `ConnectError::Ending`).
+    other.engine.end_all_and_wait(t).await;
     other.open(&me.uuid);
     let other_id = other.uuid.clone();
     eventually("the other viewer is let in", t, || {
@@ -2463,6 +2466,11 @@ async fn ending_a_session_during_its_start_leaves_nothing_behind() {
         matches!(host.engine.role(), Role::Idle)
     })
     .await;
+
+    // The host's ended session must be released too (its threads joined)
+    // before it takes a new one: until then it answers "busy" (registry
+    // `busy_for`). Its role goes Idle earlier, so wait for the release.
+    host.engine.end_all_and_wait(Duration::from_secs(5)).await;
 
     // Waiting for every session to be released, as Quit does, returns with
     // nothing left running.

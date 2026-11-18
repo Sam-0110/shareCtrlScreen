@@ -122,12 +122,18 @@ reported (09 §7.6).
 
 ### 3.4 Commands and events
 
-Commands (UI → app; all take the tab's `remoteId`, never "the active session"):
-`tab_detach`, `tab_dock`, `window_close` (= Disconnect + close tab), and the session-bar
-commands `end_session`, `request_refresh`, `select_display`, `popout_display`,
-`set_video_visible` (+ the calling window). Events: `tabs-changed` (docked tabs only, plus a
-`detached` list), `tab-state {remoteId, tab}` for a detached window's own tab, `tab-displays` /
-`tab-toast` by remote.
+Commands (UI → app; all take the tab's `remoteId`, never "the active session"; as built in W3):
+`tab_detach`, `tab_dock`, and the session-bar commands `end_session`, `request_refresh`,
+`select_display`, `popout_display` (`remoteId` optional: none = the host screen's session),
+`set_video_visible` (the calling window, from Tauri; a window with no tab is refused). Closing a
+detached window is its X (`CloseRequested`, prevented, then Disconnect + close tab), not a
+command. Events: `tabs-changed` with the strip's tabs and a `detached` list (each tab's
+`window`); each window draws its own tab from that list; `tab-displays` / `tab-toast` by
+remote (a window shows its own tab's toasts, the main window the strip's).
+
+Detach and Dock refuse a tab that is connecting (its surface is being made) or already moving
+("busy: try again"), and a second click on either is a no-op (W3 review: recorded here as the
+built behaviour; 09a §4.1's "any phase" means any session phase, which `move_session` supports).
 
 ## 4. State machines
 

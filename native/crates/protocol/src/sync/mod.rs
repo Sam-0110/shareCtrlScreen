@@ -110,7 +110,6 @@ impl Default for SyncDoc {
 }
 
 impl SyncDoc {
-    /// Fold `other` into `self` (see the module docs for the rules).
     /// Leave every tab's window out (plans/09 W4): a computer sends
     /// placement only to a server that lists [`FEATURE_PLACEMENT`].
     pub fn strip_placement(&mut self) {
@@ -119,6 +118,7 @@ impl SyncDoc {
         }
     }
 
+    /// Fold `other` into `self` (see the module docs for the rules).
     pub fn merge(&mut self, other: &SyncDoc) {
         for (id, theirs) in &other.entries {
             self.entries.entry(id.clone()).or_default().merge(theirs);
@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn placement_is_left_out_for_a_server_that_does_not_store_it() {
         let mut mine = SyncDoc::default();
-        let mut tab = SyncTab {
+        let tab = SyncTab {
             order: "m".into(),
             order_at: 1,
             opened_at: 2,
@@ -488,11 +488,11 @@ mod tests {
             serde_json::json!({"order":"m","orderAt":1,"openedAt":2,"closedAt":0})
         );
         // The old server answers with what it stored; merged here, the
-        // window survives.
+        // window survives unchanged.
         mine.merge(&sent);
-        tab.merge(&sent.tabs[X]);
         assert_eq!(mine.tabs[X], tab);
         assert!(mine.tabs[X].is_detached());
+        assert_eq!(mine.tabs[X].window_size(), Some(Size { w: 5000, h: 5000 }));
     }
 
     #[test]

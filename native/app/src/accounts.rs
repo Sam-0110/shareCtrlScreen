@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use engine::{Engine, WorkspaceSel};
 use protocol::SyncDoc;
 use serde::Deserialize;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 use crate::AppState;
 
@@ -372,7 +372,9 @@ impl AccountManager {
                     .apply_sync(&key, epoch, &body.doc, sent.tabs, sent.prefs);
                 self.inner().error = None;
                 self.emit_state();
-                let gained = (now.tabs && !sent.tabs) || (now.prefs && !sent.prefs);
+                let gained = (now.tabs && !sent.tabs)
+                    || (now.prefs && !sent.prefs)
+                    || (now.placement && !sent.placement);
                 Ok(if gained {
                     Round::AgainWithNewFeatures
                 } else {
@@ -536,9 +538,25 @@ impl AccountManager {
                 .await;
         }
         self.emit_state();
-        // The first sync runs now, so the account's data appears at once.
-        self.sync_once().await?;
+        // The first sync runs now, so the account's data appears at once —
+        // its detached tabs' windows included, opened once it settled.
+        let synced = self.sync_once().await;
+        self.seed_windows();
+        synced?;
         Ok(warning)
+    }
+
+    /// The account's first sync settled (applied, or failed: the cached copy
+    /// stands): its detached tabs' windows open now (plans/09 J6, 09a §5.5).
+    fn seed_windows(&self) {
+        let tabs = self
+            .handle
+            .get()
+            .and_then(|h| h.try_state::<Arc<crate::tabs::TabManager>>())
+            .map(|t| t.inner().clone());
+        if let Some(tabs) = tabs {
+            tabs.seed_windows();
+        }
     }
 
     /// The answer to "bring this computer's tabs and names in?" (§6.10 step 3).
@@ -557,7 +575,9 @@ impl AccountManager {
             .await;
         self.engine.hold_connects(false);
         self.emit_state();
-        self.sync_once().await
+        let synced = self.sync_once().await;
+        self.seed_windows();
+        synced
     }
 
     /// Switch to the local workspace or to an account (§6.11). An account
@@ -582,6 +602,7 @@ impl AccountManager {
         self.emit_state();
         if signed_in {
             let _ = self.sync_once().await;
+            self.seed_windows();
         }
         Ok(())
     }

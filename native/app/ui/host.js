@@ -3,7 +3,7 @@
 
 import * as api from './api.js';
 import { peerLabel } from './connect.js';
-import { $, S, countdown, setState, stopCountdown } from './state.js';
+import { $, S, countdown, setState, stopCountdown, windowRemote } from './state.js';
 
 // incoming approval (host)
 function answerIncoming(decision) {
@@ -25,6 +25,8 @@ export function wireHost() {
   $('btn-host-end').addEventListener('click', () => api.endSession());
 
   api.on('approval-request', (e) => {
+    // Asked in the main window only.
+    if (windowRemote) return;
     S.incomingFrom = e.payload.from;
     $('incoming-peer').textContent = peerLabel(S.incomingFrom);
     setState('INCOMING');

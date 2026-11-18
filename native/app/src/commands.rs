@@ -362,7 +362,8 @@ pub async fn set_video_visible(
     visible: bool,
 ) -> Result<(), String> {
     // The calling window's video only (plans/09 J4).
-    let id = crate::windows::window_of(window.label()).unwrap_or(engine::WindowId::MAIN);
+    let id = crate::windows::window_of(window.label())
+        .ok_or_else(|| format!("window {} shows no tab", window.label()))?;
     state.engine.set_overlay(id, !visible).await;
     Ok(())
 }

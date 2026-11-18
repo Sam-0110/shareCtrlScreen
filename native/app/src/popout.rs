@@ -316,7 +316,7 @@ fn attach(
 /// module docs.
 fn close_window(app: &AppHandle, engine: &Arc<Engine>, slot: u8, e: Entry, tell_host: bool) {
     if let Some(wm) = app.try_state::<Arc<crate::windows::WindowManager>>() {
-        wm.unwatch(&e.label);
+        wm.unwatch(&e.label, crate::windows::Who::Popout(e.session));
     }
     let win = app.get_webview_window(&e.label);
     let engine = engine.clone();

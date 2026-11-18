@@ -11,7 +11,7 @@
 
 import * as api from './api.js';
 import { nameOf, peerLabel, reloadConfig } from './connect.js';
-import { $, S, errorText, render, toast } from './state.js';
+import { $, S, errorText, render, toast, windowRemote } from './state.js';
 
 const LOCAL = 'local';
 
@@ -20,7 +20,12 @@ const view = () => (S.config && S.config.account) || { state: LOCAL, accounts: [
 /** Whether this computer is viewing (or connecting to) another one: a
  *  switch or sign-out disconnects every tab (D6). */
 function viewerBusy() {
-  return S.tabs.tabs.some((t) => t.phase !== 'disconnected');
+  return connectedTabs().length > 0;
+}
+
+/** Every connected tab: in the strip and in windows of their own (plans/09). */
+function connectedTabs() {
+  return [...S.tabs.tabs, ...(S.tabs.detached || [])].filter((t) => t.phase !== 'disconnected');
 }
 
 function ago(ms) {
@@ -102,6 +107,11 @@ function applyAccountState(v) {
   if (v.error && v.state === 'signedIn') setAccountStatus(v.error, true);
   // The bring-in question is part of the state, so it also comes back after
   // the page reloads.
+  // Asked in the main window only (a detached window shows one tab).
+  if (windowRemote) {
+    render();
+    return;
+  }
   if (v.bringIn && $('modal-bring-in').classList.contains('hidden')) showBringIn(v.bringIn);
   else if (!v.bringIn) $('modal-bring-in').classList.add('hidden');
   render();
@@ -134,7 +144,7 @@ function confirmAccountChange(title, detail) {
   $('account-confirm-detail').classList.toggle('hidden', !detail);
   $('account-confirm-session').classList.toggle('hidden', !ending);
   // D6: every connected tab goes, not just the one on screen.
-  const busy = S.tabs.tabs.filter((t) => t.phase !== 'disconnected');
+  const busy = connectedTabs();
   $('account-confirm-peer').textContent =
     busy.length === 1
       ? `your session with ${busy[0].name || peerLabel(busy[0].remoteId)}`

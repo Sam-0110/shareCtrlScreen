@@ -87,6 +87,9 @@ pub(crate) enum Who {
 #[derive(Debug)]
 pub(crate) enum WindowReport {
     Activity(Who, WindowActivity),
+    /// The window went (its watch first, so its last word may still say
+    /// "active"): forget what it said.
+    Gone(Who),
     /// A detached window settled after a move, resize or state change: its
     /// placement to save.
     Placement {
@@ -111,10 +114,14 @@ pub(crate) struct WindowManager {
     reports: tokio::sync::mpsc::UnboundedSender<WindowReport>,
     /// Live watches by window label (dropped on the UI thread).
     watches: Mutex<HashMap<String, Box<dyn WindowWatch>>>,
-    /// Bumped on every move or resize of a window: a save goes ahead only if
-    /// nothing moved since it was scheduled.
-    moves: Mutex<HashMap<String, u64>>,
+    /// Per window, the latest move or resize and whether a save is waiting
+    /// for it to settle: one waiting task per window, however long the drag.
+    moves: Mutex<HashMap<String, (u64, bool)>>,
     serial: AtomicU64,
+    /// Windows being placed by `open`: the moves and resizes that placing
+    /// causes are the saved placement played back (or a minimise at login),
+    /// not the user's, so they are not saved again.
+    placing: Mutex<std::collections::HashSet<String>>,
 }
 
 impl WindowManager {
@@ -130,6 +137,7 @@ impl WindowManager {
             watches: Mutex::default(),
             moves: Mutex::default(),
             serial: AtomicU64::new(0),
+            placing: Mutex::default(),
         })
     }
 
@@ -150,12 +158,14 @@ impl WindowManager {
         self.watch_on_ui_thread(win, Who::Popout(session));
     }
 
-    /// Stop watching window `label` (a pop-out closing). Any thread.
-    pub(crate) fn unwatch(&self, label: &str) {
+    /// Stop watching window `label` of `who` (a pop-out closing). Any
+    /// thread.
+    pub(crate) fn unwatch(&self, label: &str, who: Who) {
         let watch = Self::lock(&self.watches).remove(label);
         if let Some(watch) = watch {
             self.drop_on_ui_thread(watch);
         }
+        let _ = self.reports.send(WindowReport::Gone(who));
     }
 
     fn watch_on_ui_thread(&self, win: &tauri::WebviewWindow, who: Who) {
@@ -208,6 +218,7 @@ impl WindowManager {
         place: Place,
     ) -> Result<(), String> {
         let label = label_of(id);
+        Self::lock(&self.placing).insert(label.clone());
         let url = WebviewUrl::App(format!("index.html?window={remote}").into());
         let win = WebviewWindowBuilder::new(&self.app, &label, url)
             .title(format!("{title} \u{2014} ShareCtrlScreen"))
@@ -217,28 +228,34 @@ impl WindowManager {
             .build()
             .map_err(|e| format!("could not open a window: {e}"))?;
         // Placed while hidden, so it never shows in the wrong place first.
+        // A step that fails leaves the window usable where the OS put it.
+        let step = |what: &str, r: tauri::Result<()>| {
+            if let Err(e) = r {
+                tracing::warn!("window {label}: {what}: {e}");
+            }
+        };
         match self.rect_for(&win, place) {
             Some((pos, inner)) => {
                 // Position first: the size is then in that monitor's scale.
-                let _ = win.set_position(pos);
-                let _ = win.set_size(inner);
+                step("position", win.set_position(pos));
+                step("size", win.set_size(inner));
             }
-            None => {
-                let _ = win.center();
-            }
+            None => step("center", win.center()),
         }
-        let _ = win.show();
+        step("show", win.show());
         match place.state {
-            WinState::Maximized => {
-                let _ = win.maximize();
-            }
-            WinState::Minimized => {
-                let _ = win.minimize();
-            }
-            WinState::Normal => {
-                let _ = win.set_focus();
-            }
+            WinState::Maximized => step("maximize", win.maximize()),
+            WinState::Minimized => step("minimize", win.minimize()),
+            WinState::Normal => step("focus", win.set_focus()),
         }
+        // The OS delivers the placing's own move / resize events shortly
+        // after; from then on they are the user's.
+        let me = self.clone();
+        let placed = label.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(SAVE_AFTER * 2).await;
+            Self::lock(&me.placing).remove(&placed);
+        });
         let (tx, rx) = tokio::sync::oneshot::channel();
         let me = self.clone();
         let w = win.clone();
@@ -340,14 +357,35 @@ impl WindowManager {
         let Some(window) = window_of(label).filter(|w| *w != WindowId::MAIN) else {
             return;
         };
+        if Self::lock(&self.placing).contains(label) {
+            return;
+        }
         let serial = self.serial.fetch_add(1, Ordering::Relaxed);
-        Self::lock(&self.moves).insert(label.to_string(), serial);
+        let waiting = {
+            let mut moves = Self::lock(&self.moves);
+            let entry = moves.entry(label.to_string()).or_insert((serial, false));
+            entry.0 = serial;
+            std::mem::replace(&mut entry.1, true)
+        };
+        if waiting {
+            return; // the task already waiting sees this move
+        }
         let me = self.clone();
         let label = label.to_string();
         tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(SAVE_AFTER).await;
-            if Self::lock(&me.moves).get(&label) != Some(&serial) {
-                return; // moved again since: that one saves
+            // Until nothing moved for SAVE_AFTER (or the window went).
+            let mut seen = serial;
+            loop {
+                tokio::time::sleep(SAVE_AFTER).await;
+                let mut moves = Self::lock(&me.moves);
+                match moves.get_mut(&label) {
+                    None => return,
+                    Some(entry) if entry.0 != seen => seen = entry.0,
+                    Some(entry) => {
+                        entry.1 = false;
+                        break;
+                    }
+                }
             }
             if let Some(report) = me.read_placement(window, &label) {
                 let _ = me.reports.send(report);
@@ -401,6 +439,7 @@ impl WindowManager {
         let label = label_of(id);
         Self::lock(&self.moves).remove(&label);
         let watch = Self::lock(&self.watches).remove(&label);
+        let _ = self.reports.send(WindowReport::Gone(Who::Window(id)));
         let app = self.app.clone();
         let destroy = move || {
             drop(watch);

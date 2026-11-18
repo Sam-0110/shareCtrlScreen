@@ -37,6 +37,8 @@ use tauri::{AppHandle, Emitter};
 use crate::menu::update_monitor_menu;
 use crate::surfaces::SurfaceFactory;
 use crate::windows::{Place, Who, WindowManager, WindowReport};
+use engine::WorkspaceSel;
+use protocol::sync::WinState;
 
 /// Connected tabs past which opening another asks first (D2: no cap, a
 /// confirm).
@@ -115,6 +117,9 @@ enum MoveKind {
     Dock(WindowId),
 }
 
+/// A surface and the window it is in.
+type Placed = (Arc<dyn VideoSurface>, WindowId);
+
 #[derive(Default)]
 struct Inner {
     /// By remote ID. Only tabs that were ever live in this run; the strip
@@ -122,8 +127,9 @@ struct Inner {
     live: HashMap<String, TabLive>,
     /// Every surface a session may still draw into, until the engine lets
     /// go of it (`SurfaceReleased`, `Released`): its current one and the
-    /// one a move is taking it to.
-    surfaces: HashMap<SessionId, Vec<Arc<dyn VideoSurface>>>,
+    /// one a move is taking it to — each with the window it is in, so a
+    /// window is never closed while a session can still draw in it (J1).
+    surfaces: HashMap<SessionId, Vec<Placed>>,
     /// Remotes whose connection is being set up (its surface being made).
     starting: HashSet<String>,
     /// Of those, the ones the user disconnected or closed meanwhile: the
@@ -149,13 +155,21 @@ struct Inner {
     seeded: Option<u64>,
     /// Tabs whose window is being made by Detach.
     detaching: HashSet<String>,
+    /// Tabs whose Dock is being set up.
+    docking: HashSet<String>,
+    /// Detached windows closed while a connection was being set up in them:
+    /// they go once that setup has let go of its surface.
+    close_after_start: HashMap<String, WindowId>,
     /// Moves under way, by session.
     moves: HashMap<SessionId, Move>,
     /// Windows that close once a session is released (closed with X while
     /// connected, or left behind by an account switch).
-    close_after: HashMap<SessionId, WindowId>,
-    /// The OS's last word on each window.
+    close_after: HashMap<SessionId, Vec<WindowId>>,
+    /// The OS's last word on each window still open.
     activity: HashMap<Who, WindowActivity>,
+    /// The window the OS says is active now (the last one reported active,
+    /// until it reports otherwise or goes).
+    active: Option<Who>,
     /// The window the user was in last (sticky focus for the clipboard while
     /// another app is in front, 09 §7 blocker 5); the main window until the
     /// OS says otherwise.
@@ -337,9 +351,14 @@ impl TabManager {
                 Attempt::Stopped => break false,
             }
         };
-        // An unused surface goes, outside the lock (the UI thread does it).
+        // An unused surface goes, outside the lock (the UI thread does it) —
+        // and then a window closed meanwhile, which waited for it (J1).
         if let (false, Ok(surface)) = (connected, made) {
             self.surfaces.destroy(surface);
+        }
+        let closed = self.lock().close_after_start.remove(&remote);
+        if let Some(w) = closed {
+            self.windows.close(w);
         }
         self.apply_active();
         Ok(Started::Done)
@@ -369,7 +388,7 @@ impl TabManager {
                 Ok(surface) => match self.engine.connect_in(remote, surface.clone(), window) {
                     Ok(id) => {
                         inner.starting.remove(remote);
-                        inner.surfaces.insert(id, vec![surface.clone()]);
+                        inner.surfaces.insert(id, vec![(surface.clone(), window)]);
                         let tab = inner.live.entry(remote.to_string()).or_default();
                         tab.session = Some(id);
                         tab.phase = Phase::Connecting;
@@ -423,16 +442,15 @@ impl TabManager {
             if inner.shown.as_ref() == Some(&Some(remote.clone())) {
                 inner.shown = None;
             }
-            // Its own window goes with it: now when nothing draws in it,
-            // else once the session (being ended above) is released.
+            // Its own window goes with it: now when nothing draws in it, else
+            // once what does (the session being ended above, or a connection
+            // being set up there) has let go (J1).
             match inner.detached.remove(&remote) {
-                Some(w) => match live_session(&inner, &remote) {
-                    Some(s) => {
-                        inner.close_after.insert(s, w);
-                        None
-                    }
-                    None => Some(w),
-                },
+                Some(w) if inner.starting.contains(&remote) => {
+                    inner.close_after_start.insert(remote.clone(), w);
+                    None
+                }
+                Some(w) => close_when_free(&mut inner, w),
                 None => None,
             }
         };
@@ -473,7 +491,12 @@ impl TabManager {
                 .and_then(|r| inner.live.get(r))
                 .filter(|t| t.phase == Phase::Live)
                 .and_then(|t| t.session)
-                .and_then(|id| inner.surfaces.get(&id).and_then(|l| l.last().cloned()))
+                .and_then(|id| {
+                    inner
+                        .surfaces
+                        .get(&id)
+                        .and_then(|l| l.last().map(|(s, _)| s.clone()))
+                })
         };
         self.apply_active();
         if let Some(surface) = focus {
@@ -607,11 +630,17 @@ impl TabManager {
             if !ws.tabs.get(&remote).is_some_and(|t| t.is_open()) {
                 return Err("That tab is not open".into());
             }
-            if inner.detached.contains_key(&remote) || inner.detaching.contains(&remote) {
-                return Err("That tab already has its own window".into());
+            // A second click: the window exists or is on its way.
+            if let Some(w) = inner.detached.get(&remote).copied() {
+                drop(inner);
+                self.windows.raise(w);
+                return Ok(());
             }
-            if inner.starting.contains(&remote) {
-                return Err("That tab is connecting: try again in a moment".into());
+            if inner.detaching.contains(&remote) {
+                return Ok(());
+            }
+            if inner.starting.contains(&remote) || inner.docking.contains(&remote) {
+                return Err("That tab is busy: try again in a moment".into());
             }
             let session = live_session(&inner, &remote);
             if session.is_some_and(|s| inner.moves.contains_key(&s)) {
@@ -640,10 +669,9 @@ impl TabManager {
             let still = live_session(&inner, &remote) == session && self.is_open(&remote);
             match (opened, surface) {
                 (Err(e), _) | (Ok(()), Some(Err(e))) => Err((e, None)),
-                (Ok(()), made) if !still => Err((
-                    "That tab changed meanwhile: try again".to_string(),
-                    made.and_then(Result::ok),
-                )),
+                // Closed or reconnected meanwhile: nothing to do (the user's
+                // later action stands), and nothing to say.
+                (Ok(()), made) if !still => Err((String::new(), made.and_then(Result::ok))),
                 (Ok(()), made) => {
                     let surface = made.and_then(Result::ok);
                     let moved = match (session, &surface) {
@@ -655,18 +683,25 @@ impl TabManager {
                     match moved {
                         Err(e) => Err((e, surface)),
                         Ok(()) => {
+                            // The tab before it in this computer's strip
+                            // (else after it) takes its place (09 §2) — the
+                            // strip here, not the account's: J6.
+                            let neighbour = neighbour_left_of(&visible(&ws, &inner), &remote);
+                            let was_shown =
+                                shown_tab(&ws, &inner).as_deref() == Some(remote.as_str());
                             inner.detached.insert(remote.clone(), id);
-                            if inner.shown.as_ref() == Some(&Some(remote.clone())) {
-                                // Its neighbour (the workspace's pick) takes
-                                // its place in the main window.
-                                inner.shown = None;
+                            if was_shown {
+                                inner.shown = Some(neighbour.clone());
                             }
                             // Split out, it is the window in use (09 §2).
                             inner.last_used = Some(Who::Window(id));
                             // Lock order: the TabManager's, then the engine's.
                             self.engine.with_workspace(|w, s| {
                                 let now = s.now();
-                                w.detach_tab(&remote, now);
+                                w.set_detached(&remote, true, now);
+                                if w.active_tab.as_deref() == Some(remote.as_str()) {
+                                    w.active_tab = neighbour.clone();
+                                }
                             });
                             Ok(())
                         }
@@ -686,7 +721,11 @@ impl TabManager {
                 }
                 self.windows.close(id);
                 self.emit_snapshot();
-                Err(e)
+                if e.is_empty() {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
             }
         }
     }
@@ -709,7 +748,11 @@ impl TabManager {
         self.engine
             .move_session(s, surface.clone(), window)
             .map_err(|e| e.to_string())?;
-        inner.surfaces.entry(s).or_default().push(surface.clone());
+        inner
+            .surfaces
+            .entry(s)
+            .or_default()
+            .push((surface.clone(), window));
         inner.moves.insert(
             s,
             Move {
@@ -727,31 +770,42 @@ impl TabManager {
     pub(crate) async fn dock(self: &Arc<Self>, remote: &str) -> Result<(), String> {
         let remote = remote.trim().to_lowercase();
         let (window, session) = {
-            let inner = self.lock();
-            let window = *inner
-                .detached
-                .get(&remote)
-                .ok_or_else(|| "That tab has no window of its own".to_string())?;
+            let mut inner = self.lock();
+            // A second click (already docking or docked): nothing to do.
+            if inner.docking.contains(&remote) {
+                return Ok(());
+            }
+            let Some(window) = inner.detached.get(&remote).copied() else {
+                return Ok(());
+            };
             let session = live_session(&inner, &remote);
-            if session.is_some_and(|s| inner.moves.contains_key(&s)) {
-                return Err("That tab is moving: try again in a moment".into());
+            if session.is_some_and(|s| inner.moves.contains_key(&s))
+                || inner.starting.contains(&remote)
+            {
+                return Err("That tab is busy: try again in a moment".into());
             }
-            if inner.starting.contains(&remote) {
-                return Err("That tab is connecting: try again in a moment".into());
-            }
+            inner.docking.insert(remote.clone());
             (window, session)
         };
         self.windows.raise_main();
         let surface = match session {
-            Some(_) => Some(self.surfaces.create(WindowId::MAIN).await?),
+            Some(_) => match self.surfaces.create(WindowId::MAIN).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    self.lock().docking.remove(&remote);
+                    return Err(e);
+                }
+            },
             None => None,
         };
         let outcome = {
             let mut inner = self.lock();
+            inner.docking.remove(&remote);
             let still = inner.detached.get(&remote) == Some(&window)
                 && live_session(&inner, &remote) == session;
             let moved = if !still {
-                Err("That tab changed meanwhile: try again".to_string())
+                // Closed or reconnected meanwhile: nothing to do.
+                Err(String::new())
             } else {
                 match (session, &surface) {
                     (Some(s), Some(surf)) => {
@@ -765,9 +819,13 @@ impl TabManager {
                 inner.shown = Some(Some(remote.clone()));
                 inner.shown_epoch = self.engine.workspace_epoch();
                 inner.last_used = Some(Who::Window(WindowId::MAIN));
+                // At the end of the strip, the tab on screen (09 §2) —
+                // whatever the account says about its window (J6).
                 self.engine.with_workspace(|w, s| {
                     let now = s.now();
-                    w.dock_tab(&remote, now);
+                    w.set_detached(&remote, false, now);
+                    w.move_tab(&remote, None, now);
+                    w.active_tab = Some(remote.clone());
                 });
             }
             moved
@@ -775,8 +833,12 @@ impl TabManager {
         match outcome {
             Ok(()) => {
                 if session.is_none() {
-                    // Nothing draws in it: it goes now.
-                    self.windows.close(window);
+                    // No live session: it goes once nothing draws in it (an
+                    // ended one may not be released yet, J1).
+                    let now = close_when_free(&mut self.lock(), window);
+                    if let Some(w) = now {
+                        self.windows.close(w);
+                    }
                 }
                 self.apply_active();
                 Ok(())
@@ -785,7 +847,11 @@ impl TabManager {
                 if let Some(s) = surface {
                     self.surfaces.destroy(s);
                 }
-                Err(e)
+                if e.is_empty() {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
             }
         }
     }
@@ -793,10 +859,20 @@ impl TabManager {
     /// The user closed detached window `window` (X): disconnect and close its
     /// tab, synced (09a §5.6). The window goes once the session let go of it.
     pub(crate) fn close_window(&self, window: WindowId) {
-        let remote = self.remote_in(window);
+        let remote = self.remote_in(window).or_else(|| {
+            // Its tab is being docked (the window stays until the move ends):
+            // X still means "end it and close the tab"; the window then goes
+            // with the move or the release (`finish_move`, `Released`).
+            let inner = self.lock();
+            inner
+                .moves
+                .values()
+                .find(|m| matches!(m.kind, MoveKind::Dock(w) if w == window))
+                .map(|m| m.remote.clone())
+        });
         match remote {
             Some(remote) => self.close(&remote),
-            // Already on its way out (docked, or closed meanwhile).
+            // Already on its way out (closed meanwhile).
             None => tracing::debug!("window {} closing already", window.0),
         }
     }
@@ -819,9 +895,27 @@ impl TabManager {
                 {
                     let mut inner = self.lock();
                     if a.active {
+                        inner.active = Some(who);
                         inner.last_used = Some(who);
+                    } else if inner.active == Some(who) {
+                        inner.active = None;
                     }
                     inner.activity.insert(who, a);
+                }
+                self.apply_active();
+            }
+            WindowReport::Gone(who) => {
+                {
+                    // Its watch went before the window, so its last word may
+                    // be "active": forget it, or focus would stick to it.
+                    let mut inner = self.lock();
+                    inner.activity.remove(&who);
+                    if inner.active == Some(who) {
+                        inner.active = None;
+                    }
+                    if inner.last_used == Some(who) {
+                        inner.last_used = None;
+                    }
                 }
                 self.apply_active();
             }
@@ -844,29 +938,49 @@ impl TabManager {
         }
     }
 
+    /// Close the previous workspace's windows (after whatever still draws in
+    /// them is released: the switch ends their sessions, J1).
+    fn close_all_windows(&self) {
+        let close_now: Vec<WindowId> = {
+            let mut inner = self.lock();
+            let old: Vec<(String, WindowId)> = inner.detached.drain().collect();
+            let mut now = Vec::new();
+            for (remote, w) in old {
+                if inner.starting.contains(&remote) {
+                    inner.close_after_start.insert(remote, w);
+                } else {
+                    now.extend(close_when_free(&mut inner, w));
+                }
+            }
+            now
+        };
+        for w in close_now {
+            self.windows.close(w);
+        }
+    }
+
     /// Open the windows of the workspace's detached tabs, disconnected (09a
-    /// §5.5), once per workspace: at launch and at each sign-in or switch.
-    /// The previous workspace's windows close (after their sessions, which
-    /// the switch ends, are released).
+    /// §5.5), once per workspace: at launch, and at each sign-in or switch
+    /// once that account's first sync has settled (so another computer's
+    /// detached tabs show here at sign-in, J6). The previous workspace's
+    /// windows close first.
     pub(crate) fn seed_windows(self: &Arc<Self>) {
         let ws = self.engine.workspace();
         let epoch = self.engine.workspace_epoch();
-        let (close_now, open) = {
+        if self.lock().seeded == Some(epoch) {
+            return;
+        }
+        self.close_all_windows();
+        let open = {
             let mut inner = self.lock();
             if inner.seeded == Some(epoch) {
                 return;
             }
+            // Started at sign-in to the OS, the main window comes up
+            // minimised (main.rs); its tabs' windows do too, the first time.
+            let quietly = inner.seeded.is_none()
+                && std::env::args().any(|a| a == platform_api::AUTOSTART_FLAG);
             inner.seeded = Some(epoch);
-            let mut close_now = Vec::new();
-            let old: Vec<(String, WindowId)> = inner.detached.drain().collect();
-            for (remote, w) in old {
-                match live_session(&inner, &remote) {
-                    Some(s) => {
-                        inner.close_after.insert(s, w);
-                    }
-                    None => close_now.push(w),
-                }
-            }
             let mut open = Vec::new();
             let detached = ws.as_ref().map(|w| (w, w.detached_tabs()));
             for (ws, remote) in detached
@@ -880,15 +994,16 @@ impl TabManager {
                 let place = Place {
                     size: tab.window_size(),
                     pos: tab.window_pos(),
-                    state: tab.window_state(),
+                    state: if quietly {
+                        WinState::Minimized
+                    } else {
+                        tab.window_state()
+                    },
                 };
                 open.push((remote.clone(), id, title_of(ws, &remote), place));
             }
-            (close_now, open)
+            open
         };
-        for w in close_now {
-            self.windows.close(w);
-        }
         if open.is_empty() {
             self.apply_active();
             return;
@@ -899,13 +1014,21 @@ impl TabManager {
                 if me.engine.workspace_epoch() != epoch {
                     return;
                 }
-                if let Err(e) = me.windows.open(id, &remote, &title, place).await {
-                    // Shown in the strip this run instead; the account keeps
-                    // it detached (none of this persists, 09a §5.7).
-                    tracing::warn!("window for {remote}: {e}");
-                    let mut inner = me.lock();
-                    if inner.detached.get(&remote) == Some(&id) {
-                        inner.detached.remove(&remote);
+                let opened = me.windows.open(id, &remote, &title, place).await;
+                let wanted = me.lock().detached.get(&remote) == Some(&id);
+                match opened {
+                    // Closed (or switched away) while it was being made: the
+                    // close ran before the window existed, so it goes now.
+                    Ok(()) if !wanted => me.windows.close(id),
+                    Ok(()) => {}
+                    Err(e) => {
+                        // Shown in the strip this run instead; the account
+                        // keeps it detached (none of this persists, 09a §5.7).
+                        tracing::warn!("window for {remote}: {e}");
+                        let mut inner = me.lock();
+                        if inner.detached.get(&remote) == Some(&id) {
+                            inner.detached.remove(&remote);
+                        }
                     }
                 }
             }
@@ -951,20 +1074,32 @@ impl TabManager {
             match &ev {
                 SessionEvent::Released => {
                     // Every surface the session held goes (09a J1).
-                    released = inner.surfaces.remove(&id).unwrap_or_default();
+                    released = inner
+                        .surfaces
+                        .remove(&id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(s, _)| s)
+                        .collect();
+                    let mut free = inner.close_after.remove(&id).unwrap_or_default();
                     if let Some(Move {
                         kind: MoveKind::Dock(w),
                         ..
                     }) = inner.moves.remove(&id)
                     {
-                        close_windows.push(w);
+                        // Docked while it ended: its old window goes.
+                        free.push(w);
                     }
-                    close_windows.extend(inner.close_after.remove(&id));
+                    for w in free {
+                        close_windows.extend(close_when_free(&mut inner, w));
+                    }
                 }
                 SessionEvent::SurfaceReleased { surface } => {
                     if let Some(list) = inner.surfaces.get_mut(&id) {
-                        if let Some(at) = list.iter().position(|s| SurfaceTag::of(s) == *surface) {
-                            released.push(list.remove(at));
+                        if let Some(at) =
+                            list.iter().position(|(s, _)| SurfaceTag::of(s) == *surface)
+                        {
+                            released.push(list.remove(at).0);
                         }
                     }
                     // Only a move makes the engine let go of one surface.
@@ -1047,7 +1182,7 @@ impl TabManager {
                 inner.live.remove(peer);
                 // Its window goes once the session is released.
                 if let Some(w) = inner.detached.remove(peer) {
-                    inner.close_after.insert(id, w);
+                    inner.close_after.entry(id).or_default().push(w);
                 }
                 if was_shown {
                     inner.shown = Some(neighbour.clone());
@@ -1076,6 +1211,7 @@ impl TabManager {
         let epoch = self.engine.workspace_epoch();
         let (switched, gone) = {
             let mut inner = self.lock();
+            let mut freed = Vec::new();
             inner
                 .live
                 .retain(|remote, t| open.contains(remote) || t.session.is_some());
@@ -1088,10 +1224,12 @@ impl TabManager {
                 .filter(|r| !open.contains(*r) && live_session(&inner, r).is_none())
                 .cloned()
                 .collect();
-            let gone: Vec<WindowId> = gone
-                .iter()
-                .filter_map(|r| inner.detached.remove(r))
-                .collect();
+            for r in &gone {
+                if let Some(w) = inner.detached.remove(r) {
+                    freed.extend(close_when_free(&mut inner, w));
+                }
+            }
+            let gone = freed;
             let switched = inner.shown_epoch != epoch;
             if switched {
                 inner.shown_epoch = epoch;
@@ -1102,11 +1240,16 @@ impl TabManager {
         for w in gone {
             self.windows.close(w);
         }
-        if switched {
-            // Another account (or the first sign-in): its windows open.
-            self.seed_windows();
-        } else {
+        if !switched {
             self.apply_active();
+        } else if matches!(self.engine.workspace_sel(), WorkspaceSel::Account(_)) {
+            // An account: its windows open once its first sync has settled
+            // (the AccountManager calls `seed_windows`); the previous
+            // workspace's go now.
+            self.close_all_windows();
+            self.apply_active();
+        } else {
+            self.seed_windows();
         }
     }
 
@@ -1128,15 +1271,18 @@ impl TabManager {
         match (m.kind, failed) {
             (MoveKind::Detach(w), true) => {
                 if inner.detached.get(&m.remote) == Some(&w) {
+                    // Back where it was in the strip (its order key never
+                    // changed), on screen as before the Detach.
                     inner.detached.remove(&m.remote);
                     inner.shown = Some(Some(m.remote.clone()));
                     inner.last_used = Some(Who::Window(WindowId::MAIN));
                     self.engine.with_workspace(|ws, s| {
                         let now = s.now();
-                        ws.dock_tab(&m.remote, now);
+                        ws.set_detached(&m.remote, false, now);
+                        ws.active_tab = Some(m.remote.clone());
                     });
                 }
-                close.push(w);
+                close.extend(close_when_free(inner, w));
             }
             (MoveKind::Dock(w), true) => {
                 if self.is_open(&m.remote) {
@@ -1148,15 +1294,15 @@ impl TabManager {
                     inner.last_used = Some(Who::Window(w));
                     self.engine.with_workspace(|ws, s| {
                         let now = s.now();
-                        ws.detach_tab(&m.remote, now);
+                        ws.set_detached(&m.remote, true, now);
                     });
                 } else {
                     // Closed meanwhile: the session still draws there until
                     // it is released.
-                    inner.close_after.insert(id, w);
+                    inner.close_after.entry(id).or_default().push(w);
                 }
             }
-            (MoveKind::Dock(w), false) => close.push(w),
+            (MoveKind::Dock(w), false) => close.extend(close_when_free(inner, w)),
             (MoveKind::Detach(_), false) => {}
         }
     }
@@ -1296,6 +1442,34 @@ impl TabManager {
     }
 }
 
+/// Close detached window `w` now if nothing can still draw in it: returns it.
+/// Otherwise it closes once the session drawing there is released (J1: a
+/// session that ended keeps its surfaces until `Released`).
+fn close_when_free(inner: &mut Inner, w: WindowId) -> Option<WindowId> {
+    let holder = inner
+        .surfaces
+        .iter()
+        .find(|(_, list)| list.iter().any(|(_, x)| *x == w))
+        .map(|(s, _)| *s);
+    match holder {
+        Some(s) => {
+            inner.close_after.entry(s).or_default().push(w);
+            None
+        }
+        None => Some(w),
+    }
+}
+
+/// The tab before `remote` in `strip`, else the one after it — the tab that
+/// takes a detached tab's place (09 §7).
+fn neighbour_left_of(strip: &[String], remote: &str) -> Option<String> {
+    let at = strip.iter().position(|r| r == remote)?;
+    at.checked_sub(1)
+        .and_then(|i| strip.get(i))
+        .or_else(|| strip.get(at + 1))
+        .cloned()
+}
+
 /// `remote`'s session while it has one that is not over.
 fn live_session(inner: &Inner, remote: &str) -> Option<SessionId> {
     inner
@@ -1334,12 +1508,8 @@ fn screen(inner: &Inner, main_tab: Option<&str>) -> (Vec<SessionId>, Option<Sess
             on_screen.push(s);
         }
     }
-    let active = inner
-        .activity
-        .iter()
-        .find(|(_, a)| a.active)
-        .map(|(who, _)| *who);
-    let who = active
+    let who = inner
+        .active
         .or(inner.last_used)
         .unwrap_or(Who::Window(WindowId::MAIN));
     let focused = match who {
@@ -1474,9 +1644,13 @@ mod tests {
         tab.phase = Phase::Live;
     }
 
+    /// As `on_window_report` records an activity report.
     fn report(inner: &mut Inner, who: Who, active: bool, minimized: Option<bool>) {
         if active {
+            inner.active = Some(who);
             inner.last_used = Some(who);
+        } else if inner.active == Some(who) {
+            inner.active = None;
         }
         inner
             .activity
@@ -1528,6 +1702,56 @@ mod tests {
         report(&mut inner, Who::Popout(s(1)), false, Some(false));
         report(&mut inner, Who::Window(WindowId::MAIN), true, Some(false));
         assert_eq!(screen(&inner, None).1, None);
+    }
+
+    /// A window closed while active (its watch went first, so its last
+    /// word was "active") must not keep the focus (W3 review).
+    #[test]
+    fn a_window_that_went_does_not_keep_the_focus() {
+        let mut inner = Inner::default();
+        session(&mut inner, A, 1);
+        session(&mut inner, B, 2);
+        inner.detached.insert(B.into(), WindowId(1));
+        report(&mut inner, Who::Window(WindowId(1)), true, Some(false));
+        assert_eq!(screen(&inner, Some(A)).1, Some(SessionId(2)));
+        // Gone, as `WindowReport::Gone` handles it; then the main window.
+        inner.detached.remove(B);
+        inner.activity.remove(&Who::Window(WindowId(1)));
+        inner.active = None;
+        inner.last_used = None;
+        assert_eq!(
+            screen(&inner, Some(A)).1,
+            Some(SessionId(1)),
+            "back to the main window"
+        );
+        report(&mut inner, Who::Window(WindowId::MAIN), true, Some(false));
+        assert_eq!(screen(&inner, Some(A)).1, Some(SessionId(1)));
+    }
+
+    /// J1: a window closes only when no session — live or ended but not yet
+    /// released — can still draw in it.
+    #[test]
+    fn a_window_waits_for_the_session_drawing_in_it() {
+        let mut inner = Inner::default();
+        let w = WindowId(3);
+        assert_eq!(close_when_free(&mut inner, w), Some(w), "nothing there");
+        let surface: Arc<dyn VideoSurface> = platform_api::mock::MockSurface::new((1, 1));
+        inner.surfaces.insert(SessionId(9), vec![(surface, w)]);
+        assert_eq!(close_when_free(&mut inner, w), None);
+        assert_eq!(inner.close_after[&SessionId(9)], vec![w]);
+        assert_eq!(
+            close_when_free(&mut inner, WindowId(4)),
+            Some(WindowId(4)),
+            "another window is free"
+        );
+    }
+
+    #[test]
+    fn a_detached_tab_is_replaced_by_the_one_before_it() {
+        let strip: Vec<String> = [A, B, C].iter().map(|s| s.to_string()).collect();
+        assert_eq!(neighbour_left_of(&strip, B).as_deref(), Some(A));
+        assert_eq!(neighbour_left_of(&strip, A).as_deref(), Some(B));
+        assert_eq!(neighbour_left_of(&strip[..1], A), None);
     }
 
     #[test]

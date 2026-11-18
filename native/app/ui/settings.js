@@ -6,7 +6,16 @@
 import * as api from './api.js';
 import { renderAccount, setAccountStatus } from './accounts.js';
 import { reloadConfig } from './connect.js';
-import { $, S, errorText, overlayClose, overlayOpen, sessionLive, toast } from './state.js';
+import {
+  $,
+  S,
+  errorText,
+  overlayClose,
+  overlayOpen,
+  sessionLive,
+  toast,
+  windowRemote
+} from './state.js';
 
 // ---- platform wording + displays -------------------------------------------
 // The OS facts the UI words itself around (see `get_platform_info`). The HTML
@@ -419,10 +428,13 @@ export function wireSettings() {
   // flows the toolbar buttons use. (Disconnect is handled in Rust straight on the
   // engine; the role-changed event then updates the UI, exactly like the
   // end-session buttons.) No menu exists on Windows, so these never fire there.
+  // The native menu's Settings / updates are the main window's (plans/09).
   api.on('menu://settings', () => {
+    if (windowRemote) return;
     openSettingsOverVideo();
   });
   api.on('menu://check-updates', () => {
+    if (windowRemote) return;
     openSettingsOverVideo().then(() => {
       checkForUpdates(false);
       // Bring the Updates panel into view inside the settings modal.

@@ -71,6 +71,13 @@ pub(crate) fn install_native_menu(app: &tauri::App) -> tauri::Result<()> {
 struct MonitorMenu(std::sync::Mutex<Option<tauri::menu::Submenu<tauri::Wry>>>);
 
 /// The tab manager (managed from setup on).
+/// Bring the main window to the front (its dialogs serve every window).
+fn raise_main(app: &tauri::AppHandle) {
+    if let Some(wm) = app.try_state::<std::sync::Arc<crate::windows::WindowManager>>() {
+        wm.raise_main();
+    }
+}
+
 fn tabs_of(app: &tauri::AppHandle) -> Option<std::sync::Arc<crate::tabs::TabManager>> {
     app.try_state::<std::sync::Arc<crate::tabs::TabManager>>()
         .map(|t| t.inner().clone())
@@ -178,10 +185,15 @@ pub(crate) fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::Menu
         return;
     }
     match event.id().as_ref() {
+        // Settings and updates live in the main window (a detached window's
+        // page ignores these, so one dialog opens, over its own video only,
+        // plans/09 J4): it comes to the front for them.
         "menu-settings" => {
+            raise_main(app);
             let _ = app.emit("menu://settings", ());
         }
         "menu-check-updates" => {
+            raise_main(app);
             let _ = app.emit("menu://check-updates", ());
         }
         "menu-end-session" => crate::commands::end_current(app),
