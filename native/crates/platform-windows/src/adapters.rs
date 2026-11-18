@@ -598,8 +598,12 @@ impl VideoSurface for ChildWindowSurface {
         let hwnd = self
             .live()
             .ok_or_else(|| SurfaceError::Backend("the video window was destroyed".into()))?;
+        // None: no device to share (the trait's meaning): a device of its own.
+        let Some(device) = device else {
+            return d3d_presenter(hwnd, create_render_device()?);
+        };
         let dev = device
-            .and_then(|d| d.downcast_ref::<D3d11Device>())
+            .downcast_ref::<D3d11Device>()
             .ok_or_else(|| SurfaceError::Backend("not a D3D11 device".into()))?;
         d3d_presenter(hwnd, dev.0.clone())
     }

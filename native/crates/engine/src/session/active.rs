@@ -105,6 +105,11 @@ struct ViewState {
     /// What was last queued.
     shown: bool,
     /// Became focused and not shown since: the next show takes the keyboard.
+    /// Cleared only by that show or by losing focus. So a session that
+    /// became focused while off screen (focus is sticky for the clipboard,
+    /// plans/09 §7 blocker 5) takes the keyboard when it next shows: it is
+    /// the one the user chose last. A re-show of a session already shown
+    /// since (link restored, a dialog closed) owes nothing and takes nothing.
     focus_owed: bool,
 }
 

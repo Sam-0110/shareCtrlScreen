@@ -278,8 +278,6 @@ impl TabGate {
 /// focused for the clipboard while the strip shows another tab never takes
 /// that window's Win / Alt+Tab.
 pub(crate) struct Activity {
-    /// Focused.
-    active: AtomicBool,
     /// The clipboard loop's gate: the user's setting AND focused.
     clip_on: Arc<AtomicBool>,
     clipboard_setting: bool,
@@ -319,7 +317,6 @@ impl Activity {
     fn new(clipboard_setting: bool, active: bool) -> (Self, std::sync::mpsc::Receiver<()>) {
         let (clip_wake, wake_rx) = std::sync::mpsc::channel();
         let activity = Activity {
-            active: AtomicBool::new(active),
             clip_on: Arc::new(AtomicBool::new(clipboard_setting && active)),
             clipboard_setting,
             hook_quit: AtomicBool::new(true),
@@ -340,7 +337,6 @@ impl Activity {
     }
 
     fn set(&self, active: bool, view: &active::SessionView) {
-        self.active.store(active, Ordering::SeqCst);
         // The clipboard loop re-baselines when its gate opens, so text copied
         // while another tab was focused is never forwarded here (08a §6.4 step 4).
         self.clip_on

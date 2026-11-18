@@ -297,6 +297,13 @@ impl AccountManager {
             }
         }
         self.emit_state();
+        // Signed in at launch: the first sync, then the account's detached
+        // tabs' windows (plans/09 09a §5.5; the setup's seeding saw the
+        // account still locked).
+        if matches!(self.engine.workspace_sel(), WorkspaceSel::Account(_)) {
+            let _ = self.sync_once().await;
+            self.seed_windows();
+        }
     }
 
     /// Sync whenever the workspace changes (coalesced), when kicked, and every

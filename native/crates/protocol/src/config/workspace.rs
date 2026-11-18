@@ -437,9 +437,11 @@ impl Workspace {
         if !tab.is_open() {
             return false;
         }
-        if tab.state != state {
+        // Against what counts (`window_state`): a value from before the
+        // last reopen is stale, so recording it again must stamp it anew.
+        if tab.window_state() != state || tab.state_at <= tab.opened_at {
             tab.state = state;
-            tab.state_at = now.max(tab.state_at);
+            tab.state_at = now.max(tab.state_at).max(tab.opened_at + 1);
         }
         true
     }
@@ -458,20 +460,23 @@ impl Workspace {
         // Within a rounding step of what is saved: unchanged. A window put
         // back from its saved shares can read back a share off by one; that
         // must not re-stamp (and re-sync) it on every launch.
+        // Compared with what counts (`window_size` / `window_pos`): a value
+        // from before the last reopen is stale and is stamped anew.
+        let opened = tab.opened_at;
         if !tab
-            .size
+            .window_size()
             .is_some_and(|s| near(s.w, size.w) && near(s.h, size.h))
         {
             tab.size = Some(size);
-            tab.size_at = now.max(tab.size_at);
+            tab.size_at = now.max(tab.size_at).max(opened + 1);
         }
+        let current = tab.window_pos();
         let moved = |p: &Pos| {
-            !tab.pos
-                .is_some_and(|q| q.monitor == p.monitor && near(q.x, p.x) && near(q.y, p.y))
+            !current.is_some_and(|q| q.monitor == p.monitor && near(q.x, p.x) && near(q.y, p.y))
         };
         if let Some(pos) = pos.filter(moved) {
             tab.pos = Some(pos);
-            tab.pos_at = now.max(tab.pos_at);
+            tab.pos_at = now.max(tab.pos_at).max(opened + 1);
         }
         true
     }

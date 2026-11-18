@@ -153,6 +153,9 @@ struct Inner {
     detached: HashMap<String, WindowId>,
     /// The workspace epoch `detached` was seeded for.
     seeded: Option<u64>,
+    /// A workspace with tabs was seeded in this run (the first is the one a
+    /// login launch opens minimised).
+    seeded_any: bool,
     /// Tabs whose window is being made by Detach.
     detaching: HashSet<String>,
     /// Tabs whose Dock is being set up.
@@ -263,6 +266,17 @@ impl TabManager {
         }
         if remote == self.engine.config().uuid {
             return Err(ConnectError::SelfId.to_string());
+        }
+        // In a window of its own: that window comes forward (the strip has
+        // no place for it), and it connects there if it is not connected.
+        let window = self.lock().detached.get(&remote).copied();
+        if let Some(w) = window {
+            self.windows.raise(w);
+            if self.is_connected(&remote) {
+                self.emit_snapshot();
+                return Ok(Started::Done);
+            }
+            return self.connect(&remote, confirmed).await;
         }
         let opened = self
             .engine
@@ -877,6 +891,21 @@ impl TabManager {
         }
     }
 
+    /// The native menu's tab commands act on the window in use (09 §7,
+    /// answer 11): its detached tab, or the strip's tab on screen; `None`
+    /// in a detached window means "that window's tab".
+    pub(crate) fn window_in_use(&self) -> Option<(WindowId, String)> {
+        let inner = self.lock();
+        match inner.active.or(inner.last_used) {
+            Some(Who::Window(w)) if w != WindowId::MAIN => inner
+                .detached
+                .iter()
+                .find(|(_, x)| **x == w)
+                .map(|(r, _)| (w, r.clone())),
+            _ => None,
+        }
+    }
+
     /// The tab in detached window `window`.
     fn remote_in(&self, window: WindowId) -> Option<String> {
         let inner = self.lock();
@@ -977,9 +1006,11 @@ impl TabManager {
                 return;
             }
             // Started at sign-in to the OS, the main window comes up
-            // minimised (main.rs); its tabs' windows do too, the first time.
-            let quietly = inner.seeded.is_none()
-                && std::env::args().any(|a| a == platform_api::AUTOSTART_FLAG);
+            // minimised (main.rs); its tabs' windows do too — the first
+            // workspace that has any (an account opens after its token).
+            let quietly =
+                !inner.seeded_any && std::env::args().any(|a| a == platform_api::AUTOSTART_FLAG);
+            inner.seeded_any |= ws.is_some();
             inner.seeded = Some(epoch);
             let mut open = Vec::new();
             let detached = ws.as_ref().map(|w| (w, w.detached_tabs()));
@@ -1235,21 +1266,22 @@ impl TabManager {
                 inner.shown_epoch = epoch;
                 inner.shown = None;
             }
-            (switched || inner.seeded != Some(epoch), gone)
+            (switched, gone)
         };
         for w in gone {
             self.windows.close(w);
         }
-        if !switched {
-            self.apply_active();
-        } else if matches!(self.engine.workspace_sel(), WorkspaceSel::Account(_)) {
-            // An account: its windows open once its first sync has settled
-            // (the AccountManager calls `seed_windows`); the previous
-            // workspace's go now.
-            self.close_all_windows();
-            self.apply_active();
-        } else {
-            self.seed_windows();
+        // Only a real switch touches the windows: an ordinary sync never does
+        // (J6), however the seeding stands.
+        let account = matches!(self.engine.workspace_sel(), WorkspaceSel::Account(_));
+        let seeded = self.lock().seeded == Some(epoch);
+        match windows_on_change(switched, account, seeded) {
+            WindowsOnChange::Keep => self.apply_active(),
+            WindowsOnChange::CloseOld => {
+                self.close_all_windows();
+                self.apply_active();
+            }
+            WindowsOnChange::Seed => self.seed_windows(),
         }
     }
 
@@ -1439,6 +1471,28 @@ impl TabManager {
 
     fn emit_snapshot(&self) {
         let _ = self.app.emit("tabs-changed", self.snapshot());
+    }
+}
+
+/// What a workspace change does to the detached windows (J6).
+#[derive(Debug, PartialEq, Eq)]
+enum WindowsOnChange {
+    /// An ordinary sync, or this workspace's windows are open already.
+    Keep,
+    /// Switched to an account: the old windows go now; the account's open
+    /// once its first sync has settled (the AccountManager seeds them).
+    CloseOld,
+    /// Switched to the local workspace (or a locked one): seed it now.
+    Seed,
+}
+
+fn windows_on_change(switched: bool, account: bool, seeded: bool) -> WindowsOnChange {
+    match (switched, account, seeded) {
+        // Only a real switch touches the windows, and never the ones already
+        // seeded for this workspace (the switch's event can come after).
+        (false, _, _) | (true, _, true) => WindowsOnChange::Keep,
+        (true, true, false) => WindowsOnChange::CloseOld,
+        (true, false, false) => WindowsOnChange::Seed,
     }
 }
 
@@ -1752,6 +1806,22 @@ mod tests {
         assert_eq!(neighbour_left_of(&strip, B).as_deref(), Some(A));
         assert_eq!(neighbour_left_of(&strip, A).as_deref(), Some(B));
         assert_eq!(neighbour_left_of(&strip[..1], A), None);
+    }
+
+    /// Final review B1: a sync never closes the windows; an account opens
+    /// its own after its first sync; a late switch event keeps them.
+    #[test]
+    fn only_a_switch_touches_the_windows() {
+        use WindowsOnChange::*;
+        assert_eq!(windows_on_change(false, true, false), Keep, "a sync");
+        assert_eq!(windows_on_change(false, true, true), Keep);
+        assert_eq!(
+            windows_on_change(true, true, false),
+            CloseOld,
+            "to an account"
+        );
+        assert_eq!(windows_on_change(true, true, true), Keep, "seeded already");
+        assert_eq!(windows_on_change(true, false, false), Seed, "to local");
     }
 
     #[test]

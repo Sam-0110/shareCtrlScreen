@@ -206,7 +206,10 @@ open as in §5.5. None of these persists `detached = false`.
 ### 5.8 Settings and menus in a detached window
 Its Settings opens over its own video only (`set_overlay(w, …)`). The macOS / Linux menu bar,
 the Monitor menu and pop-out offers act on the focused session. Tab chords from a detached
-window's session are ignored (09 Decision 2).
+window's session are ignored (09 Decision 2). As built: the window's own ⚙ opens Settings over its own video; the native
+menu's Settings and Check for Updates open in the main window, which comes to the front (one
+dialog, never one per window); the menu's Close Tab closes the tab of the window in use, and
+Next / Previous Tab do nothing while a detached window is in use.
 
 ## 6. Invariants
 

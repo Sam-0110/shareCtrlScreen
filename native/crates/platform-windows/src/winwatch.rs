@@ -35,10 +35,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SIZE,
 };
 
-/// This subclass's id on the window (any value unique among its subclasses
-/// with the same procedure).
-const SUBCLASS_ID: usize = 0x5C7_0900;
-
 /// The message a watch dropped off the UI thread posts to its window, so the
 /// window's own thread removes the subclass and frees it (`lParam` = the
 /// data). Registered, so it collides with no other message.
@@ -127,7 +123,9 @@ impl ActivationWatch {
         let _ = unwatch_message();
         // SAFETY: `h` belongs to this thread (checked above); `data` stays
         // valid until the subclass is removed.
-        if !unsafe { SetWindowSubclass(h, Some(subclass_proc), SUBCLASS_ID, data as usize) }
+        // The data's address is the subclass id: unique per watch, so two
+        // watches on one window each keep their own.
+        if !unsafe { SetWindowSubclass(h, Some(subclass_proc), data as usize, data as usize) }
             .as_bool()
         {
             // SAFETY: never handed to the window: still ours alone.
@@ -177,7 +175,7 @@ impl Drop for ActivationWatch {
         // SAFETY: removes only our own subclass (procedure + id) from a
         // window of this thread.
         if unsafe { IsWindow(Some(h)) }.as_bool() {
-            let _ = unsafe { RemoveWindowSubclass(h, Some(subclass_proc), SUBCLASS_ID) };
+            let _ = unsafe { RemoveWindowSubclass(h, Some(subclass_proc), self.data as usize) };
         }
         // SAFETY: allocated by `install`, freed once, here; the subclass that
         // pointed at it is gone.
@@ -204,6 +202,18 @@ unsafe extern "system" fn subclass_proc(
         }
         return LRESULT(0);
     }
+    if msg == WM_NCDESTROY {
+        // SAFETY: our own subclass, on its window's thread. Marking it gone
+        // is the last touch of the data here: another thread may free it
+        // right after (`Drop`).
+        unsafe {
+            let _ = RemoveWindowSubclass(hwnd, Some(subclass_proc), id);
+            (*(refdata as *const WatchData))
+                .removed
+                .store(true, Ordering::SeqCst);
+            return DefSubclassProc(hwnd, msg, wparam, lparam);
+        }
+    }
     // SAFETY: `refdata` is the `WatchData` installed with this subclass; it
     // outlives the subclass.
     let data = unsafe { &*(refdata as *const WatchData) };
@@ -214,11 +224,6 @@ unsafe extern "system" fn subclass_proc(
             data.report(hwnd, None);
         }
         WM_SIZE => data.report(hwnd, Some(wparam.0 as u32 == SIZE_MINIMIZED)),
-        WM_NCDESTROY => {
-            // SAFETY: our own subclass, on its window's thread.
-            let _ = unsafe { RemoveWindowSubclass(hwnd, Some(subclass_proc), id) };
-            data.removed.store(true, Ordering::SeqCst);
-        }
         _ => {}
     }
     // SAFETY: the documented way to pass every message on.

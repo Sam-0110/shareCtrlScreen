@@ -226,7 +226,10 @@ impl WindowManager {
             .min_inner_size(MIN_INNER.0, MIN_INNER.1)
             .visible(false)
             .build()
-            .map_err(|e| format!("could not open a window: {e}"))?;
+            .map_err(|e| {
+                Self::lock(&self.placing).remove(&label);
+                format!("could not open a window: {e}")
+            })?;
         // Placed while hidden, so it never shows in the wrong place first.
         // A step that fails leaves the window usable where the OS put it.
         let step = |what: &str, r: tauri::Result<()>| {

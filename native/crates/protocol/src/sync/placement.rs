@@ -79,13 +79,22 @@ pub struct Placement {
 /// may not name one) the first listed counts as primary; with several, the
 /// first of them. At most `MAX_MONITOR + 1` are numbered.
 pub fn monitor_order(monitors: &[Monitor]) -> Vec<usize> {
-    let primary = monitors.iter().position(|m| m.primary).unwrap_or(0);
-    let mut rest: Vec<usize> = (0..monitors.len()).filter(|&i| i != primary).collect();
+    // A monitor with no work area (reported mid-change) holds no window.
+    let usable: Vec<usize> = (0..monitors.len())
+        .filter(|&i| monitors[i].work.w > 0 && monitors[i].work.h > 0)
+        .collect();
+    let Some(&first) = usable.first() else {
+        return Vec::new();
+    };
+    let primary = usable
+        .iter()
+        .copied()
+        .find(|&i| monitors[i].primary)
+        .unwrap_or(first);
+    let mut rest: Vec<usize> = usable.into_iter().filter(|&i| i != primary).collect();
     rest.sort_by_key(|&i| (monitors[i].bounds.x, monitors[i].bounds.y, i));
     let mut order = Vec::with_capacity(monitors.len());
-    if !monitors.is_empty() {
-        order.push(primary);
-    }
+    order.push(primary);
     order.extend(rest);
     order.truncate(usize::from(MAX_MONITOR) + 1);
     order
@@ -171,7 +180,7 @@ pub fn to_rect(
     let first = *order.first()?;
     let monitor = match pos {
         Some(p) => order.get(usize::from(p.monitor)).copied().unwrap_or(first),
-        None => unplaced_on.filter(|&i| i < monitors.len()).unwrap_or(first),
+        None => unplaced_on.filter(|i| order.contains(i)).unwrap_or(first),
     };
     let work = monitors[monitor].work;
     let size = size.unwrap_or(default_size);
@@ -364,6 +373,14 @@ mod tests {
             }
         );
         assert!(to_rect(None, None, &[], None, HALF, (1, 1)).is_none());
+        let empty = [mon(0, 0, 0, 0, true)];
+        assert!(to_rect(None, None, &empty, None, HALF, (1, 1)).is_none());
+        let one_empty = [mon(0, 0, 0, 0, true), mon(10, 0, 100, 100, false)];
+        assert_eq!(
+            monitor_order(&one_empty),
+            vec![1],
+            "an empty monitor is skipped"
+        );
     }
 
     #[test]

@@ -70,7 +70,6 @@ pub(crate) fn install_native_menu(app: &tauri::App) -> tauri::Result<()> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 struct MonitorMenu(std::sync::Mutex<Option<tauri::menu::Submenu<tauri::Wry>>>);
 
-/// The tab manager (managed from setup on).
 /// Bring the main window to the front (its dialogs serve every window).
 fn raise_main(app: &tauri::AppHandle) {
     if let Some(wm) = app.try_state::<std::sync::Arc<crate::windows::WindowManager>>() {
@@ -78,6 +77,7 @@ fn raise_main(app: &tauri::AppHandle) {
     }
 }
 
+/// The tab manager (managed from setup on).
 fn tabs_of(app: &tauri::AppHandle) -> Option<std::sync::Arc<crate::tabs::TabManager>> {
     app.try_state::<std::sync::Arc<crate::tabs::TabManager>>()
         .map(|t| t.inner().clone())
@@ -199,12 +199,17 @@ pub(crate) fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::Menu
         "menu-end-session" => crate::commands::end_current(app),
         "menu-tab-next" => {
             if let Some(tabs) = tabs_of(app) {
-                tabs.step(engine::TabStep::Next);
+                // Nothing to step through in a detached window (Decision 2).
+                if tabs.window_in_use().is_none() {
+                    tabs.step(engine::TabStep::Next);
+                }
             }
         }
         "menu-tab-prev" => {
             if let Some(tabs) = tabs_of(app) {
-                tabs.step(engine::TabStep::Prev);
+                if tabs.window_in_use().is_none() {
+                    tabs.step(engine::TabStep::Prev);
+                }
             }
         }
         "menu-tab-new" => {
@@ -216,6 +221,11 @@ pub(crate) fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::Menu
             let Some(tabs) = tabs_of(app) else {
                 return;
             };
+            // In a detached window: that window's tab, as its X does.
+            if let Some((w, _)) = tabs.window_in_use() {
+                tabs.close_window(w);
+                return;
+            }
             if let Some(remote) = app
                 .state::<AppState>()
                 .engine

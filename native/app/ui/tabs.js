@@ -155,7 +155,7 @@ function renderStrip() {
     // Its own window (plans/09); not for a tab closed elsewhere.
     if (!t.closedElsewhere) {
       const detach = document.createElement('button');
-      detach.className = 'tab-close';
+      detach.className = 'tab-close tab-detach';
       detach.title = 'Open in its own window';
       detach.textContent = '⧉';
       detach.addEventListener('click', (e) => {
