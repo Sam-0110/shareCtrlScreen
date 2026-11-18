@@ -44,15 +44,18 @@ pub struct SyncTab {                       // as today, plus:
     pub order: String, pub order_at: u64, pub opened_at: u64, pub closed_at: u64,
     pub detached: bool,      pub detached_at: u64,
     pub state: WinState,     pub state_at: u64,      // Normal | Maximized | Minimized
-    pub size: Option<Frac2>, pub size_at: u64,       // w, h
+    pub size: Option<Size>,  pub size_at: u64,       // w, h
     pub pos: Option<Pos>,    pub pos_at: u64,        // never written by a computer that cannot know it (Wayland)
 }
-pub struct Frac2 { pub a: u16, pub b: u16 }          // ten-thousandths (0..=10000) of the monitor's work area
+pub struct Size { pub w: u16, pub h: u16 }           // ten-thousandths (1..=10000) of the monitor's work area
 pub struct Pos { pub monitor: u8, pub x: u16, pub y: u16 }   // monitor: 0 = primary, then left→right, top→bottom
 ```
 
-Each pair merges last-writer-wins on its own stamp; equal stamps break ties by the serialized
-value's code-point order (Rust and JS alike). Every stamp is clamped like the others (08a §7.3),
+Each pair merges last-writer-wins on its own stamp; equal stamps pick the larger value, the same
+in Rust and JS: `true` over `false`, the state's wire name in code-point order, a known size or
+position over none and then field by field. Fields at their default are left out of the JSON, so a
+document without detached windows is byte-identical to before (implemented in W3:
+`sync/tabs.rs`, `sync/placement.rs`, `server/src/sync.js`, two shared vectors). Every stamp is clamped like the others (08a §7.3),
 counts in `last_touched` and in the server's prune. The server validates ranges and drops what is
 invalid; Rust parses leniently (out of range → `None`, unknown state → `Normal`). Sent only to a
 server advertising feature `placement`; old clients ignore the fields (serde default).

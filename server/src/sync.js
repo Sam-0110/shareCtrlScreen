@@ -9,7 +9,9 @@
 //                    non-zero nameAt is a removed name) and usedAt
 //   recentsClearedAt one account-wide time; an ID is a recent if used after it
 //   tabs (v2)        per remote ID: order + orderAt (fractional index key),
-//                    openedAt, closedAt; open ⇔ openedAt > closedAt
+//                    openedAt, closedAt; open ⇔ openedAt > closedAt; and a
+//                    detached window's detached, state, size, pos, each
+//                    with its own stamp (plans/09)
 //   prefs (v2)       per whitelisted preference: value (boolean) + at
 // Merging keeps the newer value of each, so every computer converges no matter
 // the order of syncs. Every stamp from a client is clamped to at most a few
@@ -24,6 +26,9 @@ export const MAX_NAME_CHARS = 40; // MAX_REMOTE_NAME_CHARS in config/mod.rs
 export const MAX_ORDER_KEY_CHARS = 24; // sync/tabs.rs
 export const FUTURE_SLACK_MS = 5 * 60 * 1000; // sync/clock.rs
 export const CLOSED_TAB_TTL_MS = 90 * 24 * 3600 * 1000; // sync/tabs.rs
+export const FRACTION_ONE = 10000; // sync/tabs.rs
+export const MAX_MONITOR = 15; // sync/tabs.rs
+const WIN_STATES = ["normal", "maximized", "minimized"];
 // sync/prefs.rs SYNCED_PREFS: the only preferences that follow the account.
 export const SYNCED_PREFS = [
   "translateModifiers",
@@ -32,8 +37,9 @@ export const SYNCED_PREFS = [
   "pasteDroppedFiles",
 ];
 // What this server stores, advertised in every sync reply. A client sends tabs
-// and preferences only to a server that lists them.
-export const FEATURES = ["prefs", "tabs"];
+// and preferences (and detached windows' placement) only to a server that
+// lists them.
+export const FEATURES = ["prefs", "tabs", "placement"];
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -89,6 +95,102 @@ function mergeTab(into, other) {
   }
   into.openedAt = Math.max(into.openedAt, other.openedAt);
   into.closedAt = Math.max(into.closedAt, other.closedAt);
+  // Detached windows (plans/09): each field on its own stamp; equal stamps
+  // pick the larger value exactly as SyncTab::merge does. Stored sparse (a
+  // default is left out), as the Rust side serializes it.
+  const a = withPlacementDefaults(into);
+  const b = withPlacementDefaults(other);
+  if (laterOrLarger(b.detachedAt, b.detached, a.detachedAt, a.detached, cmpBool)) {
+    a.detached = b.detached;
+    a.detachedAt = b.detachedAt;
+  }
+  if (laterOrLarger(b.stateAt, b.state, a.stateAt, a.state, cmpCodePoints)) {
+    a.state = b.state;
+    a.stateAt = b.stateAt;
+  }
+  if (laterOrLarger(b.sizeAt, b.size, a.sizeAt, a.size, cmpMaybe(["w", "h"]))) {
+    a.size = b.size;
+    a.sizeAt = b.sizeAt;
+  }
+  if (laterOrLarger(b.posAt, b.pos, a.posAt, a.pos, cmpMaybe(["monitor", "x", "y"]))) {
+    a.pos = b.pos;
+    a.posAt = b.posAt;
+  }
+  for (const [k, v] of Object.entries(PLACEMENT_DEFAULTS)) {
+    if (a[k] === v) delete into[k];
+    else into[k] = a[k];
+  }
+}
+
+// A tab's placement fields when they are left out (Rust's defaults).
+const PLACEMENT_DEFAULTS = {
+  detached: false,
+  detachedAt: 0,
+  state: "normal",
+  stateAt: 0,
+  size: null,
+  sizeAt: 0,
+  pos: null,
+  posAt: 0,
+};
+
+const withPlacementDefaults = (t) => {
+  const out = {};
+  for (const [k, v] of Object.entries(PLACEMENT_DEFAULTS)) out[k] = t[k] ?? v;
+  return out;
+};
+
+// `(atA, a) > (atB, b)`: a later stamp, or the same stamp and a larger value.
+function laterOrLarger(atA, a, atB, b, cmp) {
+  return atA > atB || (atA === atB && cmp(a, b) > 0);
+}
+
+const cmpBool = (a, b) => Number(a) - Number(b);
+
+// Option<struct> order in Rust: none < some, then field by field.
+const cmpMaybe = (fields) => (a, b) => {
+  if (a === null || b === null) return (a !== null) - (b !== null);
+  for (const f of fields) {
+    if (a[f] !== b[f]) return a[f] - b[f];
+  }
+  return 0;
+};
+
+// A share in ten-thousandths within lo..=FRACTION_ONE, or null.
+const fraction = (v, lo) => (Number.isInteger(v) && v >= lo && v <= FRACTION_ONE ? v : null);
+
+// The placement fields of an untrusted tab, validated, defaults left out.
+// Lenient like the Rust side: an invalid size or position is none, an unknown
+// state is "normal" — the rest of the tab is kept either way.
+function placementOf(t, now) {
+  const size =
+    isObject(t.size) && fraction(t.size.w, 1) !== null && fraction(t.size.h, 1) !== null
+      ? { w: t.size.w, h: t.size.h }
+      : null;
+  const pos =
+    isObject(t.pos) &&
+    Number.isInteger(t.pos.monitor) &&
+    t.pos.monitor >= 0 &&
+    t.pos.monitor <= MAX_MONITOR &&
+    fraction(t.pos.x, 0) !== null &&
+    fraction(t.pos.y, 0) !== null
+      ? { monitor: t.pos.monitor, x: t.pos.x, y: t.pos.y }
+      : null;
+  const full = {
+    detached: t.detached === true,
+    detachedAt: stamp(t.detachedAt, now),
+    state: WIN_STATES.includes(t.state) ? t.state : "normal",
+    stateAt: stamp(t.stateAt, now),
+    size,
+    sizeAt: stamp(t.sizeAt, now),
+    pos,
+    posAt: stamp(t.posAt, now),
+  };
+  const out = {};
+  for (const [k, v] of Object.entries(PLACEMENT_DEFAULTS)) {
+    if (full[k] !== v) out[k] = full[k];
+  }
+  return out;
 }
 
 // The later change wins; the same stamp goes to true (false < true).
@@ -120,7 +222,16 @@ function prune(doc) {
   }
   const tabIds = Object.keys(doc.tabs);
   if (tabIds.length > MAX_TABS) {
-    const touched = (t) => Math.max(t.orderAt, t.openedAt, t.closedAt);
+    const touched = (t) =>
+      Math.max(
+        t.orderAt,
+        t.openedAt,
+        t.closedAt,
+        t.detachedAt || 0,
+        t.stateAt || 0,
+        t.sizeAt || 0,
+        t.posAt || 0,
+      );
     tabIds.sort((a, b) => {
       const ta = doc.tabs[a];
       const tb = doc.tabs[b];
@@ -199,6 +310,7 @@ export function normalizeIncoming(raw, now) {
       orderAt: stamp(t.orderAt, now),
       openedAt: stamp(t.openedAt, now),
       closedAt: stamp(t.closedAt, now),
+      ...placementOf(t, now),
     };
     const cur = out.tabs[id];
     if (cur) mergeTab(cur, clean);

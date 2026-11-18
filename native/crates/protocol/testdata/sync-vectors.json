@@ -559,6 +559,160 @@
         "tabs": {},
         "prefs": {}
       }
+    },
+    {
+      "name": "detached windows merge field by field and a position survives a computer that cannot know it",
+      "a": {
+        "tabs": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "order": "m",
+            "orderAt": 1,
+            "openedAt": 2,
+            "detached": true,
+            "detachedAt": 10,
+            "state": "maximized",
+            "stateAt": 10,
+            "size": {
+              "w": 5000,
+              "h": 4000
+            },
+            "sizeAt": 10,
+            "pos": {
+              "monitor": 1,
+              "x": 2500,
+              "y": 100
+            },
+            "posAt": 10
+          }
+        }
+      },
+      "b": {
+        "tabs": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "order": "m",
+            "orderAt": 1,
+            "openedAt": 2,
+            "state": "normal",
+            "stateAt": 20,
+            "size": {
+              "w": 6000,
+              "h": 7000
+            },
+            "sizeAt": 20
+          },
+          "7c9e6679-7425-40de-944b-e07fc1f90ae7": {
+            "order": "n",
+            "orderAt": 1,
+            "openedAt": 2,
+            "detached": true,
+            "detachedAt": 3
+          }
+        }
+      },
+      "merged": {
+        "v": 2,
+        "entries": {},
+        "recentsClearedAt": 0,
+        "tabs": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "order": "m",
+            "orderAt": 1,
+            "openedAt": 2,
+            "closedAt": 0,
+            "detached": true,
+            "detachedAt": 10,
+            "stateAt": 20,
+            "size": {
+              "w": 6000,
+              "h": 7000
+            },
+            "sizeAt": 20,
+            "pos": {
+              "monitor": 1,
+              "x": 2500,
+              "y": 100
+            },
+            "posAt": 10
+          },
+          "7c9e6679-7425-40de-944b-e07fc1f90ae7": {
+            "order": "n",
+            "orderAt": 1,
+            "openedAt": 2,
+            "closedAt": 0,
+            "detached": true,
+            "detachedAt": 3
+          }
+        },
+        "prefs": {}
+      }
+    },
+    {
+      "name": "invalid placement reads as none and equal stamps pick the larger value",
+      "a": {
+        "tabs": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "order": "m",
+            "orderAt": 1,
+            "openedAt": 2,
+            "state": "sideways",
+            "stateAt": 5,
+            "size": {
+              "w": 0,
+              "h": 5000
+            },
+            "sizeAt": 5,
+            "pos": {
+              "monitor": 99,
+              "x": 1,
+              "y": 1
+            },
+            "posAt": 5,
+            "detached": false,
+            "detachedAt": 7
+          }
+        }
+      },
+      "b": {
+        "tabs": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "order": "m",
+            "orderAt": 1,
+            "openedAt": 2,
+            "state": "minimized",
+            "stateAt": 5,
+            "size": {
+              "w": 1,
+              "h": 1
+            },
+            "sizeAt": 5,
+            "detached": true,
+            "detachedAt": 7
+          }
+        }
+      },
+      "merged": {
+        "v": 2,
+        "entries": {},
+        "recentsClearedAt": 0,
+        "tabs": {
+          "0f8fad5b-d9cb-469f-a165-70867728950e": {
+            "order": "m",
+            "orderAt": 1,
+            "openedAt": 2,
+            "closedAt": 0,
+            "detachedAt": 7,
+            "stateAt": 5,
+            "sizeAt": 5,
+            "posAt": 5,
+            "detached": true,
+            "size": {
+              "w": 1,
+              "h": 1
+            }
+          }
+        },
+        "prefs": {}
+      }
     }
   ]
 }
