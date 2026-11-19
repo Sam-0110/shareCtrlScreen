@@ -194,16 +194,6 @@ export class AccountStore extends DurableObject {
     return `${TOKEN_PREFIX}.${username}.${secret}`;
   }
 
-  // ONE-OFF (owner request 2026-11-19), reverted right after it ran: wipe
-  // this account if it exists. Reports whether it existed.
-  async oneOffDelete() {
-    const exists = (await this.ctx.storage.get("auth")) !== undefined;
-    const tokens = (await this.ctx.storage.list({ prefix: "tok:" })).size;
-    if (!exists && tokens === 0) return { status: 404, body: { existed: false } };
-    await this.ctx.storage.deleteAll();
-    return { status: 200, body: { existed: exists, deleted: true, signedInDevices: tokens } };
-  }
-
   async checkToken(secret) {
     const key = "tok:" + (await sha256Hex(secret));
     const rec = await this.ctx.storage.get(key);
@@ -286,12 +276,6 @@ export async function handleApi(request, env, url) {
     const s = store(env, auth.username);
     const r =
       path === "/api/sync" ? await s.sync(auth.secret, body.doc) : await s.logout(auth.secret);
-    return json(r.status, r.body);
-  }
-
-  // ONE-OFF: only this one account, whoever calls it; reverted after use.
-  if (path === "/api/oneoff/delete-samthehappyman") {
-    const r = await store(env, "samthehappyman").oneOffDelete();
     return json(r.status, r.body);
   }
 
