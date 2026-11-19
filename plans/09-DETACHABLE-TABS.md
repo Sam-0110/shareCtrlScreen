@@ -201,7 +201,9 @@ The owner's first Mac → Windows run on 2.3.0 (Mac and Windows app.logs, 2026-1
   ("forbidden bit set in an OBU header", sequence headers that "end early", 2×9 / 1×1
   pictures): an OBU header with its forbidden bit set can only come from the encoder's output
   being read as something it is not — most likely Annex B (length-prefixed), which the payloader
-  does not expect; unconfirmed until the host logs it. Not a plan-09 regression: AV1 between
+  does not expect; unconfirmed until the host logs it. **Settled by the 2.3.2 logs:** the
+  encoder wraps its output in IVF framing (`DKIF` file header + 12-byte frame headers); 2.3.3
+  strips it. Not a plan-09 regression: AV1 between
   machines had never run on devices. Fix:
   the host puts every AV1 temporal unit in the sized low-overhead form, converting Annex B and
   unsized OBUs (`engine/src/media/av1.rs`; the form is decided once, on a key frame or a unit of

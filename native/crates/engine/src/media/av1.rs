@@ -10,8 +10,9 @@
 //! OBU headers. The 2.3.0 macOS report fits that: every frame from a Windows
 //! hardware AV1 encoder arrived with "forbidden bit set in an OBU header", a
 //! sequence header that "ends early", nonsense picture sizes (2×9, 1×1), and
-//! never a key frame. Unconfirmed until a host logs its form ([`Normalizer`]
-//! does, once).
+//! never a key frame. The 2.3.2 host log settled it: that encoder wraps its
+//! output in **IVF container framing** (a `DKIF` file header, then a 12-byte
+//! header per frame), which [`Normalizer`] now strips too.
 //!
 //! A [`Normalizer`] (one per encoder) returns every temporal unit in the
 //! low-overhead form with **every OBU carrying its size field** (what
@@ -30,6 +31,8 @@
 //! * A unit that is neither form is passed on unchanged and reported.
 //!
 //! ## References
+//! * IVF framing (32-byte `DKIF` file header; per frame a little-endian u32
+//!   size and u64 timestamp): <https://wiki.multimedia.cx/index.php/IVF>
 //! * AV1 Bitstream & Decoding Process Specification: §5.2 low-overhead
 //!   format, §5.3 OBU syntax (`obu_header`, `obu_has_size_field`,
 //!   `obu_reserved_1bit`, leb128), §7.5 (a sequence header starts a coded
@@ -54,6 +57,11 @@ pub(crate) enum Form {
     LowOverhead,
     /// Low-overhead with an OBU lacking its size field; sizes are added.
     LowOverheadUnsized,
+    /// Low-overhead OBUs inside IVF container framing (a 32-byte `DKIF`
+    /// file header on the first unit, a 12-byte frame header on every one);
+    /// the framing is stripped. What the owner's Windows hardware AV1 MFT
+    /// gives (2.3.2 host log: "44 4b 49 46 00 00 20 00 41 56 30 31…").
+    Ivf,
     /// Annex B; converted.
     AnnexB,
     /// Neither: passed on unchanged.
@@ -178,10 +186,25 @@ fn annex_b(data: &[u8]) -> Option<Vec<Obu<'_>>> {
     (!obus.is_empty()).then_some(obus)
 }
 
-/// `data` read as `form` (only Annex B differs).
+/// The frame inside IVF framing: an optional file header (`DKIF`, its
+/// length at bytes 6..8), then a frame header of a little-endian u32 frame
+/// size and a u64 timestamp; `None` unless the size matches what follows.
+fn strip_ivf(data: &[u8]) -> Option<&[u8]> {
+    let mut d = data;
+    if d.starts_with(b"DKIF") {
+        let header_len = usize::from(u16::from_le_bytes([*d.get(6)?, *d.get(7)?]));
+        d = d.get(header_len..)?;
+    }
+    let size = usize::try_from(u32::from_le_bytes(d.get(..4)?.try_into().ok()?)).ok()?;
+    let frame = d.get(12..)?;
+    (frame.len() == size).then_some(frame)
+}
+
+/// `data` read as `form`.
 fn parse(data: &[u8], form: Form) -> Option<Vec<Obu<'_>>> {
     match form {
         Form::AnnexB => annex_b(data),
+        Form::Ivf => strip_ivf(data).and_then(low_overhead).map(|(o, _)| o),
         Form::LowOverhead | Form::LowOverheadUnsized => low_overhead(data).map(|(o, _)| o),
         Form::Unknown => None,
     }
@@ -192,6 +215,11 @@ fn parse(data: &[u8], form: Form) -> Option<Vec<Obu<'_>>> {
 /// wins (a small Annex B unit may read both ways: the caller decides the
 /// form only on units where that cannot happen).
 fn classify(data: &[u8]) -> Form {
+    // IVF framing first: its frame header can also read as an OBU header
+    // (the first key frame's "DKIF" did, as one huge unsized OBU).
+    if strip_ivf(data).and_then(low_overhead).is_some() {
+        return Form::Ivf;
+    }
     if data.first().is_some_and(|b| b & 0x80 != 0) && annex_b(data).is_some() {
         return Form::AnnexB;
     }
@@ -391,6 +419,30 @@ mod tests {
         ];
         assert_eq!(n.normalize(au, true), expected());
         assert_eq!(n.form, Some(Form::LowOverheadUnsized));
+    }
+
+    /// The 2.3.2 host log: an IVF file header and frame header before the
+    /// first key frame, a frame header before every later unit.
+    #[test]
+    fn ivf_framing_is_stripped() {
+        let frame = |obus: &[u8], ts: u64| {
+            let mut v = (obus.len() as u32).to_le_bytes().to_vec();
+            v.extend_from_slice(&ts.to_le_bytes());
+            v.extend_from_slice(obus);
+            v
+        };
+        let mut first = b"DKIF".to_vec();
+        first.extend_from_slice(&[0, 0, 32, 0]); // version 0, header 32 bytes
+        first.extend_from_slice(b"AV01");
+        first.extend_from_slice(&[0x80, 0x07, 0xb0, 0x04]); // 1920x1200
+        first.extend_from_slice(&[0xe8, 0x03, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(first.len(), 32);
+        first.extend_from_slice(&frame(&sized(), 0));
+        let mut n = Normalizer::default();
+        assert_eq!(n.normalize(first, true), expected());
+        assert_eq!(n.form, Some(Form::Ivf));
+        let later = frame(&[0x12, 0x00, 0x32, 0x02, 8, 9], 33);
+        assert_eq!(n.normalize(later, false), vec![0x32, 0x02, 8, 9]);
     }
 
     #[test]
