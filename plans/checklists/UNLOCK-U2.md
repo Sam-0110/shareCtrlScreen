@@ -30,6 +30,10 @@ terminal. Times below are from its timestamps.
 * A Windows 10 or 11 machine with the build under test installed by the installer (the service
   is installed and running). Two local accounts, A and B, both with passwords; fast user
   switching enabled (the default).
+* **Turn off automatic sign-in after a restart** for account A: Settings → Accounts → Sign-in
+  options → "Use my sign-in info to automatically finish setting up after an update or restart"
+  → Off. With it on, Windows signs A in (and locks) during the restart, the user's token is there
+  at once, and step 1 shows neither the "no user token" line nor a sign-in.
 * A second machine as the viewer, to see the host come up (optional: Task Manager on the host
   shows `sharectrl.exe` as well).
 
@@ -58,8 +62,8 @@ terminal. Times below are from its timestamps.
 4. **Fast user switching.** Signed in as A, Switch user, sign in as B. Expect a
    `launched engine ... in session <M>` line for B's session within 5 s; B's host appears. Switch
    back to A: A's session gets a host (a new one if A's ended; a running one just steps aside,
-   exit code 0). Lines for the session that is not at the console show only with
-   `RUST_LOG=debug` (`not the active console session; ignored`).
+   exit code 0). Events for the session that is not at the console are not logged at the
+   default level.
 5. **Sign out and back in, same account.** Signed in as A, Quit the host from its tray menu
    (`the host exited cleanly ...` in the log; the host stays down). Sign out, sign in as A again.
    Expect the host back within 5 s (`a user signed in ...` or a new session id and a

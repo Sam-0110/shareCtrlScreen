@@ -39,7 +39,10 @@
 //! - SERVICE_STATUS: <https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_status>
 //!   — `SERVICE_ACCEPT_STOP` 0x1, `SERVICE_ACCEPT_SHUTDOWN` 0x4,
 //!   `SERVICE_ACCEPT_SESSIONCHANGE` 0x80; `dwCheckPoint` and `dwWaitHint`
-//!   apply only to a pending state.
+//!   apply only to a pending state. SHUTDOWN is accepted although the page
+//!   reserves it for services that must clean up: the loop then ends before
+//!   the system does instead of being killed mid-launch, and from U3 the
+//!   service must end its agent at shutdown (plan 10a §3.7).
 //! - SetServiceStatus: <https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-setservicestatus>
 //!   — "Do not register to accept controls while the status is
 //!   SERVICE_START_PENDING or the service can crash" (the service reports
@@ -510,7 +513,9 @@ mod windows_service {
                         Some(d) => tracing::info!(
                             "a user signed in to console session {session}; launching the \
                              host now instead of in {}s",
-                            d.as_secs()
+                            // Rounded up, so a skip under a second reads
+                            // "1s", never "0s".
+                            d.as_millis().div_ceil(1000)
                         ),
                         None => tracing::info!(
                             "a user signed in to console session {session}; launching the host"
@@ -596,6 +601,22 @@ mod windows_service {
                 std::mem::size_of::<WTSSESSION_NOTIFICATION>()
             );
             assert_eq!(dispatcher::ACCEPTED, 0x1 | 0x4 | 0x80);
+
+            use windows::Win32::UI::WindowsAndMessaging as wm;
+            for (ours, theirs) in [
+                (SessionChange::ConsoleConnect, wm::WTS_CONSOLE_CONNECT),
+                (SessionChange::ConsoleDisconnect, wm::WTS_CONSOLE_DISCONNECT),
+                (SessionChange::RemoteConnect, wm::WTS_REMOTE_CONNECT),
+                (SessionChange::RemoteDisconnect, wm::WTS_REMOTE_DISCONNECT),
+                (SessionChange::Logon, wm::WTS_SESSION_LOGON),
+                (SessionChange::Logoff, wm::WTS_SESSION_LOGOFF),
+                (SessionChange::Lock, wm::WTS_SESSION_LOCK),
+                (SessionChange::Unlock, wm::WTS_SESSION_UNLOCK),
+                (SessionChange::RemoteControl, wm::WTS_SESSION_REMOTE_CONTROL),
+            ] {
+                assert_eq!(ours.code(), theirs, "{ours:?}");
+                assert_eq!(SessionChange::from_code(theirs), ours);
+            }
         }
 
         #[test]

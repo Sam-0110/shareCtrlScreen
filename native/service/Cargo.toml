@@ -36,3 +36,9 @@ features = [
     "Win32_System_Services",
     "Win32_System_Threading",
 ]
+
+# Test builds only: the WTS_* session-event constants, to check the plain
+# values in `events.rs` against the Windows headers.
+[target.'cfg(windows)'.dev-dependencies.windows]
+workspace = true
+features = ["Win32_UI_WindowsAndMessaging"]

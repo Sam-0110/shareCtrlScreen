@@ -477,6 +477,42 @@ mod tests {
     }
 
     #[test]
+    fn a_busy_producer_never_reorders_or_miscounts() {
+        // The handler's thread posts while the loop's thread drains. Whatever
+        // the interleaving, the events that arrive are in posting order and
+        // every post is either delivered or counted as lost.
+        const POSTS: u32 = 200_000;
+        let inbox = Arc::new(Inbox::new());
+        assert!(inbox.set_waiter());
+        let producer = {
+            let inbox = Arc::clone(&inbox);
+            std::thread::spawn(move || {
+                for n in 0..POSTS {
+                    inbox.post(ev(SessionChange::Lock, n));
+                }
+            })
+        };
+        let mut delivered = 0usize;
+        let mut lost = 0usize;
+        let mut next = 0u32;
+        let t0 = Instant::now();
+        while delivered + lost < POSTS as usize && t0.elapsed() < Duration::from_secs(60) {
+            inbox.wait(Duration::from_millis(1));
+            let drained = inbox.drain();
+            for e in &drained.events {
+                assert_eq!(e.change, SessionChange::Lock);
+                assert!(e.session >= next, "{} arrived after {next}", e.session);
+                next = e.session + 1;
+            }
+            delivered += drained.events.len();
+            lost += drained.lost;
+        }
+        assert!(producer.join().is_ok());
+        assert_eq!(delivered + lost, POSTS as usize);
+        assert!(delivered > 0);
+    }
+
+    #[test]
     fn a_stop_wakes_the_waiter_at_once_and_keeps_it_awake() {
         let inbox = Arc::new(Inbox::new());
         assert!(inbox.set_waiter());

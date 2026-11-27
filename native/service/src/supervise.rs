@@ -183,6 +183,11 @@ impl Supervisor {
         if was != User::Absent {
             return None;
         }
+        // WHY this cannot hide a crash loop: the count is cleared only on a
+        // change from Absent to Present, and Absent is entered only by a
+        // failed token query or a logoff event. A host that keeps crashing
+        // while its user stays signed in never passes through Absent, so its
+        // delay keeps doubling.
         self.failures = 0;
         let skipped = match self.host {
             Host::Retry { at } => {

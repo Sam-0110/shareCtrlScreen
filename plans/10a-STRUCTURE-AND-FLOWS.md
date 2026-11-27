@@ -619,7 +619,7 @@ answered with `Refused` and changes nothing.
 ### 4.3 The service's view of a session
 
 ```
-NoUser ──a user signs in (event or poll)──► User: host Wanted, agent Wanted
+NoUser ──the user's token appears (checked when an event or the poll wakes the loop)──► User: host Wanted, agent Wanted
 User ──sign-out / session change──► NoUser: agent stopped, host left to end with its session
 ```
 
