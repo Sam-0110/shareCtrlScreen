@@ -1194,6 +1194,14 @@ pub(super) fn transport_driver(d: Driver) {
                                                     .unwrap_or_default()
                                                     .to_string_lossy()
                                                     .into_owned();
+                                                // The last state the host loop saw (10a §3.3). Read
+                                                // into a local first: as an argument, the guard would
+                                                // live until the call returns, holding the session's
+                                                // screen lock (a leaf lock every capture thread takes)
+                                                // across the clipboard write, the sleep and the paste.
+                                                let screen_normal =
+                                                    shared.host_screen.lock().state()
+                                                        == platform_api::ScreenState::Normal;
                                                 let pasted = super::files::deliver_received_file(
                                                     &path,
                                                     incoming_drop_at.take(),
@@ -1204,10 +1212,7 @@ pub(super) fn transport_driver(d: Driver) {
                                                     }),
                                                     platform.as_ref(),
                                                     paste_dropped,
-                                                    // The last state the host
-                                                    // loop saw (10a §3.3).
-                                                    shared.host_screen.lock().state()
-                                                        == platform_api::ScreenState::Normal,
+                                                    screen_normal,
                                                 );
                                                 ui.send(crate::SessionEvent::Toast(if pasted {
                                                     format!("Pasted {name}")

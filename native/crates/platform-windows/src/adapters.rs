@@ -307,6 +307,7 @@ impl DdaCapture {
         // the host loop's `open_capture` then waits and tells the viewer. A
         // duplication that succeeds is the picture: `Normal` (`ScreenAccess`).
         let dup = capture::Duplicator::new(0, output).map_err(capture_err)?;
+        note_capture_reached();
         let device = D3d11Device(dup.device().clone());
         Ok(Self {
             dup,
@@ -366,6 +367,16 @@ fn attach_capture_desktop(desktop: &mut elevation::InputDesktopFollower) -> Desk
         tracing::info!("capture: the input desktop is reachable again");
     }
     now
+}
+
+/// A duplication on this thread succeeded: whatever the last attach found, the
+/// outage is over. Without this, an unlock that lands between a refused attach
+/// and the duplication that then succeeds would leave [`CAPTURE_ATTACH`] at the
+/// refusal, and the "reachable again" line would wait for the next loss.
+fn note_capture_reached() {
+    if CAPTURE_ATTACH.with(|c| c.replace(DesktopAttach::Attached)) != DesktopAttach::Attached {
+        tracing::info!("capture: the input desktop is reachable again");
+    }
 }
 
 /// DDA's pointer position → the trait's: `DXGI_OUTDUPL_POINTER_POSITION`
@@ -457,6 +468,7 @@ impl ScreenCapture for DdaCapture {
         match self.dup.reinit() {
             Ok(()) => {
                 self.access.reached();
+                note_capture_reached();
                 Ok(())
             }
             Err(e) => {

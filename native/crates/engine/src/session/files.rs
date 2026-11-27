@@ -178,7 +178,8 @@ pub(super) fn deliver_received_file(
     std::thread::sleep(std::time::Duration::from_millis(120));
     let chord = inj.paste_chord();
     press_chord(inj, chord);
-    tracing::info!("pasted {path:?} at ({nx:.3}, {ny:.3})");
+    // No drop position here: pointer positions never go to a log (plans/10a K4).
+    tracing::info!("pasted {path:?} at the drop point");
     true
 }
 
