@@ -21,7 +21,7 @@ in §8 as device-only and is answered by the U3.0 spike or a phase checklist.
 |---|---|---|
 | S | This plan + structure ([10a](10a-STRUCTURE-AND-FLOWS.md)), adversarial review folded in, Microsoft references read | **in progress**: plan and 10a written, review folded in (§7), Microsoft references read and folded in (§8, §9). Open: the owner's answers to D3, D7 and D8 (§5) |
 | U1 | The viewer is told what the host's screen is doing | not started |
-| U2 | Service: session events; a sign-in no longer waits out the launch delay | **in review** (branch `task/U2`), device-pending: [checklists/UNLOCK-U2.md](checklists/UNLOCK-U2.md). As built: §4 U2 |
+| U2 | Service: session events; a sign-in no longer waits out the launch delay | **complete** (`b7d4787`, review fixes `0c31f97`; reviewed independently; CI green on Windows, macOS and Linux at `7884dd6`), **device-pending**: [checklists/UNLOCK-U2.md](checklists/UNLOCK-U2.md). The Windows half has run in CI's tests only, never as a service on a device. As built: §4 U2 |
 | U3 | The agent: the lock screen of a signed-in user | not started (begins with a device spike) |
 | U4 | Ctrl+Alt+Del and Lock | not started |
 | U5 | UAC prompts | not started |
@@ -583,3 +583,10 @@ For the owner's open decisions (§5), from the reading:
   elevation prompts" for standard users (`EnableUIADesktopToggle`, off by default). The host is a
   UIAccess program (§2 fact 1). It does not replace D7: it does not cover administrators'
   prompts, and it removes the secure desktop instead of serving it.
+
+## 10. Follow-ups found on the way (not part of a phase yet)
+
+| # | What | Found | Status |
+|---|---|---|---|
+| F1 | **A brief "no console session" is treated as a session change.** `WTSGetActiveConsoleSessionId` returns 0xFFFFFFFF while the console session is being attached or detached (§8 row 13). `Supervisor::follow` (`service/src/supervise.rs`) resets on it, so the same session id coming back counts as new: a second host is launched while the first still runs, it steps aside with exit code 0, the policy records a clean exit, and the first host is no longer watched. If that host later crashes it is not relaunched until the session really changes. The behaviour predates U2 (the old `poll` did the same) and was kept unchanged there | U2 review, 2026-11-27 | **Open: the owner decides** whether to fix it now as its own small task (recommended: ignore a "no session" shorter than a few polls, and keep watching the running host across it) or leave it |
+| F2 | **`full_session_over_real_webrtc` can fail on the untouched tree** ("surface hidden after the session", `crates/engine/tests/loopback.rs`): the role becomes idle before the hide the test waits for has been applied. Seen about once in ten runs on `5e8ac67` in a loaded container; CI has been green | U1 build, 2026-11-27 | Open: assessed in U1's review |
