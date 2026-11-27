@@ -37,6 +37,12 @@ pub(crate) struct Moves {
 /// tracks the local pointer smoothly; a flowing stream returns sooner on data.
 const IDLE_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// How long after the host's screen came back the viewer waits for the
+/// keyframe that restarts the picture before it asks for one itself. Longer
+/// than a keyframe normally takes to arrive behind the message, so the usual
+/// case sends no request; short enough that a still screen is not left black.
+const POST_BLOCK_KEYFRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Viewer decode → present loop, with backlog catch-up, a keyframe watchdog and
 /// debounced view-size reports. The presenter and decoder are created here.
 pub(crate) fn viewer_media_loop(
@@ -90,6 +96,10 @@ pub(crate) fn viewer_media_loop(
     // Catch-up state: after locally dumping a delta backlog, deltas are useless
     // (their reference frames were skipped) until the requested IDR arrives.
     let mut awaiting_keyframe = false;
+    // When the host's last block ended, while the keyframe that restarts the
+    // picture after it has not come yet (plans/10 U1, K21). See the top of the
+    // loop and the idle tick.
+    let mut block_ended_at: Option<std::time::Instant> = None;
     // Tell the host what size we're actually displaying at, so it encodes to that
     // and we can present 1:1 (no resampling blur). Debounced: a drag-resize would
     // otherwise rebuild the host's encoder on every intermediate size.
@@ -120,6 +130,21 @@ pub(crate) fn viewer_media_loop(
         if epoch != held_epoch {
             last_frame = None;
             held_epoch = epoch;
+            // The control channel and video are not ordered against each
+            // other. Frames encoded before the block can still be in flight
+            // (the host's pacer, the network, this queue) when the block's end
+            // has already arrived, and decoding them would show the screen
+            // from before the lock after it (K21; seen on a slow machine,
+            // where they came a second late). The host starts again with a
+            // keyframe (10a K5), so nothing older than the next keyframe is
+            // decoded: the catch-up state below skips deltas and asks for a
+            // keyframe, at most once a second, until one comes.
+            awaiting_keyframe = true;
+            // The other order: that keyframe can arrive before the block's
+            // end does, and is then decoded while still blocked, so never
+            // shown. On a still screen nothing would follow it. The idle tick
+            // asks for another once the block has been over for a moment.
+            block_ended_at = (!host_blocked).then(std::time::Instant::now);
         }
         if owes_show && !host_blocked {
             owes_show = !show_unless_blocked(surface.as_ref(), &shared);
@@ -205,6 +230,7 @@ pub(crate) fn viewer_media_loop(
                     }
                     pending.drain(..k);
                     awaiting_keyframe = false;
+                    block_ended_at = None;
                 } else if awaiting_keyframe {
                     // Deltas can't decode until the requested IDR arrives.
                     skipped += pending.len() as u64;
@@ -317,6 +343,21 @@ pub(crate) fn viewer_media_loop(
                 // otherwise stay black until the next frame). `swap` reads and
                 // clears the request atomically so it fires exactly once.
                 let repaint = shared.repaint_requested.swap(false, Ordering::SeqCst);
+                // The block is over and no keyframe has come since (see the
+                // top of the loop): ask for one, so a still screen does not
+                // stay black. The host defers a request that follows its own
+                // keyframe too closely, and never drops one.
+                if block_ended_at.is_some_and(|at| at.elapsed() >= POST_BLOCK_KEYFRAME_WAIT)
+                    && last_kf_req.elapsed() >= std::time::Duration::from_secs(1)
+                {
+                    tracing::info!(
+                        "viewer: no keyframe since the host's screen came back — requesting one"
+                    );
+                    let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest {
+                        s: slot,
+                    }));
+                    last_kf_req = std::time::Instant::now();
+                }
                 // Looked at again: a block (or a block and its end) may have
                 // come while this pass waited, and the re-show's repaint
                 // must not find the frame from before it (K21).
