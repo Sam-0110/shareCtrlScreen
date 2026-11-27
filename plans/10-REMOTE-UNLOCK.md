@@ -20,7 +20,7 @@ in §8 as device-only and is answered by the U3.0 spike or a phase checklist.
 | Step | What | Status |
 |---|---|---|
 | S | This plan + structure ([10a](10a-STRUCTURE-AND-FLOWS.md)), adversarial review folded in, Microsoft references read | **in progress**: plan and 10a written, review folded in (§7), Microsoft references read and folded in (§8, §9). Open: the owner's answers to D3, D7 and D8 (§5) |
-| U1 | The viewer is told what the host's screen is doing | **in review** (branch `task/U1`, see U1 *As built* in §4); device-pending: [checklists/UNLOCK-U1.md](checklists/UNLOCK-U1.md) |
+| U1 | The viewer is told what the host's screen is doing | **complete** (`b6053f0`; review fixes `61cc9b1`, `832fe60`; CI fixes `5b1021a`, `9ae8e4a`, `26b4207`, `fce6796`; reviewed independently in two rounds, the keyframe rule in a third; CI green on Windows, macOS and Linux at `fce6796`), **device-pending**: [checklists/UNLOCK-U1.md](checklists/UNLOCK-U1.md). Nothing of it has run on a Windows device; known gap: §10 F3. As built: §4 U1 |
 | U2 | Service: session events; a sign-in no longer waits out the launch delay | **complete** (`b7d4787`, review fixes `0c31f97`; reviewed independently; CI green on Windows, macOS and Linux at `7884dd6`), **device-pending**: [checklists/UNLOCK-U2.md](checklists/UNLOCK-U2.md). The Windows half has run in CI's tests only, never as a service on a device. As built: §4 U2 |
 | U3 | The agent: the lock screen of a signed-in user | not started (begins with a device spike) |
 | U4 | Ctrl+Alt+Del and Lock | not started |
