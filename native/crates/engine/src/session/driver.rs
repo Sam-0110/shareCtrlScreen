@@ -165,6 +165,16 @@ fn popout_surfaces(shared: &Shared) -> Vec<Arc<dyn VideoSurface>> {
         .collect()
 }
 
+/// Viewer: every open pop-out window's stream slot and surface (D14).
+fn popout_slots(shared: &Shared) -> Vec<(u8, Arc<dyn VideoSurface>)> {
+    shared
+        .popouts
+        .lock()
+        .iter()
+        .map(|(slot, p)| (*slot, p.surface.clone()))
+        .collect()
+}
+
 /// Most video streams a session carries (main + pop-outs).
 const MAX_STREAMS: usize = 1 + crate::media::host::MAX_POPOUTS as usize;
 
@@ -436,18 +446,16 @@ pub(super) fn transport_driver(d: Driver) {
                         |b| tp.send_ctl(b),
                     );
                 }
-                let open: Vec<(u8, Arc<dyn VideoSurface>)> = shared
-                    .popouts
-                    .lock()
-                    .iter()
-                    .map(|(slot, p)| (*slot, p.surface.clone()))
-                    .collect();
-                for (slot, s) in open {
-                    s.show();
-                    ctl.send(
-                        serialize(&protocol::ControlMsg::KeyframeRequest { s: slot }),
-                        |b| tp.send_ctl(b),
-                    );
+                // Not while the host's screen is blocked: the end of the
+                // block shows them (K21).
+                if !shared.host_block.blocked() {
+                    for (slot, s) in popout_slots(&shared) {
+                        s.show();
+                        ctl.send(
+                            serialize(&protocol::ControlMsg::KeyframeRequest { s: slot }),
+                            |b| tp.send_ctl(b),
+                        );
+                    }
                 }
                 ui.send(crate::SessionEvent::LinkRestored);
             }
@@ -1023,6 +1031,58 @@ pub(super) fn transport_driver(d: Driver) {
                                     }
                                     continue;
                                 }
+                                // Viewer: what the host's screen is (plans/10
+                                // U1, 10a §3.3). While it is blocked nothing
+                                // shows its picture — neither the main video
+                                // (the gate) nor a pop-out — and no frame from
+                                // before is repainted after (K21,
+                                // `Shared::host_block`). The UI shows why.
+                                Ok(protocol::ControlMsg::HostState { screen, kind, why }) => {
+                                    if !host_side {
+                                        let blocked = screen == protocol::HostScreen::Blocked;
+                                        // First the record the present loops
+                                        // read, then the gate: a show the gate
+                                        // queues finds the held frame dropped.
+                                        let changed = shared.host_block.set(blocked);
+                                        if let Some(v) = &view {
+                                            v.set_host_blocked(blocked);
+                                        }
+                                        if changed && blocked {
+                                            for s in popout_surfaces(&shared) {
+                                                s.hide();
+                                            }
+                                        } else if changed && !link_trouble {
+                                            // Back: show the pop-outs (link
+                                            // trouble keeps them hidden; its
+                                            // end shows them) and ask for
+                                            // fresh pictures, as the held
+                                            // ones are gone.
+                                            for (slot, s) in popout_slots(&shared) {
+                                                s.show();
+                                                ctl.send(
+                                                    serialize(
+                                                        &protocol::ControlMsg::KeyframeRequest {
+                                                            s: slot,
+                                                        },
+                                                    ),
+                                                    |b| tp.send_ctl(b),
+                                                );
+                                            }
+                                        }
+                                        if changed {
+                                            tracing::info!(
+                                                "viewer: the host's screen is {}",
+                                                screen.as_str()
+                                            );
+                                        }
+                                        ui.send(crate::SessionEvent::HostScreen {
+                                            screen,
+                                            kind,
+                                            why,
+                                        });
+                                    }
+                                    continue;
+                                }
                                 // Viewer: a part of the host's cursor image
                                 // (D9). Reassembled and cached here; the media
                                 // thread picks it up when a position names it.
@@ -1136,6 +1196,11 @@ pub(super) fn transport_driver(d: Driver) {
                                                     }),
                                                     platform.as_ref(),
                                                     paste_dropped,
+                                                    // The last state the host
+                                                    // loop saw (10a §3.3).
+                                                    !shared
+                                                        .host_screen_secure
+                                                        .load(Ordering::SeqCst),
                                                 );
                                                 ui.send(crate::SessionEvent::Toast(if pasted {
                                                     format!("Pasted {name}")

@@ -343,6 +343,12 @@ fn event_kind(ev: &SessionEvent) -> String {
         SessionEvent::LinkRestored => "restored".into(),
         SessionEvent::Displays { .. } => "displays".into(),
         SessionEvent::Toast(_) => "toast".into(),
+        SessionEvent::HostScreen { screen, kind, why } => format!(
+            "hostscreen:{}:{}:{}",
+            screen.as_str(),
+            kind.as_deref().unwrap_or(""),
+            why.as_deref().unwrap_or("")
+        ),
         SessionEvent::Released => "released".into(),
         SessionEvent::SurfaceReleased { surface } => format!("surface-released:{surface:?}"),
     }
@@ -2491,5 +2497,177 @@ async fn ending_a_session_during_its_start_leaves_nothing_behind() {
             .connect(&host.uuid, viewer.platform.surface.clone())
             .is_ok(),
         "nothing is still ending"
+    );
+}
+
+/// The host-screen reports a viewer received, in order (plans/10 U1).
+fn host_screens(p: &Peer) -> Vec<String> {
+    p.session_log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, e)| e.starts_with("hostscreen:"))
+        .map(|(_, e)| e.clone())
+        .collect()
+}
+
+const BLOCKED: &str = "hostscreen:blocked::unsupported";
+const NORMAL: &str = "hostscreen:normal::";
+
+/// plans/10 U1, flows 10a §5.1/§5.5: the host's screen becomes one it cannot
+/// capture (its lock screen) mid-session. The viewer hears `blocked` once —
+/// however many times the host retries — hides the picture, and shows
+/// nothing from before the lock afterwards (K21); after the local unlock the
+/// host says `normal` by itself and the picture comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_locked_host_screen_is_explained_and_comes_back_by_itself() {
+    const LOCK_AT: u64 = 20;
+    let relay = start_relay().await;
+    let host = start_peer_with("lock-host", &relay, |p| {
+        p.capture.outage = Some(platform_api::mock::MockOutage {
+            at: LOCK_AT,
+            // ~1.5 s of a lock screen at the loop's 250 ms retry.
+            failed_reinits: 6,
+            state: platform_api::ScreenState::Blocked(platform_api::BlockReason::NotSupported),
+        });
+    });
+    let viewer = start_peer("lock-viewer", &relay);
+    let t = Duration::from_secs(15);
+    eventually("both registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    viewer.open(&host.uuid);
+    let surface = viewer.platform.surface.clone();
+    eventually("the picture before the lock", t, || {
+        !surface.state().presented.is_empty()
+    })
+    .await;
+    eventually("the host says it is locked", t, || {
+        host_screens(&viewer).iter().any(|e| e == BLOCKED)
+    })
+    .await;
+    // Everything presented up to now predates the lock.
+    let before = surface.state().presented.len();
+    eventually("the picture is hidden", t, || !surface.state().visible).await;
+
+    eventually("the host says it is back", t, || {
+        host_screens(&viewer).last().map(String::as_str) == Some(NORMAL)
+    })
+    .await;
+    eventually("the picture is back", t, || {
+        let s = surface.state();
+        s.visible && s.presented.len() > before
+    })
+    .await;
+    // Let the repaint that follows the re-show and a few frames happen.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    {
+        let s = surface.state();
+        let after: Vec<Option<u64>> = s.presented[before..].iter().map(|p| p.stamp).collect();
+        assert!(
+            after.iter().all(|st| st.is_some_and(|n| n >= LOCK_AT)),
+            "a frame from before the lock was shown again (K21): {after:?}"
+        );
+    }
+    // The first state on the channel, the lock once, and the way back.
+    assert_eq!(host_screens(&viewer), [NORMAL, BLOCKED, NORMAL]);
+    assert!(
+        host_screens(&host).is_empty(),
+        "the host's own UI is not told"
+    );
+}
+
+/// plans/10 U1, flow 10a §5.3 without the agent: connecting to a host that
+/// is already on a screen it cannot capture. No frame and no decoder output
+/// exist yet, so the message is the only thing the viewer can show, and it
+/// arrives (the acceptance asks for 2 s; the queue delivers it as soon as
+/// the control channel opens). The picture follows once the screen is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connecting_to_an_already_locked_host_explains_the_missing_picture() {
+    let relay = start_relay().await;
+    // Five refusals: 100 + 200 + 400 + 800 + 1600 ms of `open_capture`'s
+    // back-off, so the channel is open well before the screen is back.
+    let host = start_peer_with("locked-host", &relay, |p| {
+        p.capture_refusals
+            .store(5, std::sync::atomic::Ordering::SeqCst);
+    });
+    let viewer = start_peer("locked-viewer", &relay);
+    let t = Duration::from_secs(15);
+    eventually("both registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    viewer.open(&host.uuid);
+    let surface = viewer.platform.surface.clone();
+    let asked = Instant::now();
+    eventually("the host says it is locked", t, || {
+        host_screens(&viewer).iter().any(|e| e == BLOCKED)
+    })
+    .await;
+    let waited = asked.elapsed();
+    assert!(
+        surface.state().presented.is_empty(),
+        "nothing was captured yet"
+    );
+    eventually("the black surface is hidden", t, || {
+        !surface.state().visible
+    })
+    .await;
+    assert!(
+        waited < Duration::from_secs(3),
+        "the message took {waited:?} (connect + handshake included)"
+    );
+    eventually("the picture once the screen is back", t, || {
+        let s = surface.state();
+        s.visible && !s.presented.is_empty()
+    })
+    .await;
+    assert_eq!(host_screens(&viewer), [BLOCKED, NORMAL]);
+}
+
+/// K21 at its sharpest: after the unlock the host's screen does not change,
+/// so no new frame arrives and the re-shown video has only what it held. It
+/// must show nothing rather than the picture from before the lock (which
+/// could be a different user's desktop, or a document closed meanwhile).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_from_before_the_lock_is_never_shown_again() {
+    const LOCK_AT: u64 = 20;
+    let relay = start_relay().await;
+    let host = start_peer_with("still-host", &relay, |p| {
+        // Still after the lock: an idle desktop sends nothing new.
+        p.capture.static_after = Some(LOCK_AT);
+        p.capture.outage = Some(platform_api::mock::MockOutage {
+            at: LOCK_AT,
+            failed_reinits: 4,
+            state: platform_api::ScreenState::Blocked(platform_api::BlockReason::NotSupported),
+        });
+    });
+    let viewer = start_peer("still-viewer", &relay);
+    let t = Duration::from_secs(15);
+    eventually("both registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    viewer.open(&host.uuid);
+    let surface = viewer.platform.surface.clone();
+    eventually("the host says it is locked", t, || {
+        host_screens(&viewer).iter().any(|e| e == BLOCKED)
+    })
+    .await;
+    let before = surface.state().presented.len();
+    assert!(before > 0, "the picture before the lock was shown");
+    eventually("the host says it is back", t, || {
+        host_screens(&viewer).last().map(String::as_str) == Some(NORMAL)
+    })
+    .await;
+    eventually("the video is shown again", t, || surface.state().visible).await;
+    // The re-show's repaint (D12) and cursor moves (D11) run every 16 ms.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let s = surface.state();
+    let after: Vec<Option<u64>> = s.presented[before..].iter().map(|p| p.stamp).collect();
+    assert!(
+        after.iter().all(|st| st.is_some_and(|n| n >= LOCK_AT)),
+        "a frame from before the lock was repainted (K21): {after:?}"
     );
 }

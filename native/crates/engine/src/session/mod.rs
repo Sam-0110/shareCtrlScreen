@@ -97,6 +97,16 @@ pub(crate) struct Shared {
     pub input_target: Arc<Mutex<u8>>,
     /// Viewer: the last pop-out attachment generation handed out.
     pub popout_gen: AtomicU64,
+    /// Viewer: whether the host says its screen cannot be shown (`hstate`
+    /// `blocked`, plans/10 U1), and how often that changed. One for the
+    /// session: a pop-out stream's `Shared` holds the same `Arc`, so every
+    /// window's present loop drops the frame it holds at a block (K21).
+    pub host_block: Arc<HostBlock>,
+    /// Host: the last [`platform_api::ScreenState`] the main stream's loop
+    /// saw is not `Normal` (a secure screen is up, shown or not). A dropped
+    /// file is then left on the clipboard instead of pasted, because the
+    /// paste chord would go to the secure screen (10a §3.3).
+    pub host_screen_secure: AtomicBool,
     /// Test hook (`test-hooks` feature only): the host's current encode size,
     /// `w << 32 | h`, so the loopback can assert it stays full resolution as the
     /// link varies (V2 has no resolution ladder).
@@ -117,6 +127,46 @@ pub(crate) struct Shared {
     /// shipping build.
     #[cfg(feature = "test-hooks")]
     pub sever: AtomicBool,
+}
+
+/// Viewer: the host's `blocked` state as the present loops see it
+/// (plans/10a §3.3, invariant K21). A counter, not a flag, so a loop that did
+/// not run between a block and its end still sees that one happened: the
+/// frame it holds predates the block and must never be repainted, even if
+/// the block is already over when the loop next looks. Odd = blocked.
+#[derive(Debug, Default)]
+pub(crate) struct HostBlock(AtomicU64);
+
+impl HostBlock {
+    /// Record the host's state. Returns whether it changed. Written by the
+    /// session's transport thread only; the loops only read.
+    pub(crate) fn set(&self, blocked: bool) -> bool {
+        self.0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                (blocked != (v % 2 == 1)).then_some(v + 1)
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn blocked(&self) -> bool {
+        self.epoch() % 2 == 1
+    }
+
+    /// Changes so far: a frame held at one epoch may be shown only while
+    /// the epoch is still the same.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// What a viewer advertised in its connect-request besides its codecs
+/// (`Caps`). Missing caps (an older viewer) mean neither.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ViewerFeatures {
+    /// It can show pop-out windows (D14).
+    pub popout: bool,
+    /// It understands `hstate` (plans/10 U1).
+    pub hstate: bool,
 }
 
 /// The pointer as the last position message described it.
@@ -462,14 +512,15 @@ pub(crate) fn input_rect_for(d: &platform_api::DisplayInfo) -> Option<Rect> {
 
 /// Host: build the offer and data channels, start the transport, capture →
 /// encode and clipboard threads, then send the offer to `peer`.
-/// `popouts`: the viewer said it can show pop-out windows (D14), so spare
-/// video tracks are worth offering.
+/// `features`: what the viewer can do. With pop-outs (D14) spare video
+/// tracks are worth offering; with `hstate` (plans/10 U1) the host tells it
+/// what its screen is.
 pub(crate) fn begin_host(
     engine: &Engine,
     id: SessionId,
     peer: String,
     permission: Permission,
-    popouts: bool,
+    features: ViewerFeatures,
     codec: platform_api::Codec,
 ) {
     // Set when the session ends any way; the transport thread reports a dead
@@ -525,7 +576,7 @@ pub(crate) fn begin_host(
     // spare carries nothing until a pop-out is opened, and having them in the
     // offer means opening one needs no renegotiation. Their order is the slot
     // number; the viewer reads it back from the m-line order.
-    let pop_slots = if popouts {
+    let pop_slots = if features.popout {
         (platform.displays().len().saturating_sub(1)).min(MAX_POPOUTS as usize) as u8
     } else {
         0
@@ -566,6 +617,7 @@ pub(crate) fn begin_host(
         cursor_tx,
         bitrate: bitrate.clone(),
         stop: stop.clone(),
+        hstate: features.hstate,
     };
     // Clipboard sync is gated on the SAME live permission as input: a view-only
     // peer must not read this machine's clipboard (it can hold a password that
@@ -1322,6 +1374,8 @@ pub(crate) fn open_viewer_popout(
     let control = main.control.load(Ordering::SeqCst);
     let shared = Arc::new(Shared {
         cursor_images: main.cursor_images.clone(),
+        // One record of the host's block for every window (K21).
+        host_block: main.host_block.clone(),
         ..Shared::default()
     });
     shared.control.store(control, Ordering::SeqCst);

@@ -77,6 +77,51 @@ pub enum CaptureError {
     Backend(String),
 }
 
+/// What the host's screen is, as far as the capture backend can tell (plans/10
+/// U1, 10a §3.1). The host tells the viewer on every change, so a screen that
+/// cannot be captured is explained instead of shown as a black or frozen
+/// picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenState {
+    /// The ordinary desktop: what [`ScreenCapture::acquire`] delivers is what
+    /// the person at the computer sees. Also the answer of every backend that
+    /// cannot tell (the default).
+    Normal,
+    /// A secure desktop is showing and is being captured.
+    Secure(SecureKind),
+    /// A secure desktop is showing and cannot be captured: `acquire` returns
+    /// [`CaptureError::Lost`] until it is gone.
+    Blocked(BlockReason),
+}
+
+/// Which secure desktop is showing, so the viewer does not call a
+/// permission prompt a lock screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecureKind {
+    /// The lock screen of a signed-in user.
+    Lock,
+    /// A prompt of the operating system (Windows: User Account Control, or
+    /// the Ctrl+Alt+Del screen) in an unlocked session.
+    Prompt,
+    /// The sign-in screen with nobody signed in.
+    SignIn,
+}
+
+/// Why a secure desktop cannot be shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockReason {
+    /// This host has no way to show it (Windows: no installed service; every
+    /// Windows host before plans/10 U3).
+    NotSupported,
+    /// The host's own setting is off.
+    Disabled,
+    /// The machine's policy says no (Windows: prompts, unless an
+    /// administrator allowed them).
+    NotAllowed,
+    /// The helper that would show it is not answering.
+    AgentUnavailable,
+}
+
 /// A display capture session.
 ///
 /// Invariants (each one fixed a real bug on Windows — keep them on every OS):
@@ -110,5 +155,23 @@ pub trait ScreenCapture {
     /// encoder path as today. Default: unsupported.
     fn request_output_size(&mut self, _size: (u32, u32)) -> bool {
         false
+    }
+
+    /// What the screen is right now, as far as this backend can tell. Read by
+    /// the host loop after every [`acquire`](Self::acquire) and
+    /// [`reinit`](Self::reinit) (and after construction), so it must be cheap
+    /// (a field read, no OS call) and say what those calls last found out.
+    ///
+    /// [`ScreenState::Blocked`] goes with [`CaptureError::Lost`]: a backend
+    /// reports it while the screen the person at the computer sees cannot be
+    /// captured, and returns to [`ScreenState::Normal`] by itself once a
+    /// `reinit` reaches the ordinary desktop again — nothing outside the
+    /// backend resets it. Being off the desktop for another reason (a startup
+    /// race, a mode change, a disconnected session) is still `Normal`: only a
+    /// screen the backend positively knows it cannot reach is `Blocked`.
+    ///
+    /// Default: [`ScreenState::Normal`] (a backend that cannot tell).
+    fn screen_state(&self) -> ScreenState {
+        ScreenState::Normal
     }
 }

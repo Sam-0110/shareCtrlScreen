@@ -25,7 +25,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-use platform_api::{CaptureError, Codec, DisplayInfo, EncoderConfig, Platform, ScreenCapture};
+use platform_api::{
+    BlockReason, CaptureError, Codec, DisplayInfo, EncoderConfig, Platform, ScreenCapture,
+    ScreenState, SecureKind,
+};
+use protocol::control::hstate;
 
 use crate::session::Shared;
 use crate::tuning::{MAX_FPS, MAX_FPS_INTERVAL};
@@ -58,6 +62,77 @@ pub(crate) struct HostCtx {
     pub bitrate: Arc<AtomicU32>,
     /// The session's stop flag.
     pub stop: Arc<AtomicBool>,
+    /// The viewer advertised `Caps::hstate`: the main stream tells it what
+    /// the screen is (plans/10 U1). Never sent to a viewer without it.
+    pub hstate: bool,
+}
+
+/// The `hstate` message for `state` (10a §3.2).
+pub(crate) fn host_state_msg(state: ScreenState) -> protocol::ControlMsg {
+    let (screen, kind, why) = match state {
+        ScreenState::Normal => (protocol::HostScreen::Normal, None, None),
+        ScreenState::Secure(k) => (
+            protocol::HostScreen::Secure,
+            Some(match k {
+                SecureKind::Lock => hstate::KIND_LOCK,
+                SecureKind::Prompt => hstate::KIND_PROMPT,
+                SecureKind::SignIn => hstate::KIND_SIGNIN,
+            }),
+            None,
+        ),
+        ScreenState::Blocked(r) => (
+            protocol::HostScreen::Blocked,
+            None,
+            Some(match r {
+                BlockReason::NotSupported => hstate::WHY_UNSUPPORTED,
+                BlockReason::Disabled => hstate::WHY_DISABLED,
+                BlockReason::NotAllowed => hstate::WHY_POLICY,
+                BlockReason::AgentUnavailable => hstate::WHY_AGENT,
+            }),
+        ),
+    };
+    protocol::ControlMsg::HostState {
+        screen,
+        kind: kind.map(str::to_string),
+        why: why.map(str::to_string),
+    }
+}
+
+/// The main stream's report of what the host's screen is (plans/10 U1,
+/// 10a §3.3, invariant K13). Only the main stream has one: a pop-out's
+/// capture shows another monitor of the same machine, so it never says
+/// anything the main one does not.
+#[derive(Default)]
+struct ScreenReport {
+    /// What was last observed (and sent). `None` until the first look, so
+    /// the first state is always sent: queued until the ctl channel opens,
+    /// it is the value the viewer starts from.
+    last: Option<ScreenState>,
+}
+
+impl ScreenReport {
+    /// Record `state`; on a change, tell the viewer (if it understands
+    /// `hstate`) and remember for a dropped file whether the screen is the
+    /// ordinary one. Cheap when nothing changed: called on every pass.
+    fn observe(&mut self, state: ScreenState, ctx: &HostCtx) {
+        if self.last == Some(state) {
+            return;
+        }
+        // Not logged for the very first, ordinary state: every session has it.
+        if self.last.is_some() || state != ScreenState::Normal {
+            tracing::info!("host: the screen is now {state:?}");
+        }
+        self.last = Some(state);
+        ctx.shared
+            .host_screen_secure
+            .store(state != ScreenState::Normal, Ordering::SeqCst);
+        if ctx.hstate {
+            let msg = host_state_msg(state);
+            let _ = ctx
+                .ctl_tx
+                .send(serde_json::to_vec(&msg).unwrap_or_default());
+        }
+    }
 }
 
 /// One video stream of the host.
@@ -292,12 +367,15 @@ type OpenedCapture = (Box<dyn ScreenCapture>, Option<String>);
 /// self-recovers exactly as it does for a mid-session desktop switch. A missing
 /// saved display falls back to the primary; any other (terminal) error is returned.
 /// Also returns the display actually opened (`None` = the primary, including
-/// after that fallback).
+/// after that fallback). `on_wait` runs once, when the first attempt is
+/// refused that way: the main stream tells the viewer then (plans/10 U1), so a
+/// session started on a lock screen explains itself instead of staying black.
 fn open_capture(
     platform: &dyn Platform,
     display: Option<&str>,
     fallback_to_primary: bool,
     stop: &dyn Fn() -> bool,
+    on_wait: &mut dyn FnMut(),
 ) -> Result<OpenedCapture, Box<dyn std::error::Error>> {
     let mut backoff = std::time::Duration::from_millis(100);
     let mut waited = false;
@@ -335,6 +413,7 @@ fn open_capture(
                          unavailable (service host starting off the desktop, or a secure \
                          desktop / lock screen is up); retrying until it returns"
                     );
+                    on_wait();
                 }
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
@@ -393,7 +472,27 @@ pub(crate) fn host_media_loop(
     // the record of what the viewer holds (one cache on the viewer).
     let mut cursor_images = shared.host_cursor_root.sharing();
     let codecs = platform.codecs();
-    let (mut cap, opened) = open_capture(platform.as_ref(), display.as_deref(), main, &stopped)?;
+    let mut report = main.then(ScreenReport::default);
+    // Before a capture object exists there is no backend to ask. A refusal
+    // that keeps the capture from even being created is a screen this host
+    // cannot reach — before plans/10 U3, every secure desktop on Windows — so
+    // the viewer hears `blocked`, once; the first `screen_state` of the
+    // capture that finally opens takes it back to what it really is.
+    let mut on_wait = || {
+        if let Some(r) = report.as_mut() {
+            r.observe(ScreenState::Blocked(BlockReason::NotSupported), &ctx);
+        }
+    };
+    let (mut cap, opened) = open_capture(
+        platform.as_ref(),
+        display.as_deref(),
+        main,
+        &stopped,
+        &mut on_wait,
+    )?;
+    if let Some(r) = report.as_mut() {
+        r.observe(cap.screen_state(), &ctx);
+    }
     // The monitor being shared, as an id from `platform.displays()`, announced
     // to both sides so either can offer a switch.
     let mut current_display = {
@@ -471,6 +570,12 @@ pub(crate) fn host_media_loop(
             std::thread::sleep(MAX_FPS_INTERVAL - since);
         }
         last_frame_at = std::time::Instant::now();
+        // What the last acquire / reinit / switch found out (a field read).
+        // Before the pause check, so a paused stream still reports what it
+        // last saw; it observes nothing new until it acquires again (K13).
+        if let Some(r) = report.as_mut() {
+            r.observe(cap.screen_state(), &ctx);
+        }
 
         // A monitor switch (host UI, or a controlling viewer). The new capture
         // is opened next to the old one and only replaces it once it AND an
@@ -788,7 +893,13 @@ pub(crate) fn host_media_loop(
             // and re-acquires the duplication; if that still fails (secure desktop
             // up), back off and keep trying until the desktop returns.
             Err(CaptureError::Lost) => {
-                if let Err(e) = cap.reinit() {
+                let reinit = cap.reinit();
+                // At once, not after the back-off below: the viewer hears
+                // of a lock within one pass (plans/10 U1 acceptance: 2 s).
+                if let Some(r) = report.as_mut() {
+                    r.observe(cap.screen_state(), &ctx);
+                }
+                if let Err(e) = reinit {
                     if capture_down_since.is_none() {
                         capture_down_since = Some(std::time::Instant::now());
                         tracing::warn!(
@@ -847,7 +958,124 @@ pub(crate) fn fit_within(want: (u32, u32), src: (u32, u32)) -> (u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::fit_within;
+    use super::{fit_within, host_state_msg, HostCtx, ScreenReport};
+    use platform_api::{BlockReason, ScreenState, SecureKind};
+    use protocol::{ControlMsg, HostScreen};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    fn wire(state: ScreenState) -> String {
+        serde_json::to_string(&host_state_msg(state)).unwrap()
+    }
+
+    #[test]
+    fn every_screen_state_has_its_wire_words() {
+        assert_eq!(
+            wire(ScreenState::Normal),
+            r#"{"t":"hstate","screen":"normal"}"#
+        );
+        for (k, word) in [
+            (SecureKind::Lock, "lock"),
+            (SecureKind::Prompt, "prompt"),
+            (SecureKind::SignIn, "signin"),
+        ] {
+            assert_eq!(
+                wire(ScreenState::Secure(k)),
+                format!(r#"{{"t":"hstate","screen":"secure","kind":"{word}"}}"#)
+            );
+        }
+        for (r, word) in [
+            (BlockReason::NotSupported, "unsupported"),
+            (BlockReason::Disabled, "disabled"),
+            (BlockReason::NotAllowed, "policy"),
+            (BlockReason::AgentUnavailable, "agent"),
+        ] {
+            assert_eq!(
+                wire(ScreenState::Blocked(r)),
+                format!(r#"{{"t":"hstate","screen":"blocked","why":"{word}"}}"#)
+            );
+        }
+    }
+
+    /// A host context whose ctl messages land in the returned receiver.
+    fn ctx(hstate: bool) -> (HostCtx, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let (ctl_tx, ctl_rx) = std::sync::mpsc::channel();
+        let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (frame_tx, _) = std::sync::mpsc::channel();
+        let (cursor_tx, _) = std::sync::mpsc::channel();
+        let platform = Arc::new(platform_api::mock::MockPlatform::new(&std::env::temp_dir()));
+        let ctx = HostCtx {
+            platform,
+            codec: platform_api::Codec::H264,
+            shared: Arc::default(),
+            ctl_tx,
+            ui: crate::SessionUi {
+                id: crate::SessionId(1),
+                peer: "viewer".into(),
+                host: true,
+                tx: ui_tx,
+            },
+            frame_tx,
+            cursor_tx,
+            bitrate: Arc::default(),
+            stop: Arc::default(),
+            hstate,
+        };
+        (ctx, ctl_rx)
+    }
+
+    fn screens(rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<HostScreen> {
+        rx.try_iter()
+            .map(
+                |b| match serde_json::from_slice::<ControlMsg>(&b).unwrap() {
+                    ControlMsg::HostState { screen, .. } => screen,
+                    other => panic!("unexpected {other:?}"),
+                },
+            )
+            .collect()
+    }
+
+    /// K13: the first state goes out (it is what the viewer starts from),
+    /// then only changes — a reinit retried every 250 ms on a lock screen
+    /// sends `blocked` once.
+    #[test]
+    fn the_viewer_hears_the_first_state_and_each_change_once() {
+        let (ctx, rx) = ctx(true);
+        let mut r = ScreenReport::default();
+        let blocked = ScreenState::Blocked(BlockReason::NotSupported);
+        r.observe(ScreenState::Normal, &ctx);
+        for _ in 0..10 {
+            r.observe(blocked, &ctx);
+        }
+        assert!(ctx.shared.host_screen_secure.load(Ordering::SeqCst));
+        r.observe(ScreenState::Secure(SecureKind::Lock), &ctx);
+        assert!(ctx.shared.host_screen_secure.load(Ordering::SeqCst));
+        r.observe(ScreenState::Normal, &ctx);
+        r.observe(ScreenState::Normal, &ctx);
+        assert!(!ctx.shared.host_screen_secure.load(Ordering::SeqCst));
+        assert_eq!(
+            screens(&rx),
+            [
+                HostScreen::Normal,
+                HostScreen::Blocked,
+                HostScreen::Secure,
+                HostScreen::Normal
+            ]
+        );
+    }
+
+    /// An old viewer (no `Caps::hstate`) is never sent `hstate`; the host
+    /// still knows its own screen (a dropped file is not pasted onto it).
+    #[test]
+    fn an_old_viewer_never_receives_hstate() {
+        let (ctx, rx) = ctx(false);
+        let mut r = ScreenReport::default();
+        r.observe(ScreenState::Normal, &ctx);
+        r.observe(ScreenState::Blocked(BlockReason::NotSupported), &ctx);
+        assert!(ctx.shared.host_screen_secure.load(Ordering::SeqCst));
+        r.observe(ScreenState::Normal, &ctx);
+        assert!(rx.try_iter().next().is_none());
+    }
 
     #[test]
     fn fit_within_never_upscales() {

@@ -94,7 +94,9 @@ Each prints one line and exits 0 on success, non-zero with a readable reason oth
 installer surfaces that line and gates on the exit code). `--install-service` refuses unless
 `sharectrl.exe` is in the same folder: the service launches the host from its own directory.
 
-The service is mandatory to reach the secure desktop (UAC / lock / login). UIAccess is
+The service does **not** reach the secure desktop (UAC / lock / sign-in) yet: the host it
+launches is the user's process, which Windows keeps off the `Winlogon` desktop. While one is
+up the viewer is told (`hstate`, plans/10 U1); reaching it is plans/10 U3–U6. UIAccess is
 deliberately **not** used, so the app runs **unsigned** — the only cost is a first-install
 SmartScreen "Run anyway" prompt (§8b/§11.4). No code-signing certificate, no codec
 license, no cloud bill: `$0` to build and ship (§11.4).

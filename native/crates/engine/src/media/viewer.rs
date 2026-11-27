@@ -64,8 +64,14 @@ pub(crate) fn viewer_media_loop(
         .codecs()
         .new_decoder(presenter.device(), codec, 1920, 1080)?;
     tracing::info!("viewer: decoder+presenter ready ({})", codec.as_caps_str());
+    // A pop-out shows itself, but not while the host's screen is blocked
+    // (K21): it then owes its show until the block ends. The transport
+    // thread shows the pop-outs it knows of when the block ends; this
+    // covers one that was not registered yet at that moment.
+    let mut owes_show = false;
     match &view {
         Some(v) => v.set_ready(),
+        None if shared.host_block.blocked() => owes_show = true,
         None => surface.show(),
     }
 
@@ -102,7 +108,24 @@ pub(crate) fn viewer_media_loop(
     // re-presents only when the cursor actually moved (bounding the GPU work).
     let mut last_frame: Option<Frame<'_>> = None;
     let mut last_cursor: Option<(f64, f64)> = None;
+    // The host-block epoch `last_frame` was decoded in (plans/10 U1, K21).
+    // A held frame from before a block is never presented again: not by the
+    // repaint that follows the re-show, not by a cursor move. Compared at the
+    // top of each pass (so even a block that ended before this loop looked
+    // drops it) and again right before any present: a block can arrive while
+    // a pass waits for or decodes a frame.
+    let mut held_epoch = shared.host_block.epoch();
     while !stop.load(Ordering::SeqCst) {
+        let epoch = shared.host_block.epoch();
+        let host_blocked = epoch % 2 == 1;
+        if epoch != held_epoch {
+            last_frame = None;
+            held_epoch = epoch;
+        }
+        if owes_show && !host_blocked {
+            owes_show = false;
+            surface.show();
+        }
         // A move to another window (plans/09 W2): a presenter on the new
         // surface, on the decoder's device — the decoder and its held frame
         // stay, so nothing waits for a keyframe an idle host would not send.
@@ -256,7 +279,13 @@ pub(crate) fn viewer_media_loop(
                             // frame is then exactly the screen at the pause,
                             // which is what an idle host — sending nothing
                             // until its screen changes — shows on return.
-                            if view.as_ref().is_none_or(|v| v.is_shown()) {
+                            // Read again, not this pass's copy: a block that
+                            // came while decoding stops the present (K21).
+                            let block_changed = shared.host_block.epoch() != held_epoch;
+                            if !host_blocked
+                                && !block_changed
+                                && view.as_ref().is_none_or(|v| v.is_shown())
+                            {
                                 present_frame(
                                     presenter.as_mut(),
                                     &shared,
@@ -268,7 +297,12 @@ pub(crate) fn viewer_media_loop(
                                 );
                             }
                             last_cursor = cursor;
-                            last_frame = Some(frame);
+                            // Decoded while blocked (in flight from before) or
+                            // across a change: kept for its references only,
+                            // never held.
+                            if !host_blocked && !block_changed {
+                                last_frame = Some(frame);
+                            }
                         }
                         Ok(None) => {
                             on_no_picture(&mut undecoded_streak, &mut last_kf_req, &ctl_tx, slot)
@@ -285,6 +319,12 @@ pub(crate) fn viewer_media_loop(
                 // otherwise stay black until the next frame). `swap` reads and
                 // clears the request atomically so it fires exactly once.
                 let repaint = shared.repaint_requested.swap(false, Ordering::SeqCst);
+                // Looked at again: a block (or a block and its end) may have
+                // come while this pass waited, and the re-show's repaint
+                // must not find the frame from before it (K21).
+                if shared.host_block.epoch() != held_epoch {
+                    last_frame = None;
+                }
                 match &last_frame {
                     Some(frame) => {
                         let (cursor, shape) = current_cursor(&shared, surface.as_ref());
