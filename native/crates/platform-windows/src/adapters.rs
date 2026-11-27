@@ -14,9 +14,11 @@
 //! * `OpenInputDesktop` checks the requested access against the desktop's
 //!   security descriptor:
 //!   <https://learn.microsoft.com/en-us/windows/win32/winstation/desktop-security-and-access-rights>
-//! * `OpenInputDesktop` returns NULL with `GetLastError` on failure, and in a
-//!   disconnected session a handle to the desktop that becomes active on
-//!   reconnect (so a disconnected session is not a refusal):
+//! * `OpenInputDesktop` returns NULL with `GetLastError` on failure; "if the
+//!   calling process is running in a disconnected session, the function returns
+//!   a handle to the desktop that becomes active when the user restores the
+//!   connection". That a disconnected session therefore never reads as a refusal
+//!   here is our inference, unverified on a device (checklists/UNLOCK-U1.md §5):
 //!   <https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-openinputdesktop>
 //! * `DuplicateOutput` returns `E_ACCESSDENIED` without access to the current
 //!   desktop image ("only an application that runs at LOCAL_SYSTEM can access
@@ -37,9 +39,9 @@ use std::time::Duration;
 use platform_api::{
     Autostart, CaptureError, CapturedFrame, Clipboard, Codec, CodecError, CodecFactory,
     CursorShape, CursorSprite, CursorUpdate, EncodedUnit, EncoderConfig, FileDrop, Frame,
-    FrameData, InputInjector, KeyForwarder, MoveRect, Point, Presenter, Rect, ScreenCapture,
-    ScreenState, SecretStore, ShortcutHook, SurfaceError, VideoDecoder, VideoEncoder, VideoInput,
-    VideoSurface,
+    FrameData, InputInjector, KeyForwarder, MoveRect, Point, Presenter, Rect, ScreenAccess,
+    ScreenCapture, ScreenState, SecretStore, ShortcutHook, SurfaceError, VideoDecoder,
+    VideoEncoder, VideoInput, VideoSurface,
 };
 use protocol::InputMsg;
 use windows::Win32::Foundation::{E_ACCESSDENIED, HWND, POINT, RECT};
@@ -242,8 +244,21 @@ pub struct DdaCapture {
     /// Attaches THIS (host-media / capture) thread to the active input desktop
     /// before the duplication is (re)acquired. See [`attach_capture_desktop`].
     desktop: elevation::InputDesktopFollower,
-    /// What the last attach found; [`ScreenCapture::screen_state`] reads it.
-    attach: DesktopAttach,
+    /// What [`ScreenCapture::screen_state`] reports: decided by the last
+    /// attempt to get a picture ([`ScreenAccess`]), not by the attach alone —
+    /// the desktop may come back between a refused attach and a duplication
+    /// that then succeeds.
+    access: ScreenAccess,
+}
+
+thread_local! {
+    /// What the last attach of a capture on THIS thread found. Per thread, not
+    /// per capture: `open_capture` builds a new [`DdaCapture`] on every retry
+    /// while a lock screen is up, and one outage must be logged once, not once
+    /// per constructor. Each stream (main, every pop-out) captures on a thread
+    /// of its own, so each logs its own outage once and never hides another's.
+    static CAPTURE_ATTACH: std::cell::Cell<DesktopAttach> =
+        const { std::cell::Cell::new(DesktopAttach::Attached) };
 }
 
 /// What an attempt to attach a thread to the input desktop found.
@@ -263,8 +278,8 @@ enum DesktopAttach {
 /// Classify the result of [`elevation::InputDesktopFollower::follow`]. Only
 /// an access denial is a refusal: that is what the desktop's security
 /// descriptor answers for the `Winlogon` desktop. In a disconnected session
-/// `OpenInputDesktop` succeeds (with the desktop of the reconnect), so a
-/// disconnected session is never reported as blocked.
+/// `OpenInputDesktop` returns the desktop of the reconnect, so we expect it
+/// not to read as a refusal (unverified on a device).
 fn classify_follow(r: &Result<bool, elevation::desktop::DesktopError>) -> DesktopAttach {
     match r {
         Ok(_) => DesktopAttach::Attached,
@@ -287,10 +302,10 @@ impl DdaCapture {
         // same thread, right after this) is also created in the right desktop
         // context — restoring the full fast path, not just capture.
         let mut desktop = elevation::InputDesktopFollower::new();
-        let mut attach = DesktopAttach::Attached;
-        attach_capture_desktop(&mut desktop, &mut attach);
+        attach_capture_desktop(&mut desktop);
         // A refused attach usually fails here too (`E_ACCESSDENIED` → `Lost`):
-        // the host loop's `open_capture` then waits and tells the viewer.
+        // the host loop's `open_capture` then waits and tells the viewer. A
+        // duplication that succeeds is the picture: `Normal` (`ScreenAccess`).
         let dup = capture::Duplicator::new(0, output).map_err(capture_err)?;
         let device = D3d11Device(dup.device().clone());
         Ok(Self {
@@ -299,7 +314,7 @@ impl DdaCapture {
             current: None,
             hotspot: Point::default(),
             desktop,
-            attach,
+            access: ScreenAccess::default(),
         })
     }
 }
@@ -313,9 +328,10 @@ impl DdaCapture {
 /// Logs the desktop it moved onto (so a future lag report says which desktop the
 /// capture is reading — `Default`, `Winlogon`, `Screen-saver`), and warns, without
 /// failing, when the input desktop cannot be opened (the duplication attempt that
-/// follows then reports the denial, which the host loop retries). `last` is what
-/// the previous attach found: a failure is logged when it starts and its end
-/// when it ends, not on each of the host loop's 250 ms retries.
+/// follows then reports the denial, which the host loop retries). Compared with
+/// what the previous attach on this thread found ([`CAPTURE_ATTACH`]): a failure
+/// is logged when it starts and its end when it ends, not on each of the host
+/// loop's 250 ms retries nor on each of `open_capture`'s new captures.
 ///
 /// ## References
 /// * `SetThreadDesktop` affects only the calling thread and fails if that thread
@@ -323,9 +339,10 @@ impl DdaCapture {
 ///   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-setthreaddesktop>
 /// * `OpenInputDesktop` returns the desktop currently receiving user input:
 ///   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-openinputdesktop>
-fn attach_capture_desktop(desktop: &mut elevation::InputDesktopFollower, last: &mut DesktopAttach) {
+fn attach_capture_desktop(desktop: &mut elevation::InputDesktopFollower) -> DesktopAttach {
     let r = desktop.follow();
     let now = classify_follow(&r);
+    let last = CAPTURE_ATTACH.with(|c| c.replace(now));
     match r {
         Ok(true) => tracing::info!(
             "capture: host thread attached to input desktop {:?}",
@@ -334,7 +351,7 @@ fn attach_capture_desktop(desktop: &mut elevation::InputDesktopFollower, last: &
         // Already on the current input desktop (self-launched host, or no switch
         // since the last attach) — nothing to log.
         Ok(false) => {}
-        Err(_) if now == *last => {}
+        Err(_) if now == last => {}
         Err(e) if now == DesktopAttach::Refused => tracing::warn!(
             "capture: the input desktop refused this process ({e}) — a lock screen, \
              sign-in screen or UAC prompt is up, which this host cannot show; the \
@@ -345,10 +362,10 @@ fn attach_capture_desktop(desktop: &mut elevation::InputDesktopFollower, last: &
              Desktop Duplication may be denied until it is reachable — will retry"
         ),
     }
-    if now == DesktopAttach::Attached && *last != DesktopAttach::Attached {
+    if now == DesktopAttach::Attached && last != DesktopAttach::Attached {
         tracing::info!("capture: the input desktop is reachable again");
     }
-    *last = now;
+    now
 }
 
 /// DDA's pointer position → the trait's: `DXGI_OUTDUPL_POINTER_POSITION`
@@ -436,23 +453,33 @@ impl ScreenCapture for DdaCapture {
         // a `Lost`/`AccessDenied` is often a desktop switch (secure desktop up,
         // lock, fast-user-switch), so the new duplication must be taken on the
         // new input desktop. Logs the move; a no-op switch logs nothing.
-        attach_capture_desktop(&mut self.desktop, &mut self.attach);
-        self.dup.reinit().map_err(capture_err)
+        let attach = attach_capture_desktop(&mut self.desktop);
+        match self.dup.reinit() {
+            Ok(()) => {
+                self.access.reached();
+                Ok(())
+            }
+            Err(e) => {
+                // Before plans/10 U3 nothing can show a secure desktop to this
+                // process: a refused attach is `NotSupported` (10a §4.1, last
+                // paragraph); any other failure is retried, not reported.
+                self.access.failed(
+                    (attach == DesktopAttach::Refused)
+                        .then_some(platform_api::BlockReason::NotSupported),
+                );
+                Err(capture_err(e))
+            }
+        }
     }
 
     fn device(&self) -> Option<&dyn Any> {
         Some(&self.device)
     }
 
-    /// Before plans/10 U3 nothing can show a secure desktop to this process,
-    /// so a refused attach is `Blocked(NotSupported)` (10a §4.1, last
-    /// paragraph) and anything else is `Normal` — including a duplication
-    /// that fails for another reason, which the host loop just retries.
+    /// `Blocked(NotSupported)` while the last reinit failed after a refused
+    /// attach; `Normal` otherwise (see [`ScreenAccess`]).
     fn screen_state(&self) -> ScreenState {
-        match self.attach {
-            DesktopAttach::Refused => ScreenState::Blocked(platform_api::BlockReason::NotSupported),
-            DesktopAttach::Attached | DesktopAttach::Failed => ScreenState::Normal,
-        }
+        self.access.state()
     }
 }
 

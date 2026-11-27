@@ -187,12 +187,20 @@ impl Engine {
 }
 ```
 
-- **Host media loop** (`media/host.rs`). After `open_capture` returns, and after every `acquire`
-  and `reinit`, the main stream (slot 0) compares `cap.screen_state()` with the last value sent
-  and sends `hstate` on `ctl_tx` when it differs (the channel `displays` uses, `host.rs:190-195`;
-  messages sent before the channel opens are queued, `session/driver.rs:288`). While
-  `open_capture` waits on `Lost` (`host.rs:331-341`) it sends `blocked` once. A paused main
-  stream does not acquire (`host.rs:660-663`), so it reports at resume.
+- **Host media loop** (`media/host.rs`). The screen state belongs to the **session**
+  (`SessionScreen` in `Shared::host_screen`, a leaf lock). After `open_capture` returns, after
+  every `acquire` (read at the top of the next pass) and right after every `reinit`, each stream
+  records `cap.screen_state()` there; nothing is sent while the lock is held. The session's state
+  is the main stream's observation while it runs; while it is paused, the pop-out streams'
+  (blocked if any is blocked, then secure, then normal); with the main stream paused and no
+  pop-out, it stays as it was. A stream counts only what it observed since it last acquired: a
+  resumed main stream counts again from its first acquire or reinit, so its pre-pause state is
+  never sent. The **transport thread** alone takes each change (`pending_hstate`) and queues one
+  `hstate` for it (queued until the channel opens), only for a viewer with `Caps::hstate` — one
+  change is one message, in order, whichever streams took part. While `open_capture` waits on
+  `Lost` (`host.rs:331-341`), the stream records `Blocked(NotSupported)` once, at the **second**
+  refusal in a row (about 100 ms in), so a single transient refusal at open shows no card. A
+  paused main stream does not acquire (`host.rs:660-663`).
 - **D8 in the loop.** If the answer is "view-only viewers do not see secure screens": while the
   state is `Secure` and the session has no control, every stream's loop releases frames without
   encoding and the main stream reports `blocked` with `why: "view-only"`. The permission is read
@@ -545,7 +553,8 @@ knows which keys and buttons are down, because it sees every event whatever its 
 
 | Piece | Contract |
 |---|---|
-| Event `host-screen` | `{ remoteId, screen, kind, why }` from `SessionEvent::HostScreen` (`app/src/bridge.rs`) |
+| Event `host-screen` | `{ remoteId, screen, kind, why }` from `SessionEvent::HostScreen`, emitted by the TabManager (`app/src/tabs.rs`, where viewer session events go; `bridge.rs` passes them on) |
+| Snapshot field `hostScreen` | On each tab of the `tabs-changed` snapshot (and `get_snapshot`): `{ remoteId, screen, kind, why }` as last received, or `null` (no session, or a host that never sent `hstate`). Reset on connect and on end. Detached windows draw from it |
 | Event `action-result` | `{ remoteId, action, ok, why }` |
 | Command `send_secure_attention(remoteId)` | → `Engine::send_secure_attention` (the pattern of `request_refresh`, `app/src/commands.rs:266-274`, `app/ui/api.js:66`) |
 | Command `lock_remote(remoteId)` | → `Engine::lock_remote` |
@@ -761,7 +770,9 @@ A host has one session at a time (`crates/engine/src/sessions.rs:266`). Within i
 
 - **Pop-outs.** Each pop-out stream owns a capture object on its own thread
   (`media/host.rs:396`), so each has its own source and, on the lock screen, its own attachment
-  for its own output (at most `MAX_ATTACHMENTS`). Only the main stream reports `hstate`. Pointer
+  for its own output (at most `MAX_ATTACHMENTS`). Every stream records what its capture sees;
+  the pop-outs' observations decide the session's state only while the main stream is paused
+  (§3.3, K13). Pointer
   input aimed at a pop-out reaches [A] with that stream's `TargetRect` (`InputTarget`,
   `session/driver.rs:978-1003`).
 - **Monitor switch.** The new capture object is created while the old one is alive
@@ -787,9 +798,12 @@ today.
 ### 5.14 A background tab
 
 The viewer pauses the main stream of a tab that is not on screen; the host stops acquiring
-(`media/host.rs:660-663`). If the machine locks meanwhile, the host notices at resume: `acquire`
-returns `Lost`, and flow 5.1 runs from step 2. An attachment held across a pause idles on its
-unacknowledged frame.
+(`media/host.rs:660-663`) and the main stream's observation stops counting. Pop-out streams are
+not paused: while one is open, its capture speaks for the session, so a lock meanwhile reaches
+the viewer as `blocked` and hides the pop-out (K21). With no pop-out open nothing of the host is
+on screen at the viewer, and the host notices at resume: `acquire` returns `Lost`, and flow 5.1
+runs from step 2; the main stream's pre-pause state is never sent in between. An attachment held
+across a pause idles on its unacknowledged frame.
 
 ## 6. Thread and failure rules
 
@@ -822,7 +836,7 @@ unacknowledged frame.
 | K10 | The service reports stopped only after the agent's process has ended; `--stop-service` leaves no agent running from the binary. |
 | K11 | With the user's setting off the host never attaches. The setting is a preference; the agent's table is the protection. |
 | K12 | A host without the service behaves as today, plus `hstate`. |
-| K13 | `hstate` is sent when the ctl channel opens and when the main stream's loop observes a change of `ScreenState` (a paused stream observes it at resume), only to a viewer that advertised `hstate`. |
+| K13 | `hstate` is sent when the ctl channel opens and whenever the session's screen state changes, only to a viewer that advertised `hstate`. The session's screen state is what the main stream's capture reports while the main stream runs; while it is paused, it is what the pop-out streams' captures report (blocked if any of them is blocked). With the main stream paused and no pop-out open, nothing of the host is on screen at the viewer and the state is observed at resume. |
 | K14 | The pipe exists before its name is published. It is created with its access list (the session's logon SID, individual rights, no right to create instances), its integrity label (no read or write from below), an explicit SYSTEM owner, first-instance and reject-remote, or not at all. The service deletes every published name when it starts. |
 | K15 | The agent ends when the service ends: it exits when its control pipe closes, and its own job object ends it where Windows allows the assignment. The control pipe is the service's, open to SYSTEM only, and accepts only the process the service has just created. |
 | K16 | ShareCtrlScreen never stores, caches or replays a Windows password or PIN. |

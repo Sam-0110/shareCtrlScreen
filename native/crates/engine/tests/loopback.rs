@@ -2528,7 +2528,7 @@ async fn a_locked_host_screen_is_explained_and_comes_back_by_itself() {
             at: LOCK_AT,
             // ~1.5 s of a lock screen at the loop's 250 ms retry.
             failed_reinits: 6,
-            state: platform_api::ScreenState::Blocked(platform_api::BlockReason::NotSupported),
+            refused: Some(platform_api::BlockReason::NotSupported),
         });
     });
     let viewer = start_peer("lock-viewer", &relay);
@@ -2640,7 +2640,7 @@ async fn a_frame_from_before_the_lock_is_never_shown_again() {
         p.capture.outage = Some(platform_api::mock::MockOutage {
             at: LOCK_AT,
             failed_reinits: 4,
-            state: platform_api::ScreenState::Blocked(platform_api::BlockReason::NotSupported),
+            refused: Some(platform_api::BlockReason::NotSupported),
         });
     });
     let viewer = start_peer("still-viewer", &relay);
@@ -2670,4 +2670,80 @@ async fn a_frame_from_before_the_lock_is_never_shown_again() {
         after.iter().all(|st| st.is_some_and(|n| n >= LOCK_AT)),
         "a frame from before the lock was repainted (K21): {after:?}"
     );
+}
+
+/// K13 (review decision): the screen state belongs to the session. With the
+/// main stream paused (its tab in the background) and a pop-out window open,
+/// the pop-out's capture speaks for the host: its screen blocks, the viewer
+/// hears `blocked` and the pop-out is hidden — no pre-lock picture stays up —
+/// and the unlock brings `normal` and the pop-out back.
+#[cfg(feature = "test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_popout_speaks_for_the_host_while_the_main_stream_is_paused() {
+    let relay = start_relay().await;
+    let second = platform_api::DisplayInfo {
+        id: "mock-1".into(),
+        name: "Second".into(),
+        x: 640,
+        y: 0,
+        width: 800,
+        height: 600,
+        scale: 1.0,
+        primary: false,
+    };
+    let host = start_peer_with("paused-host", &relay, |p| {
+        p.extra_displays.push(second.clone());
+        // Only the pop-out's capture loses its screen: the paused main
+        // stream would not see it before it acquires again.
+        p.outage_on = Some("mock-1".into());
+        p.capture.outage = Some(platform_api::mock::MockOutage {
+            // ~3 s into the pop-out's stream: time to pause the main one.
+            at: 90,
+            failed_reinits: 6,
+            refused: Some(platform_api::BlockReason::NotSupported),
+        });
+    });
+    let viewer = start_peer("paused-viewer", &relay);
+    let t = Duration::from_secs(15);
+    eventually("both registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    let id = viewer.open(&host.uuid);
+    eventually("main window presenting", t, || {
+        viewer.last_displays().is_some_and(|d| d.2)
+            && !viewer.platform.surface.state().presented.is_empty()
+    })
+    .await;
+    viewer.engine.popout_display(id, "mock-1".into());
+    eventually("pop-out announced", t, || {
+        *viewer.popouts.lock().unwrap() == vec![(1, "mock-1".to_string())]
+    })
+    .await;
+    let pop = platform_api::mock::MockSurface::new((800, 600));
+    assert!(viewer.engine.attach_popout(id, 1, pop.clone()).is_some());
+    eventually("the pop-out presents", t, || {
+        let s = pop.state();
+        s.visible && !s.presented.is_empty()
+    })
+    .await;
+    // The tab goes to the background: the host pauses the main stream.
+    viewer.engine.set_screen(&[], None);
+    eventually("main stream paused", t, || {
+        host.engine.test_video_paused() == Some(true)
+    })
+    .await;
+    assert_eq!(host_screens(&viewer), [NORMAL], "nothing blocked yet");
+
+    eventually("the pop-out's screen blocks", t, || {
+        host_screens(&viewer).iter().any(|e| e == BLOCKED)
+    })
+    .await;
+    eventually("the pop-out is hidden", t, || !pop.state().visible).await;
+    eventually("the host says it is back", t, || {
+        host_screens(&viewer).last().map(String::as_str) == Some(NORMAL)
+    })
+    .await;
+    eventually("the pop-out is shown again", t, || pop.state().visible).await;
+    assert_eq!(host_screens(&viewer), [NORMAL, BLOCKED, NORMAL]);
 }

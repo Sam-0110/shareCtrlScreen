@@ -26,7 +26,8 @@ use protocol::{Button, InputMsg};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 use crate::capture::{
-    CaptureError, CapturedFrame, CursorShape, CursorUpdate, ScreenCapture, ScreenState,
+    BlockReason, CaptureError, CapturedFrame, CursorShape, CursorUpdate, ScreenAccess,
+    ScreenCapture, ScreenState,
 };
 use crate::codec::{
     Codec, CodecError, CodecFactory, EncodedUnit, EncoderConfig, VideoDecoder, VideoEncoder,
@@ -95,7 +96,10 @@ impl Default for MockCaptureConfig {
 /// A capture outage for [`MockCaptureConfig::outage`] (plans/10a §3.1).
 /// Unlike `lose_at`, which loses once and recovers on the first `reinit`,
 /// the screen stays lost: every `acquire` returns [`CaptureError::Lost`] and
-/// `reinit` fails `failed_reinits` times before one succeeds.
+/// `reinit` fails `failed_reinits` times before one succeeds. What it reports
+/// follows [`ScreenAccess`], the rule the real backends follow: each failed
+/// `reinit` reports `refused`, the one that succeeds `Normal`, and the lost
+/// `acquire` alone changes nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MockOutage {
     /// `acquire` reports the loss when this frame number is reached (0: the
@@ -104,9 +108,10 @@ pub struct MockOutage {
     /// How many `reinit` calls fail before one succeeds. `u32::MAX`: never
     /// (a capture that stays lost).
     pub failed_reinits: u32,
-    /// What [`ScreenCapture::screen_state`] reports from the loss until the
-    /// `reinit` that succeeds; [`ScreenState::Normal`] before and after.
-    pub state: ScreenState,
+    /// Why the failed `reinit`s fail: `Some` reports `Blocked(reason)` from
+    /// the first failed `reinit` until the one that succeeds; `None` is a
+    /// loss that is not a refusal and stays [`ScreenState::Normal`].
+    pub refused: Option<BlockReason>,
 }
 
 /// The mock's pointer image: 6×10, hotspot (2, 3), straight alpha, an opaque
@@ -147,6 +152,8 @@ pub struct MockCapture {
     in_outage: bool,
     /// `reinit` calls that failed in this outage.
     outage_reinits: u32,
+    /// What `screen_state` reports, by the real backends' rule.
+    access: ScreenAccess,
     /// Whether the next frame reports the pointer image (first frame, and
     /// the first after a reinit).
     shape_due: bool,
@@ -170,6 +177,7 @@ impl MockCapture {
             outage_fired: false,
             in_outage: false,
             outage_reinits: 0,
+            access: ScreenAccess::default(),
             shape_due: true,
             burst_next: 0,
             releases: 0,
@@ -323,13 +331,18 @@ impl ScreenCapture for MockCapture {
         self.release();
         self.reinits += 1;
         if self.in_outage {
-            let allowed = self.cfg.outage.map_or(0, |o| o.failed_reinits);
+            let (allowed, refused) = self
+                .cfg
+                .outage
+                .map_or((0, None), |o| (o.failed_reinits, o.refused));
             if self.outage_reinits < allowed {
                 self.outage_reinits += 1;
+                self.access.failed(refused);
                 return Err(CaptureError::Lost);
             }
             self.in_outage = false;
         }
+        self.access.reached();
         self.paint_background();
         self.bar_x = None;
         self.shape_due = true;
@@ -341,10 +354,7 @@ impl ScreenCapture for MockCapture {
     }
 
     fn screen_state(&self) -> ScreenState {
-        match self.cfg.outage {
-            Some(o) if self.in_outage => o.state,
-            _ => ScreenState::Normal,
-        }
+        self.access.state()
     }
 }
 
@@ -1099,6 +1109,9 @@ pub struct MockPlatform {
     /// before one succeeds: a screen that cannot be reached when the session
     /// starts (a host already on its lock screen). Default: 0.
     pub capture_refusals: AtomicU32,
+    /// Limits [`MockCaptureConfig::outage`] to captures of this display id
+    /// (`"mock-0"` or one of `extra_displays`); `None`: every capture.
+    pub outage_on: Option<String>,
     codecs: MockCodecFactory,
     secrets: Arc<MockSecretStore>,
 }
@@ -1128,6 +1141,7 @@ impl MockPlatform {
             os_name: "mock",
             extra_displays: Vec::new(),
             capture_refusals: AtomicU32::new(0),
+            outage_on: None,
             codecs: MockCodecFactory,
             secrets: Arc::new(MockSecretStore),
         }
@@ -1171,6 +1185,13 @@ impl Platform for MockPlatform {
         display: Option<&str>,
     ) -> Result<Box<dyn ScreenCapture>, CaptureError> {
         let mut cfg = self.capture.clone();
+        if self
+            .outage_on
+            .as_deref()
+            .is_some_and(|on| on != display.unwrap_or("mock-0"))
+        {
+            cfg.outage = None;
+        }
         if let Some(id) = display.filter(|d| *d != "mock-0") {
             let extra = self
                 .extra_displays
@@ -1319,14 +1340,13 @@ mod tests {
     /// reports lasts exactly as long as the outage.
     #[test]
     fn capture_outage_stays_lost_until_a_reinit_succeeds() {
-        use crate::capture::BlockReason;
         let blocked = ScreenState::Blocked(BlockReason::NotSupported);
         let mut c = MockCapture::new(MockCaptureConfig {
             fps: 1000,
             outage: Some(MockOutage {
                 at: 2,
                 failed_reinits: 3,
-                state: blocked,
+                refused: Some(BlockReason::NotSupported),
             }),
             ..Default::default()
         });
@@ -1334,12 +1354,14 @@ mod tests {
             assert!(c.acquire(Duration::from_millis(20)).unwrap().is_some());
             assert_eq!(c.screen_state(), ScreenState::Normal);
         }
-        for _ in 0..3 {
+        for i in 0..3 {
             assert!(matches!(
                 c.acquire(Duration::from_millis(20)),
                 Err(CaptureError::Lost)
             ));
-            assert_eq!(c.screen_state(), blocked);
+            // The loss alone is not a refusal: the reinit decides.
+            let before = if i == 0 { ScreenState::Normal } else { blocked };
+            assert_eq!(c.screen_state(), before);
             assert!(matches!(c.reinit(), Err(CaptureError::Lost)));
             assert_eq!(c.screen_state(), blocked);
         }
@@ -1366,7 +1388,7 @@ mod tests {
             outage: Some(MockOutage {
                 at: 0,
                 failed_reinits: u32::MAX,
-                state: blocked,
+                refused: Some(BlockReason::NotSupported),
             }),
             ..Default::default()
         });

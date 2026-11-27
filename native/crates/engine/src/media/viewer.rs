@@ -71,8 +71,7 @@ pub(crate) fn viewer_media_loop(
     let mut owes_show = false;
     match &view {
         Some(v) => v.set_ready(),
-        None if shared.host_block.blocked() => owes_show = true,
-        None => surface.show(),
+        None => owes_show = !show_unless_blocked(surface.as_ref(), &shared),
     }
 
     let mut ts = 0i64;
@@ -123,8 +122,7 @@ pub(crate) fn viewer_media_loop(
             held_epoch = epoch;
         }
         if owes_show && !host_blocked {
-            owes_show = false;
-            surface.show();
+            owes_show = !show_unless_blocked(surface.as_ref(), &shared);
         }
         // A move to another window (plans/09 W2): a presenter on the new
         // surface, on the decoder's device — the decoder and its held frame
@@ -360,6 +358,23 @@ pub(crate) fn viewer_media_loop(
         }
     }
     Ok(())
+}
+
+/// Show a pop-out's surface unless the host's screen is blocked; returns
+/// whether it is shown. Re-checked after the show: a block that starts
+/// between the check and the show finds the surface not yet registered or not
+/// yet shown, so the transport thread's hide may have come first — this
+/// hides it again and the show stays owed (K21).
+fn show_unless_blocked(surface: &dyn VideoSurface, shared: &Shared) -> bool {
+    if shared.host_block.blocked() {
+        return false;
+    }
+    surface.show();
+    if shared.host_block.blocked() {
+        surface.hide();
+        return false;
+    }
+    true
 }
 
 /// A decode error: logged, with the access unit's first bytes for the

@@ -39,8 +39,8 @@ pub mod unavailable;
 pub mod mock;
 
 pub use capture::{
-    BlockReason, CaptureError, CapturedFrame, CursorShape, CursorUpdate, ScreenCapture,
-    ScreenState, SecureKind,
+    BlockReason, CaptureError, CapturedFrame, CursorShape, CursorUpdate, ScreenAccess,
+    ScreenCapture, ScreenState, SecureKind,
 };
 pub use codec::{
     Codec, CodecError, CodecFactory, EncodedUnit, EncoderConfig, VideoDecoder, VideoEncoder,

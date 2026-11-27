@@ -262,24 +262,30 @@ Microsoft references of §8 read and cited; D3, D7 and D8 answered by the owner.
 - **As built** (in review, branch `task/U1`; device-pending:
   [checklists/UNLOCK-U1.md](checklists/UNLOCK-U1.md)):
   - `platform-api`: `ScreenState` / `SecureKind` / `BlockReason` and
-    `ScreenCapture::screen_state` (default `Normal`) as 10a §3.1. The mock has
-    `MockCaptureConfig::outage` (`MockOutage { at, failed_reinits, state }`, `u32::MAX` = stays
-    lost) and, beyond 10a, `MockPlatform::capture_refusals` (`create_capture` refused with `Lost`
-    *n* times: a session that starts on a lock screen).
+    `ScreenCapture::screen_state` (default `Normal`) as 10a §3.1, plus `ScreenAccess`: the one
+    rule for `Blocked` — the last attempt to get a picture decides (one that got a picture is
+    `Normal`; a failed one is `Blocked` only when refused). The mock has
+    `MockCaptureConfig::outage` (`MockOutage { at, failed_reinits, refused }`, `u32::MAX` = stays
+    lost; it reports by `ScreenAccess`, so the refusal is given as a `BlockReason` rather than a
+    whole `ScreenState`) and, beyond 10a, `MockPlatform::capture_refusals` (`create_capture`
+    refused with `Lost` *n* times) and `MockPlatform::outage_on` (the outage on one display).
   - `protocol`: `ControlMsg::HostState { screen, kind, why }`, `HostScreen` (an unknown value
     parses as `normal`), the `kind` / `why` words in `control::hstate`, `Caps::hstate` (omitted
     when false).
-  - Host (`engine/src/media/host.rs`): `ScreenReport` on the main stream sends the first state
-    and every change, only when the viewer advertised `hstate` (`ViewerFeatures`, replacing the
-    pop-out-only peer set in `lib.rs`); read after `open_capture`, at the top of each pass and
-    right after each `reinit`. `open_capture`'s wait reports `Blocked(NotSupported)` once (no
-    capture object exists to ask). `Shared::host_screen_secure` skips the paste chord of a
-    dropped file unless the screen is `Normal` (`session/files.rs`).
+  - Host (`engine/src/media/host.rs`): the screen state is the session's (`SessionScreen` in
+    `Shared::host_screen`, K13 as revised by the review): every stream records what its capture
+    observed since it last acquired; the main stream decides while it runs, the pop-outs while it
+    is paused. The transport thread alone takes each change and queues one `hstate`, only for a
+    viewer that advertised it (`ViewerFeatures`, replacing the pop-out-only peer set in
+    `lib.rs`). `open_capture`'s wait records `Blocked(NotSupported)` once, at the second refusal
+    in a row. A dropped file's paste chord is skipped unless the session's state is `Normal`
+    (`session/files.rs`).
   - Windows (`platform-windows/src/adapters.rs`): `DdaCapture` reports `Blocked(NotSupported)`
-    while its last attach had `OpenInputDesktop` denied (`E_ACCESSDENIED`; any other failure,
-    and a disconnected session, stay `Normal`); the capture's attach failure and the injector's
-    are logged when they start and end, not per retry or event. `login_screen_supported` is
-    `false`.
+    while its last reinit failed after `OpenInputDesktop` was denied (`E_ACCESSDENIED`; any other
+    failure stays `Normal`; a duplication that succeeds is `Normal`, by `ScreenAccess`). The
+    capture's attach failures are logged per capture thread (across `open_capture`'s new
+    captures) and the injector's per injector, when they start and end, never per retry or
+    event. `login_screen_supported` is `false`.
   - Viewer: the driver turns `hstate` into `SessionEvent::HostScreen`, the ActiveGate hides the
     main video (`SessionView::set_host_blocked`), pop-outs are hidden and shown with it (and a
     pop-out opened while blocked waits), and `Shared::host_block` (an epoch shared with the
@@ -293,8 +299,12 @@ Microsoft references of §8 read and cited; D3, D7 and D8 answered by the owner.
     installer hooks, `elevation`'s header, W8.md, 05-TASKS.md).
   - Before U3 a Windows host cannot tell its lock screen from a UAC prompt, so the
     `unsupported` card reads "The remote computer is locked" and its text names the prompt too.
+  - Residual: the host leaves at least 250 ms between giving up and retrying, but that is not a
+    bound on delivery; a pre-lock frame delivered after `normal` would be shown. It can only be
+    the same user's own desktop from just before the lock, shown right after a local unlock.
   - Unverified until the checklist runs: that `OpenInputDesktop` fails with access denied on
-    the lock screen and UAC prompts and not in a disconnected session; the 2 s on a device.
+    the lock screen and UAC prompts and not in a disconnected session; the 2 s on a device;
+    whether a re-shown native surface flashes its retained buffer (per viewer OS).
 
 ### U2 — Service: session events (S–M)
 

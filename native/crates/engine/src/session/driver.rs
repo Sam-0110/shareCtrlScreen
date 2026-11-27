@@ -558,6 +558,14 @@ pub(super) fn transport_driver(d: Driver) {
         while let Ok(bytes) = ctl_rx.try_recv() {
             ctl.send(bytes, |b| tp.send_ctl(b));
         }
+        // Host: the session's screen state, if it changed (plans/10 U1, K13).
+        // Only this thread takes changes, so they go out once each, in order;
+        // queued like everything else until the channel opens.
+        if let Some(h) = &host {
+            if let Some(msg) = crate::media::host::pending_hstate(&shared, h.hstate) {
+                ctl.send(msg, |b| tp.send_ctl(b));
+            }
+        }
         if let Some(frame_rx) = &frame_rx {
             while let Ok((slot, au, keyframe)) = frame_rx.try_recv() {
                 // Write onto the RTP media track. str0m packetizes, paces, and
@@ -1198,9 +1206,8 @@ pub(super) fn transport_driver(d: Driver) {
                                                     paste_dropped,
                                                     // The last state the host
                                                     // loop saw (10a §3.3).
-                                                    !shared
-                                                        .host_screen_secure
-                                                        .load(Ordering::SeqCst),
+                                                    shared.host_screen.lock().state()
+                                                        == platform_api::ScreenState::Normal,
                                                 );
                                                 ui.send(crate::SessionEvent::Toast(if pasted {
                                                     format!("Pasted {name}")

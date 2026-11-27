@@ -28,8 +28,9 @@ unlocks the computer or answers the prompt (planned in
 [plans/10](../plans/10-REMOTE-UNLOCK.md)). Uninstalling removes it. You do not need to run
 anything by hand.
 
-If you run the **portable** `sharectrl.exe` instead of installing, and you want that same
-reach, put the standalone `sharectrl-service.exe` next to it and run this once from a
+If you run the **portable** `sharectrl.exe` instead of installing, and you want the service
+to start it at every sign-in (see below for Alt+Tab and the Windows key), put the standalone
+`sharectrl-service.exe` next to it and run this once from a
 terminal opened as administrator (`--uninstall-service` removes it):
 
 ```

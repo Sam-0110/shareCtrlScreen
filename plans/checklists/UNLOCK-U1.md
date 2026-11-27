@@ -3,7 +3,8 @@
 Device-only. The loopback suite proves the wire, the engine and the viewer's hiding with a mock
 capture (`crates/engine/tests/loopback.rs`: `a_locked_host_screen_is_explained_and_comes_back_by_itself`,
 `a_frame_from_before_the_lock_is_never_shown_again`,
-`connecting_to_an_already_locked_host_explains_the_missing_picture`). What only a real Windows
+`connecting_to_an_already_locked_host_explains_the_missing_picture`,
+`a_popout_speaks_for_the_host_while_the_main_stream_is_paused`). What only a real Windows
 host can show: that `OpenInputDesktop` is refused with *access denied* while the lock screen or a
 UAC prompt is up (the one signal `DdaCapture` reports as `Blocked`), that it is **not** refused
 in a disconnected session, and that the picture returns by itself after a local unlock.
@@ -34,9 +35,14 @@ Nothing here may show a key, a typed character or a pointer position in either l
    - [ ] H's log: `capture: the input desktop is reachable again`, `host: the screen is now
      Normal`, `host: screen capture re-acquired after …`; B's: `viewer: the host's screen is
      normal`.
-   - [ ] The first picture B shows after the unlock is the unlocked desktop, never the picture
-     from before the lock (K21). Best seen with a window moved or closed on H while it was
-     locked (moved by someone at H before locking is not enough: lock, then unlock and check).
+   - The first picture B shows after the unlock is the unlocked desktop, never the picture from
+     before the lock (K21). Prepare: open a window on H, lock H, unlock it, close that window at
+     H right away; B must never show the window again. The engine repaints nothing old, but a
+     re-shown native surface may show the buffer the window system retained until the forced
+     keyframe arrives — so check each viewer OS on its own line:
+     - [ ] B on **Windows** (D3D11 child window).
+     - [ ] B on **macOS** (CAMetalLayer).
+     - [ ] B on **Linux** (X11; and Wayland if available).
 5. [ ] Repeat steps 2–4 once more: it is reliable, not a one-shot.
 
 ## 2. Connecting to a host that is already locked
@@ -44,7 +50,9 @@ Nothing here may show a key, a typed character or a pointer position in either l
 2. From B, connect with H's password.
    - [ ] Within **2 s** of the connection opening B shows "The remote computer is locked" —
      not a black rectangle — although no frame ever arrived.
-   - [ ] H's log: `host: screen capture not ready yet …` once, then nothing per retry.
+   - [ ] H's log: `host: screen capture not ready yet …` once and `capture: the input desktop
+     refused this process …` once for the whole lock, although a new capture is tried on every
+     retry; then nothing per retry.
 3. Unlock H locally.
    - [ ] The picture appears on B by itself.
 
@@ -63,11 +71,14 @@ Nothing here may show a key, a typed character or a pointer position in either l
    - [ ] The pop-out window shows nothing (hidden) while the main tab shows the message; no
      frozen picture of the second monitor is left on screen.
    - [ ] After the unlock the pop-out shows a live picture again (it may take a second).
-3. Open a second tab on B (another computer, or the new-tab page) so H's tab is in the
-   background. Lock H, wait 5 s, unlock H, wait 5 s, switch back to H's tab.
+3. Keep the pop-out open, put H's tab in the background (open a second tab on B) and lock H.
+   - [ ] The pop-out is hidden within 2 s (it speaks for H while the main stream is paused,
+     K13); after the unlock it shows a live picture again.
+4. Close the pop-out. With H's tab in the background, lock H, wait 5 s, unlock H, wait 5 s,
+   switch back to H's tab.
    - [ ] H's tab shows the live picture (a paused stream notices the lock only when it resumes,
      10a §5.14; it must not show a stale picture or a stuck message).
-4. Detach H's tab into its own window (⧉) and repeat §1 steps 2–4 there.
+5. Detach H's tab into its own window (⧉) and repeat §1 steps 2–4 there.
    - [ ] The detached window shows the message and then the picture, like the main window.
 
 ## 5. Not a lock: no false message
@@ -77,7 +88,10 @@ Nothing here may show a key, a typed character or a pointer position in either l
    - [ ] B never shows the locked message for a disconnected session or a sleeping display
      (`OpenInputDesktop` succeeds then; only *access denied* is reported). Write down what B
      shows instead — a frozen picture during display sleep is today's behaviour.
-2. [ ] A Windows 10 host, a Windows 11 host: §1 passes on both.
+2. Turn on a screen saver with "On resume, display logon screen" on H, let it start.
+   - [ ] Write down what B shows. The secure screen saver runs on its own desktop, which is
+     probably also refused to the host: then B shows the locked card, which is acceptable.
+3. [ ] A Windows 10 host, a Windows 11 host: §1 passes on both.
 
 ## 6. Dropped files and Settings
 1. On B drop a large file (a few hundred MB) on a window in H's picture and lock H while it

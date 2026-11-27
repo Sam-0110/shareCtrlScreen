@@ -102,11 +102,11 @@ pub(crate) struct Shared {
     /// session: a pop-out stream's `Shared` holds the same `Arc`, so every
     /// window's present loop drops the frame it holds at a block (K21).
     pub host_block: Arc<HostBlock>,
-    /// Host: the last [`platform_api::ScreenState`] the main stream's loop
-    /// saw is not `Normal` (a secure screen is up, shown or not). A dropped
-    /// file is then left on the clipboard instead of pasted, because the
-    /// paste chord would go to the secure screen (10a §3.3).
-    pub host_screen_secure: AtomicBool,
+    /// Host: the session's screen state, from what its streams' captures
+    /// observed (plans/10 U1, K13). Sent to the viewer by the transport
+    /// thread; a dropped file is pasted only while it is `Normal` (the paste
+    /// chord would otherwise go to the secure screen, 10a §3.3). A leaf lock.
+    pub host_screen: Mutex<crate::media::host::SessionScreen>,
     /// Test hook (`test-hooks` feature only): the host's current encode size,
     /// `w << 32 | h`, so the loopback can assert it stays full resolution as the
     /// link varies (V2 has no resolution ladder).
