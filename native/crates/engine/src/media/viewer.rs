@@ -100,6 +100,9 @@ pub(crate) fn viewer_media_loop(
     // picture after it has not come yet (plans/10 U1, K21). See the top of the
     // loop and the idle tick.
     let mut block_ended_at: Option<std::time::Instant> = None;
+    // Whether this loop has asked for that keyframe since the block ended
+    // (for the log level only).
+    let mut post_block_asked = false;
     // Tell the host what size we're actually displaying at, so it encodes to that
     // and we can present 1:1 (no resampling blur). Debounced: a drag-resize would
     // otherwise rebuild the host's encoder on every intermediate size.
@@ -145,6 +148,7 @@ pub(crate) fn viewer_media_loop(
             // shown. On a still screen nothing would follow it. The idle tick
             // asks for another once the block has been over for a moment.
             block_ended_at = (!host_blocked).then(std::time::Instant::now);
+            post_block_asked = false;
         }
         if owes_show && !host_blocked {
             owes_show = !show_unless_blocked(surface.as_ref(), &shared);
@@ -346,13 +350,25 @@ pub(crate) fn viewer_media_loop(
                 // The block is over and no keyframe has come since (see the
                 // top of the loop): ask for one, so a still screen does not
                 // stay black. The host defers a request that follows its own
-                // keyframe too closely, and never drops one.
+                // keyframe too closely, and never drops one. Only while the
+                // video is on screen: a background tab's stream is paused and
+                // its host sends nothing, so asking would repeat for as long
+                // as the tab stays there; when it returns, this tick asks.
                 if block_ended_at.is_some_and(|at| at.elapsed() >= POST_BLOCK_KEYFRAME_WAIT)
                     && last_kf_req.elapsed() >= std::time::Duration::from_secs(1)
+                    && view.as_ref().is_none_or(|v| v.is_shown())
                 {
-                    tracing::info!(
-                        "viewer: no keyframe since the host's screen came back — requesting one"
-                    );
+                    // Once at info; a host that cannot answer yet (a still
+                    // screen delivers it no frame to encode) is asked again
+                    // every second, and that is not worth a line each time.
+                    if post_block_asked {
+                        tracing::debug!(
+                            "viewer: still no keyframe since the host's screen came back"
+                        );
+                    } else {
+                        tracing::info!("viewer: no keyframe since the host's screen came back — requesting one");
+                    }
+                    post_block_asked = true;
                     let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest {
                         s: slot,
                     }));

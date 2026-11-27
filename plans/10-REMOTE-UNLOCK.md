@@ -289,8 +289,12 @@ Microsoft references of §8 read and cited; D3, D7 and D8 answered by the owner.
   - Viewer: the driver turns `hstate` into `SessionEvent::HostScreen`, the ActiveGate hides the
     main video (`SessionView::set_host_blocked`), pop-outs are hidden and shown with it (and a
     pop-out opened while blocked waits), and `Shared::host_block` (an epoch shared with the
-    pop-outs) makes every present loop drop the frame it holds and re-check before any present
-    (K21).
+    pop-outs) makes every present loop drop the frame it holds, decode nothing until the next
+    keyframe, and re-check before any present (K21). After the end of a block, a loop whose
+    video is on screen asks for a keyframe if none has come within 300 ms. The keyframe rule
+    was added after CI on macOS showed frames from before the lock arriving after `normal`
+    (`9ae8e4a`); `video_from_before_the_lock_that_arrives_after_it_is_not_shown` reproduces it
+    with a test hook that keeps the viewer's video back.
   - App/UI: the TabManager keeps the state per tab (`hostScreen` in the snapshot, so detached
     windows have it) and emits `host-screen` (from `app/src/tabs.rs`, where viewer events go,
     rather than `bridge.rs`); the tab shows a card with words per `why` (generic for unknown
@@ -299,9 +303,11 @@ Microsoft references of §8 read and cited; D3, D7 and D8 answered by the owner.
     installer hooks, `elevation`'s header, W8.md, 05-TASKS.md).
   - Before U3 a Windows host cannot tell its lock screen from a UAC prompt, so the
     `unsupported` card reads "The remote computer is locked" and its text names the prompt too.
-  - Residual: the host leaves at least 250 ms between giving up and retrying, but that is not a
-    bound on delivery; a pre-lock frame delivered after `normal` would be shown. It can only be
-    the same user's own desktop from just before the lock, shown right after a local unlock.
+  - Residual (§10 F3): a keyframe from before the lock that is delivered only after `normal`
+    is shown until the host's restart keyframe replaces it (delta frames are not: see the
+    Viewer bullet). And when the restart keyframe arrives before `normal` on a screen that then
+    stays still, the viewer's request for another is served only once the host's screen or
+    pointer changes; until then the video area is black.
   - Unverified until the checklist runs: that `OpenInputDesktop` fails with access denied on
     the lock screen and UAC prompts and not in a disconnected session; the 2 s on a device;
     whether a re-shown native surface flashes its retained buffer (per viewer OS).
@@ -635,4 +641,5 @@ For the owner's open decisions (§5), from the reading:
 | # | What | Found | Status |
 |---|---|---|---|
 | F1 | **A brief "no console session" is treated as a session change.** `WTSGetActiveConsoleSessionId` returns 0xFFFFFFFF while the console session is being attached or detached (§8 row 13). `Supervisor::follow` (`service/src/supervise.rs`) resets on it, so the same session id coming back counts as new: a second host is launched while the first still runs, it steps aside with exit code 0, the policy records a clean exit, and the first host is no longer watched. If that host later crashes it is not relaunched until the session really changes. The behaviour predates U2 (the old `poll` did the same) and was kept unchanged there | U2 review, 2026-11-27 | **Open: the owner decides** whether to fix it now as its own small task (recommended: ignore a "no session" shorter than a few polls, and keep watching the running host across it) or leave it |
-| F2 | **`full_session_over_real_webrtc` can fail on the untouched tree** ("surface hidden after the session", `crates/engine/tests/loopback.rs`): the role becomes idle before the hide the test waits for has been applied. Seen about once in ten runs on `5e8ac67` in a loaded container; CI has been green | U1 build, 2026-11-27 | Open: assessed in U1's review |
+| F2 | **`full_session_over_real_webrtc` could fail on the untouched tree** ("surface hidden after the session", `crates/engine/tests/loopback.rs`): the test asserted the surface was hidden the moment both roles were idle, but the hide is queued after that and applied asynchronously. About one suite run in ten on `5e8ac67` in a loaded container | U1 build, 2026-11-27 | **Fixed** in the test (`d4ac638`): it waits for the hide. The engine's order is as designed (U1 review) |
+| F3 | **The viewer cannot tell which video belongs to after a block.** `hstate` and video travel separately, so the viewer does not know which frame is the host's first after a block. U1 uses "the next keyframe", which leaves two rare cases (10a K21): a keyframe from before the block that arrives late is shown, and a restart keyframe that arrives before `normal` is lost, after which a still screen stays black until the host has a new frame to encode (the host answers a keyframe request only with a captured frame, `crates/engine/src/media/host.rs`) | U1 CI and review, 2026-11-27 | **Open: the owner decides.** Recommended, as its own small task: `hstate normal` carries an optional marker of the first frame after the block (capability-gated, old peers unaffected), and the host answers a keyframe request on a still screen by encoding its last frame again |

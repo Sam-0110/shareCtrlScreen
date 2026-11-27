@@ -64,6 +64,11 @@ pub struct MockCaptureConfig {
     pub fps: u32,
     /// After this many frames the screen stops changing (`acquire` → `Ok(None)`).
     pub static_after: Option<u64>,
+    /// A successful `reinit` is followed by one frame even when the screen is
+    /// static, as a real backend delivers the whole screen on a new
+    /// duplication. Off by default: a test of what a viewer shows when NO
+    /// frame follows needs the screen to stay silent.
+    pub fresh_after_reinit: bool,
     /// Return [`CaptureError::Lost`] once when this frame number is reached.
     pub lose_at: Option<u64>,
     /// A loss that lasts: the screen becomes unreachable (a lock screen, a
@@ -85,6 +90,7 @@ impl Default for MockCaptureConfig {
             height: 360,
             fps: 30,
             static_after: None,
+            fresh_after_reinit: false,
             lose_at: None,
             outage: None,
             cursor_shape: Some(mock_cursor_shape()),
@@ -152,6 +158,10 @@ pub struct MockCapture {
     in_outage: bool,
     /// `reinit` calls that failed in this outage.
     outage_reinits: u32,
+    /// A reinit succeeded and its first frame is still owed
+    /// (`fresh_after_reinit`): a capture that has gone static still
+    /// produces it.
+    fresh_due: bool,
     /// What `screen_state` reports, by the real backends' rule.
     access: ScreenAccess,
     /// Whether the next frame reports the pointer image (first frame, and
@@ -177,6 +187,7 @@ impl MockCapture {
             outage_fired: false,
             in_outage: false,
             outage_reinits: 0,
+            fresh_due: false,
             access: ScreenAccess::default(),
             shape_due: true,
             burst_next: 0,
@@ -252,7 +263,7 @@ impl ScreenCapture for MockCapture {
             // a real backend returns at once too (DXGI's ACCESS_LOST).
             return Err(CaptureError::Lost);
         }
-        if self.cfg.static_after.is_some_and(|n| self.seq >= n) {
+        if self.cfg.static_after.is_some_and(|n| self.seq >= n) && !self.fresh_due {
             std::thread::sleep(timeout);
             return Ok(None);
         }
@@ -266,6 +277,7 @@ impl ScreenCapture for MockCapture {
             std::thread::sleep(wait);
         }
         self.next_due = Instant::now() + self.interval();
+        self.fresh_due = false;
 
         let w = self.cfg.width;
         let mut dirty = Vec::with_capacity(2);
@@ -343,6 +355,7 @@ impl ScreenCapture for MockCapture {
             self.in_outage = false;
         }
         self.access.reached();
+        self.fresh_due = self.cfg.fresh_after_reinit;
         self.paint_background();
         self.bar_x = None;
         self.shape_due = true;

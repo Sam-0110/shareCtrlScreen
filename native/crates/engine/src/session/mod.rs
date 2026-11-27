@@ -127,6 +127,13 @@ pub(crate) struct Shared {
     /// shipping build.
     #[cfg(feature = "test-hooks")]
     pub sever: AtomicBool,
+    /// Test hook (`test-hooks` feature only): a viewer session keeps the main
+    /// stream's video back while this is set and hands it on, one unit per
+    /// transport pass, once it is cleared, so a loopback test can make video
+    /// arrive later than the control channel, as a slow link does. Never
+    /// written in a shipping build.
+    #[cfg(feature = "test-hooks")]
+    pub hold_video: AtomicBool,
 }
 
 /// Viewer: the host's `blocked` state as the present loops see it
@@ -1587,6 +1594,11 @@ impl Session {
     /// Make the transport declare the link dead on its next pass.
     pub(crate) fn sever(&self) {
         self.shared.sever.store(true, Ordering::SeqCst);
+    }
+
+    /// Keep the main stream's video back (`true`) or let it through again.
+    pub(crate) fn hold_video(&self, hold: bool) {
+        self.shared.hold_video.store(hold, Ordering::SeqCst);
     }
 }
 

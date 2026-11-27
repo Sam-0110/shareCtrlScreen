@@ -381,6 +381,9 @@ pub(super) fn transport_driver(d: Driver) {
 
     let mut buf = [0u8; 2048];
     let mut video_count: u64 = 0;
+    // Test hook: main-stream video kept back by `Shared::hold_video`.
+    #[cfg(feature = "test-hooks")]
+    let mut held_video: std::collections::VecDeque<(Vec<u8>, bool)> = Default::default();
     while !stop.load(Ordering::SeqCst) {
         // Test hook: a link that dies right now, as a dead network would
         // make it (the loopback has no network to cut).
@@ -388,6 +391,14 @@ pub(super) fn transport_driver(d: Driver) {
         if shared.sever.load(Ordering::SeqCst) {
             notify_dead("severed by a test");
             break;
+        }
+        // Test hook: video that was kept back goes on one unit a pass, so it
+        // reaches the media loop spread out, as late packets would.
+        #[cfg(feature = "test-hooks")]
+        if !shared.hold_video.load(Ordering::SeqCst) {
+            if let (Some(tx), Some(unit)) = (&video_tx, held_video.pop_front()) {
+                let _ = tx.send(unit);
+            }
         }
         // Liveness: once connected, no traffic for DEAD_AFTER ⇒ declare it dead.
         if connected && last_rx.elapsed() > DEAD_AFTER {
@@ -795,6 +806,17 @@ pub(super) fn transport_driver(d: Driver) {
                                 }
                             }
                             if slot == 0 {
+                                // Test hook: kept back while held, and behind
+                                // anything still kept, so the order holds.
+                                #[cfg(feature = "test-hooks")]
+                                let (data, keyframe) = if shared.hold_video.load(Ordering::SeqCst)
+                                    || !held_video.is_empty()
+                                {
+                                    held_video.push_back((data, keyframe));
+                                    continue;
+                                } else {
+                                    (data, keyframe)
+                                };
                                 if let Some(tx) = &video_tx {
                                     let _ = tx.send((data, keyframe));
                                 }

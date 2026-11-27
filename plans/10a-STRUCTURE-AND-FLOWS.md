@@ -212,9 +212,15 @@ impl Engine {
   `Toast` reaches only the host's own UI (`crates/engine/src/events.rs:113`), which is why a
   result message is needed. `sas` is accepted at most once a second.
 - **Viewer driver.** `HostState` becomes `SessionEvent::HostScreen`. On `blocked` it also hides
-  the pop-out surfaces (as link trouble does, `driver.rs:232`, `:416`) and tells the media thread
-  to drop its held frame, so that a later show cannot repaint a picture from before the lock
-  (`ViewOp::Show` repaints the held frame, `session/active.rs:37-48`).
+  the pop-out surfaces (as link trouble does, `driver.rs:232`, `:416`). `Shared::host_block` is
+  an epoch counter the present loops read. Each change makes every loop drop the frame it holds,
+  so that a later show cannot repaint a picture from before the lock (`ViewOp::Show` repaints
+  the held frame, `session/active.rs:37-48`), **and decode nothing until the next keyframe**:
+  the control channel and video are not ordered against each other, so frames from before the
+  block can arrive after its end, and the host restarts with a keyframe (K5). When a block has
+  been over for 300 ms and no keyframe has come (it can arrive before `normal`, and is then
+  never shown), a loop whose video is on screen asks for one, at most once a second. Before
+  any present the loop reads the epoch again.
 - **ActiveGate** (`session/active.rs`). A session's video is shown when it is on screen, ready,
   its link is not in trouble, no overlay is open in its window (`active.rs:5-8`) **and the host
   is not `blocked`**. `SessionView::set_host_blocked(bool)` follows `set_trouble`
@@ -844,7 +850,7 @@ across a pause idles on its unacknowledged frame.
 | K18 | `sas` and `lock` are honoured only for a session with control; `sas` at most once a second; `lock` is advertised only in `password` mode. |
 | K19 | An attachment the host is not waiting for is closed and detached by the reader; no section handle outlives its attachment. |
 | K20 | Nothing on `sct-transport` waits for the pipe. |
-| K21 | While the host is `blocked`, the viewer shows neither the main video nor a pop-out, and no frame from before the block is repainted afterwards. |
+| K21 | While the host is `blocked`, the viewer shows neither the main video nor a pop-out, and no frame from before the block is shown afterwards: not the one it held, and not one that arrives late (nothing older than the first keyframe after a block is decoded). Residual, plan 10 §10 F3: a **keyframe** from before the block that arrives only after its end cannot be told from the host's restart keyframe and is shown until that one comes; a present already under way when the block lands may finish. |
 
 ## 8. The sign-in screen: constraints for step S6
 

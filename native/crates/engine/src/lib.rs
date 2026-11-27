@@ -703,6 +703,17 @@ impl Engine {
         }
     }
 
+    /// Keep viewer session `id`'s main-stream video back (`true`), or hand
+    /// what was kept on and let the rest through (`false`): video that
+    /// arrives later than the control channel, as on a slow link.
+    #[doc(hidden)]
+    pub fn test_hold_viewer_video(&self, id: SessionId, hold: bool) {
+        let reg = self.reg.lock();
+        if let Some(s) = reg.viewers.get(&id).and_then(|v| v.session.as_ref()) {
+            s.hold_video(hold);
+        }
+    }
+
     /// Make every viewer session's start wait `ms` before building anything,
     /// so a test can end it in the middle of its start.
     #[doc(hidden)]
