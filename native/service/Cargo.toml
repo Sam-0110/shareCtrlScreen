@@ -31,6 +31,8 @@ platform-api = { path = "../crates/platform-api" }
 workspace = true
 features = [
     "Win32_Foundation",
+    # WTSSESSION_NOTIFICATION, read in the control handler (U2).
+    "Win32_System_RemoteDesktop",
     "Win32_System_Services",
     "Win32_System_Threading",
 ]

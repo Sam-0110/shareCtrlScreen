@@ -43,7 +43,9 @@ crates/elevation/src/agent.rs    (new)   the SYSTEM-in-session token, the job ob
 crates/elevation/src/pipe.rs     (new)   the named pipe: creation with its security descriptor, the
                                          published name, the client open and its check, overlapped I/O
 crates/elevation/src/sas.rs      (new)   SendSAS and the policy handling (U4)
-crates/elevation/src/session.rs          session-change events as plain values; signed in? locked?
+crates/elevation/src/session.rs          locked? (U3). Session-change events as plain values moved to
+                                         service/src/events.rs in U2: the elevation crate is
+                                         Windows-only, and the values must be tested on every OS
 crates/elevation/src/desktop.rs          follow(): close the handle when SetThreadDesktop fails
 crates/capture/src/lib.rs                Duplicator: device creation split from duplication (U3.1)
 crates/input/Cargo.toml                  feature `keyhook` (default on); the agent builds without it
@@ -58,6 +60,8 @@ crates/engine/src/session/files.rs       no paste chord unless the screen is nor
 crates/engine/src/events.rs              SessionEvent::HostScreen, ActionResult
 crates/engine/src/sessions.rs            Caps and HostCaps; send_secure_attention, lock_remote
 service/src/main.rs                      --secure-agent; HandlerEx; the event-driven loop
+service/src/events.rs        (new, U2)   pure: control and session-event codes, HandlerEx's replies,
+                                         the lock-free hand-off from the handler to the loop
 service/src/supervise.rs                 a sign-in resets the delay; a second Supervisor for the agent
 app/src/commands.rs, bridge.rs, menu.rs  the two commands, the two events, the menu items
 app/ui/api.js, session.js, tabs.js, settings.js, index.html

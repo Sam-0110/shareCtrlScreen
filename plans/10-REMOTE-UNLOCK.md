@@ -21,7 +21,7 @@ in §8 as device-only and is answered by the U3.0 spike or a phase checklist.
 |---|---|---|
 | S | This plan + structure ([10a](10a-STRUCTURE-AND-FLOWS.md)), adversarial review folded in, Microsoft references read | **in progress**: plan and 10a written, review folded in (§7), Microsoft references read and folded in (§8, §9). Open: the owner's answers to D3, D7 and D8 (§5) |
 | U1 | The viewer is told what the host's screen is doing | not started |
-| U2 | Service: session events; a sign-in no longer waits out the launch delay | not started |
+| U2 | Service: session events; a sign-in no longer waits out the launch delay | **in review** (branch `task/U2`), device-pending: [checklists/UNLOCK-U2.md](checklists/UNLOCK-U2.md). As built: §4 U2 |
 | U3 | The agent: the lock screen of a signed-in user | not started (begins with a device spike) |
 | U4 | Ctrl+Alt+Del and Lock | not started |
 | U5 | UAC prompts | not started |
@@ -268,6 +268,45 @@ Microsoft references of §8 read and cited; D3, D7 and D8 answered by the owner.
 - Acceptance: on a device, signing in after the service has been failing to launch for several
   minutes brings the host up within 5 s. Independent of U1; it fixes something that affects users
   today.
+- **As built (in review).**
+  - `service/src/events.rs` (new, pure, tested on every OS): the control codes and HandlerEx's
+    replies (`NO_ERROR` for stop, shutdown, session change and INTERROGATE,
+    `ERROR_CALL_NOT_IMPLEMENTED` otherwise); the `WM_WTSSESSION_CHANGE` event values as
+    `SessionChange`/`SessionEvent`; `Inbox`, the hand-off from the handler to the loop: a
+    single-producer ring of atomics, a stop flag and `Thread::unpark`, so the handler never
+    blocks, locks, allocates or logs. The loop's thread is registered as the waiter before the
+    handler is, so no wake-up is lost.
+  - `service/src/main.rs`: `RegisterServiceCtrlHandlerExW` accepting stop, shutdown and session
+    change; the handler reports `STOP_PENDING` on stop or shutdown and wakes the loop, records
+    session events (the notification is read only when its `cbSize` covers it); the loop waits on
+    the inbox with a 2 s timeout instead of sleeping, so a stop is immediate and the poll stays as
+    the fallback. The status handle is an `AtomicPtr` instead of a `static mut`. While no host
+    runs, the loop asks for the console user's token (the first step of a launch) to learn
+    whether someone is signed in; any failure means nobody yet (the error is undocumented).
+  - `service/src/supervise.rs`: the supervisor knows whether a user is signed in
+    (`Unknown`/`Absent`/`Present`). `follow`, `session`, `wants_user_check`,
+    `user_arrived(now) -> Option<Arrived>`, `user_left`, `session_event`. While nobody is signed
+    in no launch is attempted, so no delay builds up (one log line, not one per retry). A
+    sign-in (token present after it was seen missing) drops a pending `Retry` (and a clean
+    `Stopped`: the user signed out and back in) to `Wanted` and clears the failure count; a
+    launch failing right after starts again from 2 s. A logoff event for the console session is
+    `user_left`; a logon event only wakes the loop, and the token check that follows reports the
+    sign-in, so event and poll are the same input in either order. Other sessions' events are
+    ignored; lock, unlock and the rest are logged and drive nothing. Clean-exit rule, doubling
+    backoff, cap, `STABLE_AFTER` and session-change relaunch unchanged; a transient 0xFFFFFFFF
+    from `WTSGetActiveConsoleSessionId` is still a session change, as before.
+  - Microsoft docs read and cited in the modules' References: HandlerEx
+    (<https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nc-winsvc-lphandler_function_ex>:
+    "a service will only be notified of a user logon if it is fully loaded before the logon
+    attempt is made", "avoid operations that might block, such as taking a lock", INTERROGATE
+    returns `NO_ERROR`), RegisterServiceCtrlHandlerExW, SERVICE_STATUS, SetServiceStatus, the
+    control-handler pages, WM_WTSSESSION_CHANGE, WTSSESSION_NOTIFICATION, WTSQueryUserToken,
+    WTSGetActiveConsoleSessionId, system error codes. §8's row on
+    `SERVICE_ACCEPT_SESSIONCHANGE` is confirmed from the docs; that the events arrive on a real
+    machine is device-pending.
+  - Device-pending: every step of [checklists/UNLOCK-U2.md](checklists/UNLOCK-U2.md), the 5 s
+    acceptance first. The Windows half was type-checked and linted for
+    `x86_64-pc-windows-msvc` only; it runs first in Windows CI.
 
 ### U3 — The agent: the lock screen of a signed-in user (L)
 
