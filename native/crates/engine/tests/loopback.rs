@@ -638,10 +638,13 @@ async fn full_session_over_real_webrtc() {
         host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
     })
     .await;
-    assert!(
-        !viewer.platform.surface.state().visible,
-        "surface hidden after the session"
-    );
+    // Waited for, not asserted at once: the role is Idle as soon as the session
+    // leaves the registry, and only then is the surface's hide queued on the
+    // view's applier, which performs it asynchronously (plans/10 §10 F2).
+    eventually("surface hidden after the session", t, || {
+        !viewer.platform.surface.state().visible
+    })
+    .await;
     // The session's own events: accepted, then ended by the user and
     // released once its threads were joined (08a §5.2).
     eventually("the viewer session is released", t, || {
