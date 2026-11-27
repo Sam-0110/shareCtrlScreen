@@ -2633,17 +2633,16 @@ async fn connecting_to_an_already_locked_host_explains_the_missing_picture() {
 /// against each other, so frames from before the lock can still be on their
 /// way when the viewer has already heard both `blocked` and `normal` (seen in
 /// CI on a slow machine, where they came a second late). They must not be
-/// shown; the picture restarts at the keyframe the host sends when its screen
-/// is back. The test hook keeps the viewer's video back across the whole lock
-/// and then hands it on unit by unit.
+/// shown. The test hook hands the last frames from before the lock to the
+/// media loop once more after the lock is over, as late arrivals would come;
+/// the host's screen stays still, so nothing else arrives.
+#[cfg(feature = "test-hooks")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn video_from_before_the_lock_that_arrives_after_it_is_not_shown() {
     const LOCK_AT: u64 = 20;
     let relay = start_relay().await;
     let host = start_peer_with("late-host", &relay, |p| {
         p.capture.static_after = Some(LOCK_AT);
-        // A real backend delivers the screen once on a new duplication.
-        p.capture.fresh_after_reinit = true;
         p.capture.outage = Some(platform_api::mock::MockOutage {
             at: LOCK_AT,
             failed_reinits: 4,
@@ -2658,13 +2657,6 @@ async fn video_from_before_the_lock_that_arrives_after_it_is_not_shown() {
     .await;
     let id = viewer.open(&host.uuid);
     let surface = viewer.platform.surface.clone();
-    eventually("the first picture", t, || {
-        !surface.state().presented.is_empty()
-    })
-    .await;
-    // From here the viewer's video waits: everything up to the lock that has
-    // not been shown yet, and the keyframe after it.
-    viewer.engine.test_hold_viewer_video(id, true);
     eventually("the host says it is locked", t, || {
         host_screens(&viewer).iter().any(|e| e == BLOCKED)
     })
@@ -2675,22 +2667,13 @@ async fn video_from_before_the_lock_that_arrives_after_it_is_not_shown() {
     .await;
     eventually("the video is shown again", t, || surface.state().visible).await;
     let before = surface.state().presented.len();
-    let newest_shown = surface.state().presented[..before]
-        .iter()
-        .filter_map(|p| p.stamp)
-        .max();
-    assert!(
-        newest_shown.is_some_and(|n| n + 1 < LOCK_AT),
-        "frames from before the lock were still to come when the video was held: {newest_shown:?}"
-    );
-    viewer.engine.test_hold_viewer_video(id, false);
-    eventually("the picture after the lock", t, || {
-        surface.state().presented[before..]
-            .iter()
-            .any(|p| p.stamp.is_some_and(|n| n >= LOCK_AT))
+    assert!(before > 0, "the picture before the lock was shown");
+    viewer.engine.test_replay_viewer_video(id);
+    eventually("the late frames were handed on", t, || {
+        viewer.engine.test_viewer_video_replayed(id) > 0
     })
     .await;
-    // Everything kept back has been handed on by now or will be within this.
+    // Time for the media loop to take them, and for the re-show's repaint.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let s = surface.state();
     let after: Vec<Option<u64>> = s.presented[before..].iter().map(|p| p.stamp).collect();

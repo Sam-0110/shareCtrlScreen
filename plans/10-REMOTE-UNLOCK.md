@@ -294,7 +294,8 @@ Microsoft references of §8 read and cited; D3, D7 and D8 answered by the owner.
     video is on screen asks for a keyframe if none has come within 300 ms. The keyframe rule
     was added after CI on macOS showed frames from before the lock arriving after `normal`
     (`9ae8e4a`); `video_from_before_the_lock_that_arrives_after_it_is_not_shown` reproduces it
-    with a test hook that keeps the viewer's video back.
+    with a test hook that hands the last frames from before the lock to the media loop again
+    after the lock is over.
   - App/UI: the TabManager keeps the state per tab (`hostScreen` in the snapshot, so detached
     windows have it) and emits `host-screen` (from `app/src/tabs.rs`, where viewer events go,
     rather than `bridge.rs`); the tab shows a card with words per `why` (generic for unknown

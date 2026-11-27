@@ -127,13 +127,17 @@ pub(crate) struct Shared {
     /// shipping build.
     #[cfg(feature = "test-hooks")]
     pub sever: AtomicBool,
-    /// Test hook (`test-hooks` feature only): a viewer session keeps the main
-    /// stream's video back while this is set and hands it on, one unit per
-    /// transport pass, once it is cleared, so a loopback test can make video
-    /// arrive later than the control channel, as a slow link does. Never
-    /// written in a shipping build.
+    /// Test hook (`test-hooks` feature only): ask a viewer session's transport
+    /// to hand the main stream's most recent delta frames to the media loop
+    /// once more, as frames that arrive late would come: a loopback test's way
+    /// to have video from before a block arrive after it. Never written in a
+    /// shipping build.
     #[cfg(feature = "test-hooks")]
-    pub hold_video: AtomicBool,
+    pub replay_video: AtomicBool,
+    /// Test hook (`test-hooks` feature only): how many frames `replay_video`
+    /// has handed on.
+    #[cfg(feature = "test-hooks")]
+    pub replayed_video: AtomicU32,
 }
 
 /// Viewer: the host's `blocked` state as the present loops see it
@@ -1596,9 +1600,15 @@ impl Session {
         self.shared.sever.store(true, Ordering::SeqCst);
     }
 
-    /// Keep the main stream's video back (`true`) or let it through again.
-    pub(crate) fn hold_video(&self, hold: bool) {
-        self.shared.hold_video.store(hold, Ordering::SeqCst);
+    /// Hand the main stream's most recent delta frames to the media loop
+    /// once more.
+    pub(crate) fn replay_video(&self) {
+        self.shared.replay_video.store(true, Ordering::SeqCst);
+    }
+
+    /// How many frames [`replay_video`](Self::replay_video) has handed on.
+    pub(crate) fn replayed_video(&self) -> u32 {
+        self.shared.replayed_video.load(Ordering::SeqCst)
     }
 }
 

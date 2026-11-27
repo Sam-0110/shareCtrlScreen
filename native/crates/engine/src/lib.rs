@@ -703,15 +703,26 @@ impl Engine {
         }
     }
 
-    /// Keep viewer session `id`'s main-stream video back (`true`), or hand
-    /// what was kept on and let the rest through (`false`): video that
-    /// arrives later than the control channel, as on a slow link.
+    /// Hand viewer session `id`'s most recent main-stream delta frames to its
+    /// media loop once more: video that arrives later than the control
+    /// channel, as on a slow link.
     #[doc(hidden)]
-    pub fn test_hold_viewer_video(&self, id: SessionId, hold: bool) {
+    pub fn test_replay_viewer_video(&self, id: SessionId) {
         let reg = self.reg.lock();
         if let Some(s) = reg.viewers.get(&id).and_then(|v| v.session.as_ref()) {
-            s.hold_video(hold);
+            s.replay_video();
         }
+    }
+
+    /// How many frames [`test_replay_viewer_video`](Self::test_replay_viewer_video)
+    /// has handed on in session `id`.
+    #[doc(hidden)]
+    pub fn test_viewer_video_replayed(&self, id: SessionId) -> u32 {
+        let reg = self.reg.lock();
+        reg.viewers
+            .get(&id)
+            .and_then(|v| v.session.as_ref())
+            .map_or(0, |s| s.replayed_video())
     }
 
     /// Make every viewer session's start wait `ms` before building anything,

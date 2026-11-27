@@ -381,9 +381,10 @@ pub(super) fn transport_driver(d: Driver) {
 
     let mut buf = [0u8; 2048];
     let mut video_count: u64 = 0;
-    // Test hook: main-stream video kept back by `Shared::hold_video`.
+    // Test hook (`Shared::replay_video`): the main stream's delta frames since
+    // its last keyframe, newest last, a few at most.
     #[cfg(feature = "test-hooks")]
-    let mut held_video: std::collections::VecDeque<(Vec<u8>, bool)> = Default::default();
+    let mut recent_deltas: std::collections::VecDeque<Vec<u8>> = Default::default();
     while !stop.load(Ordering::SeqCst) {
         // Test hook: a link that dies right now, as a dead network would
         // make it (the loopback has no network to cut).
@@ -392,12 +393,14 @@ pub(super) fn transport_driver(d: Driver) {
             notify_dead("severed by a test");
             break;
         }
-        // Test hook: video that was kept back goes on one unit a pass, so it
-        // reaches the media loop spread out, as late packets would.
+        // Test hook: those frames once more, as late arrivals would come.
         #[cfg(feature = "test-hooks")]
-        if !shared.hold_video.load(Ordering::SeqCst) {
-            if let (Some(tx), Some(unit)) = (&video_tx, held_video.pop_front()) {
-                let _ = tx.send(unit);
+        if shared.replay_video.swap(false, Ordering::SeqCst) {
+            if let Some(tx) = &video_tx {
+                for au in recent_deltas.iter() {
+                    let _ = tx.send((au.clone(), false));
+                    shared.replayed_video.fetch_add(1, Ordering::SeqCst);
+                }
             }
         }
         // Liveness: once connected, no traffic for DEAD_AFTER ⇒ declare it dead.
@@ -806,17 +809,17 @@ pub(super) fn transport_driver(d: Driver) {
                                 }
                             }
                             if slot == 0 {
-                                // Test hook: kept back while held, and behind
-                                // anything still kept, so the order holds.
+                                // Test hook: remember the deltas since the
+                                // last keyframe (see `recent_deltas`).
                                 #[cfg(feature = "test-hooks")]
-                                let (data, keyframe) = if shared.hold_video.load(Ordering::SeqCst)
-                                    || !held_video.is_empty()
-                                {
-                                    held_video.push_back((data, keyframe));
-                                    continue;
+                                if keyframe {
+                                    recent_deltas.clear();
                                 } else {
-                                    (data, keyframe)
-                                };
+                                    if recent_deltas.len() == 8 {
+                                        recent_deltas.pop_front();
+                                    }
+                                    recent_deltas.push_back(data.clone());
+                                }
                                 if let Some(tx) = &video_tx {
                                     let _ = tx.send((data, keyframe));
                                 }
