@@ -6,15 +6,17 @@ messages, the state machines, every flow and the invariants. It is **step S**. P
 to `native/`. Tags in flows: [VU] viewer web page, [V] viewer engine, [H] host engine, [W] the
 host's Windows capture wrapper and injector (`platform-windows`), [A] the agent, [S] the service.
 
-Windows behaviour this document relies on is listed in plan 10 §8 and is not yet verified from
-Microsoft's documentation. §8 below (the sign-in screen) holds constraints only; step S6 writes
-its structure.
+Windows behaviour this document relies on was checked against Microsoft's documentation on
+2026-11-27 (plan 10 §8, with the page for each claim). That reading changed §3.4–§3.7 here
+(plan 10 §9); those parts belong to U3 and later and are reviewed again with U3's structure
+after the U3.0 spike. §8 below (the sign-in screen) holds constraints only; step S6 writes its
+structure.
 
 ## 1. Ownership
 
 | Owner | Owns | Does not own |
 |---|---|---|
-| **Service** (`sharectrl-service.exe --run-service`, session 0, LocalSystem) | Which console session is active, whether a user is signed in; starting, watching and ending the host and the agent; the pipe's published name; the `SendSAS` call and the policy around it | Capture, input, the pipe itself, any remote session |
+| **Service** (`sharectrl-service.exe --run-service`, session 0, LocalSystem) | Which console session is active, whether a user is signed in, whether the session is locked (its session events); starting, watching and ending the host and the agent; the control pipe to the agent (§3.6); the client pipe's published name; the `SendSAS` call and the policy around it | Capture, input, the client pipe itself, any remote session |
 | **Agent** (`sharectrl-service.exe --secure-agent`, the console session, LocalSystem) | The pipe (as server); **the decision what it will serve, from the machine's state** (§3.5); capture of and input into the `Winlogon` desktop; the frame sections; asking the service for Ctrl+Alt+Del | The network, remote sessions, permissions, the user's files and settings, the `Default` desktop |
 | **Host's Windows platform** (`crates/platform-windows`) | The pipe client; one `ScreenCapture` over two sources and its D3D11 device; the forwarding injector and **the ledger of held keys**; the `ScreenState` it reports | Who is connected, permissions |
 | **Host engine** (`crates/engine`) | Who is connected and with which permission (unchanged); sending `hstate`; honouring `sas` and `lock` only with control; not streaming a secure screen to a viewer that may not see it (D8) | Anything Windows-specific |
@@ -216,21 +218,47 @@ impl Engine {
 
 **Name.** `\\.\pipe\ShareCtrlScreen.<128 random bits, hex>`, new for every agent start. The agent
 creates the pipe, then tells the service the name over its control channel (§3.6); the service
-writes it to a volatile registry value under `HKLM` that users can read and only SYSTEM and
-administrators can write, keyed by session id. The host reads the name there. The name is
-published only after the pipe exists, so nobody can create it first.
+writes it as a value named by the session id in a **volatile registry key** under `HKLM`. The
+host reads the name there. The name is published only after the pipe exists, so nobody can
+create it first.
 
-**Creation.** Byte mode, one instance, overlapped. Security descriptor: owner SYSTEM; SYSTEM full
-access; the session user's SID read and write, without the right to create instances; an explicit
-medium integrity label (it keeps low-integrity processes out); `FILE_FLAG_FIRST_PIPE_INSTANCE`;
-`PIPE_REJECT_REMOTE_CLIENTS`. The agent takes the user's SID from that session's own token, never
-from its command line. If creation fails the agent logs why and exits non-zero; with a random
-name this means a real fault, not a squatter.
+- Volatility belongs to a key, not a value, and the flag is ignored for a key that already
+  exists. The service creates the key itself with an explicit, protected security descriptor
+  (SYSTEM and administrators full access, users read) instead of inheriting one.
+- A volatile key under `HKLM` lasts until a full shutdown, and an ordinary shutdown is a fast
+  start-up shutdown by default. So the service **deletes every published name when it starts**
+  and removes a session's name when that session's agent stops. A stale name is never trusted
+  anyway: the host checks what it opened (below).
 
-**The host's check of the server.** After opening (with `SECURITY_SQOS_PRESENT |
-SECURITY_IDENTIFICATION`, so the server cannot act as the host's user): the pipe object's owner
-is SYSTEM (`GetSecurityInfo` on the handle) and the server's session is the host's own
-(`GetNamedPipeServerSessionId`). The host never needs to open the agent's process.
+**Creation.** Byte mode, one instance, overlapped, `FILE_FLAG_FIRST_PIPE_INSTANCE`, and
+`PIPE_REJECT_REMOTE_CLIENTS` in the pipe mode. Security descriptor:
+
+- Owner SYSTEM, set explicitly.
+- SYSTEM: full access.
+- The session's **logon SID** (not the user's SID: pipe names are machine-wide, and the same
+  user can be signed in to another session): `FILE_READ_DATA | FILE_WRITE_DATA |
+  FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE`. Individual rights, never
+  `FILE_GENERIC_WRITE` or `GENERIC_WRITE`, because those include the right to create instances.
+- A medium integrity label that blocks reading as well as writing from below
+  (`S:(ML;;NWNR;;;ME)`): without the read part a low-integrity process could open the single
+  instance and hold it.
+
+The agent takes the logon SID from that session's own token, never from its command line. If
+creation fails the agent logs why and exits non-zero; with a random name this means a real
+fault, not a squatter.
+
+**The host's open.** With exactly the rights of the access list above (asking for
+`GENERIC_WRITE` would be refused) and `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`, so the
+server cannot act as the host's user; without the second flag the level would be impersonation.
+`ERROR_PIPE_BUSY` (the one instance is taken) is a retry at the next `reinit`, not an error.
+
+**The host's check of the server.** The pipe object's owner is SYSTEM (`GetSecurityInfo` on the
+handle, which is why the host has `READ_CONTROL`). The host never needs to open the agent's
+process. `GetNamedPipeServerSessionId` is documented only for a handle the server created; if
+the U3.0 spike shows it works on the host's handle, "the server's session is the host's own" is
+added as a second check, and recorded as resting on a device test. An elevated administrator
+could create a pipe owned by SYSTEM; an administrator is outside what this check defends
+against.
 
 **The agent's check of the client.** The client's process (`GetNamedPipeClientProcessId`, a
 handle kept for the life of the connection so the id cannot be reused) is `sharectrl.exe` from
@@ -293,17 +321,21 @@ enum Refusal { NotSecure, NotAllowed, TooMany, NoSuchOutput, Failed }
 - **Late answers.** An `Attached` whose `a` the host is no longer waiting for (the wait timed
   out) is handled by the reader thread: it closes the section handle and sends `Detach { a }`.
   Nothing is leaked when a retry loop outruns the agent.
-- **The section.** Unnamed, one per attachment, `stride × height` bytes. Its handle may be
-  re-duplicated by the host with more access, so the agent treats it as write-only: **it never
-  reads a section and never takes a decision from its contents.**
+- **The section.** Unnamed, one per attachment, `stride × height` bytes, created with an
+  explicit security descriptor (SYSTEM only) and duplicated into the host with read access
+  only. Whether the holder of a handle can raise its own access is not documented, so the agent
+  treats the section as write-only all the same: **it never reads a section and never takes a
+  decision from its contents.**
 
 ### 3.5 The agent (`crates/secure-agent`)
 
-**Start-up.** The agent runs only if all of these hold, else it logs and exits non-zero: it is
-LocalSystem; it holds SeTcbPrivilege; its two control handles (§3.6) are valid pipes. So an
-`--secure-agent` started by hand does nothing. It then makes itself Per-Monitor-V2 DPI aware
-before any other window-system call: the injector's geometry is physical pixels
-(`crates/input/src/lib.rs:106`) and the service binary has no manifest (`service/build.rs`).
+**Start-up.** The agent first makes itself Per-Monitor-V2 DPI aware, before any other
+window-system call: the injector's geometry is physical pixels (`crates/input/src/lib.rs:106`)
+and the service binary has no manifest (`service/build.rs`). "Already set" (access denied) is
+success; any other failure ends the agent. It then runs only if all of these hold, else it logs
+and exits non-zero: it is LocalSystem; it holds SeTcbPrivilege; it connected to the control pipe
+named on its command line and that pipe's server is the service (§3.6). So an `--secure-agent`
+started by hand does nothing.
 
 **What it serves — decided by the agent from what it reads itself:**
 
@@ -313,11 +345,17 @@ before any other window-system call: the injector's geometry is physical pixels
 | `Winlogon` | locked | any | Serves: `kind: Lock` |
 | `Winlogon` | not locked | on | Serves: `kind: Prompt` |
 | `Winlogon` | not locked | off or absent | Nothing (`Refusal::NotAllowed`) |
-| any other name | any | any | Nothing (`Refusal::NotSecure`) |
+| any other name (`ScreenSaver` included) | any | any | Nothing (`Refusal::NotSecure`) |
 
-"Locked" is the session's state as Windows reports it to a SYSTEM process; the machine switch is
-a value under `HKLM` that only administrators can write. The agent reads neither from the host,
-the user's registry hive or the user's files. Until U5 the switch is not read and counts as off.
+"Locked" comes from SYSTEM-side sources only: the lock and unlock events the service receives
+for the session and passes on (§3.6), with the session's state as Windows reports it to a
+SYSTEM process as the value at start. Microsoft documents the events as the way to know; the
+query can fail and can answer "unknown". **Anything but a positive "locked" counts as not
+locked**, so a doubt falls to the row that needs the administrator's switch. The machine switch
+is a value under `HKLM` that only administrators can write. The agent reads none of this from
+the host, the user's registry hive or the user's files. Until U5 the switch is not read and
+counts as off. The order of the lock event and the desktop switch is not documented; the U3.0
+spike measures it, and `agent-watch` re-evaluates on both.
 
 **Threads**, each created for one job. None creates a window, installs a hook or enters a COM
 single-threaded apartment, so `SetThreadDesktop` works on all of them.
@@ -340,6 +378,11 @@ single-threaded apartment, so `SetThreadDesktop` works on all of them.
   Changes that arrive meanwhile are merged into the next frame's rectangles. If no `Ack` comes,
   the thread idles; it never blocks anything else.
 - At most 30 frames a second per attachment.
+- **One duplication per output.** Windows allows a process one duplication of an output. What a
+  second attachment to an output already being served gets (a refusal, or frames from the one
+  duplication) is open, and is settled in U3's structure review against how the host treats
+  two captures of one output today. `DXGI_ERROR_UNSUPPORTED` and
+  `DXGI_ERROR_SESSION_DISCONNECTED` from the duplication are retried, not fatal.
 - **Display asleep.** If the output delivers no picture, the attachment still succeeds
   (`picture: false`) and the thread retries the duplication once a second and after every
   injected event. The first forwarded input wakes the display, as it would on the desktop.
@@ -360,30 +403,52 @@ start. Never a key code, a typed character, a pointer position or any part of a 
 
 ### 3.6 Service ↔ agent
 
-At launch the service creates two anonymous pipes and passes exactly those two handles to the
-agent: an explicit inherited-handle list in the process's start-up attributes, nothing else
-inherited, and the two handle values on the command line. Line protocol, UTF-8, one request at a
-time:
+A **named control pipe served by the service**, one per agent launch. (The first design passed
+two anonymous pipe handles by inheritance. Windows does not inherit handles across sessions,
+and anonymous pipes cannot be overlapped; plan 10 §8 row 18.)
+
+- The service creates `\\.\pipe\ShareCtrlScreen.ctl.<128 random bits, hex>`: one instance,
+  overlapped, first-instance, remote clients rejected, owner SYSTEM, access for SYSTEM only.
+  It passes the name on the agent's command line. The name is not a secret: the access list
+  is what keeps everyone but SYSTEM out.
+- The service accepts exactly one client and only if its process id is the agent it has just
+  created (`GetNamedPipeClientProcessId` on the service's own handle, compared with the id
+  from the launch, while the service holds that process's handle). Anything else is
+  disconnected and the launch counts as failed.
+- The agent opens the pipe with identification-level impersonation only, and checks that the
+  pipe's owner is SYSTEM before it sends anything.
+- Either side closing the pipe ends the relationship: the agent exits (§5.9), the service
+  treats the agent as gone.
+
+Line protocol, UTF-8, one request at a time:
 
 ```
 agent → service:   pipe <name>              the client pipe exists under this name
                    sas                      at most one a second
 service → agent:   sas ok | sas policy | sas failed <text>
-                   session <event>          lock, unlock, logon, logoff (a hint to re-evaluate §3.5)
+                   session <event>          lock, unlock, logon, logoff: the agent's source for
+                                            "locked" (§3.5), sent as they arrive and once at
+                                            connect with the current state
 ```
 
-**`SendSAS` and the policy (D3, the recommended behaviour).** If the policy value that allows
-services to send it is absent, the service sets it, calls `SendSAS(FALSE)`, and removes it again.
-If the value is present and allows services, it just calls. If it is present and forbids, it
-answers `sas policy` and changes nothing. A marker under the service's own key records "we set
-it", so a crash between set and remove is repaired at the next service start. If step S finds
-that the agent itself may call `SendSAS`, this exchange is dropped and the call moves to the
-agent; the policy handling stays in the service.
+**`SendSAS` and the policy (D3, the recommended behaviour).** The call is made by the service:
+Windows lets a service call it, and a SYSTEM process that is not a service only under conditions
+the agent does not meet. To aim at the agent's session the service impersonates the agent's end
+of the control pipe for the call, which is the documented way to choose the session; U4
+verifies on a device that this reaches the console session. If the policy value that allows
+services to send it is absent, the service sets it, calls `SendSAS(FALSE)`, and removes it
+again. If the value is present and allows services, it just calls. If it is present and forbids,
+it answers `sas policy` and changes nothing. A marker under the service's own key records "we
+set it", so a crash between set and remove is repaired at the next service start. The value's
+name and numbers are not in Microsoft's documentation; U4 confirms them, and how quickly
+Windows picks up a change, on a device before this behaviour is relied on.
 
 ### 3.7 Service changes
 
 - `RegisterServiceCtrlHandlerExW`, accepting stop, shutdown and session change. The handler only
-  records the event and signals the loop; all work stays on the loop's thread.
+  records the event and signals the loop; all work stays on the loop's thread. The handler
+  takes no lock (Microsoft's rule for control handlers), and the controls are accepted from the
+  moment the service reports running, not before.
 - The loop waits on that signal with a 2 s timeout instead of sleeping
   (`service/src/main.rs:300`), so the poll stays as the fallback. An event and the poll can report
   the same change in either order; both are idempotent inputs to the supervisor.
@@ -392,14 +457,18 @@ agent; the policy handling stays in the service.
 - From U3: a second `Supervisor` for the agent. It wants an agent exactly when the host is
   wanted: a user is signed in at the active console session. Exit code 0 means "told to stop";
   anything else is relaunched with the same doubling delay (`service/src/supervise.rs:28-33`).
-- **Launch** (`elevation::agent`): duplicate the service's own token as a primary token, set its
-  session id to the console session (SeTcbPrivilege is enabled the same way as for UIAccess,
-  `crates/elevation/src/uiaccess.rs:172-209`), create the process suspended on `winsta0\default`
-  with the two control handles, assign it to a job object that kills its processes when the job
-  handle closes, resume. If the assignment is refused (plan 10 §8), the launch continues without
-  the job and logs it once: the agent still exits when its control pipe closes.
+- **Launch** (`elevation::agent`): create the control pipe (§3.6); duplicate the service's own
+  token as a primary token, set its session id to the console session (SeTcbPrivilege is
+  enabled the same way as for UIAccess, `crates/elevation/src/uiaccess.rs:172-209`); create the
+  process suspended on `winsta0\default`, inheriting no handles, with an explicit process
+  security descriptor that grants SYSTEM only (so the user's programs cannot end it); assign it
+  to a **new** job object that kills its processes when the job handle closes; resume; accept
+  the agent on the control pipe. A job belongs to the session of the first process put in it,
+  so each launch gets its own job and the agent is its first process; a job is never reused for
+  another session. If the assignment is refused, the launch continues without the job and logs
+  it once: the agent still exits when its control pipe closes.
 - **Stop.** On service stop, on a session change away from the agent's session, and on sign-out:
-  close the control pipes, wait up to 5 s for the agent to exit, then terminate it and wait for
+  close the control pipe, wait up to 5 s for the agent to exit, then terminate it and wait for
   the handle. Only then report stopped (K10). On **system shutdown** the service terminates the
   agent at once, without the wait.
 - **`--stop-service` and `--uninstall-service`** (`crates/elevation/src/service.rs:416` waits only
@@ -608,6 +677,9 @@ serves only the other platforms.
 
 ### 5.4 The locked machine's display is asleep
 
+This is the usual state of a machine someone connects to while it is locked: Windows turns the
+display off 60 seconds after the console locks, by default.
+
 1. [W] Attaches as in 5.1. [A] answers `Attached { picture: false }`.
 2. [H] Sends `hstate secure lock`. No frame arrives; the viewer shows the badge and whatever the
    decoder last had, which the message under the badge explains ("the remote display is asleep;
@@ -640,7 +712,9 @@ A view-only viewer cannot wake it; that is the same on the normal desktop today.
 ### 5.7 Lock from the viewer
 
 [V] sends `lock` → [H] control gate → `platform.lock_session(done)` (the host itself, as the
-user) → `actr` → the machine locks → flow 5.1 follows by itself. A host in `approve` mode does
+user) → `actr` → the machine locks → flow 5.1 follows by itself. Windows locks asynchronously
+and reports only that the request was accepted, so `actr ok` means "requested"; the viewer
+learns that the machine is locked from `hstate`. A host in `approve` mode does
 not advertise `lock` (D9).
 
 ### 5.8 A UAC prompt (U5)
@@ -657,7 +731,7 @@ not advertise `lock` (D9).
 
 ### 5.9 Stopping the service, upgrading
 
-1. [S] Receives stop. It closes the agent's control pipes and removes the published name.
+1. [S] Receives stop. It closes the agent's control pipe and removes the published name.
 2. [A] `agent-control` sees the close: release held keys, close the client's pipe, exit 0.
 3. [S] Waits for the agent's process handle (5 s, then terminate and wait), then reports stopped.
 4. [W] The pipe broke: `Lost`, then `Blocked(AgentUnavailable)` if a secure desktop is up.
@@ -745,8 +819,8 @@ unacknowledged frame.
 | K11 | With the user's setting off the host never attaches. The setting is a preference; the agent's table is the protection. |
 | K12 | A host without the service behaves as today, plus `hstate`. |
 | K13 | `hstate` is sent when the ctl channel opens and when the main stream's loop observes a change of `ScreenState` (a paused stream observes it at resume), only to a viewer that advertised `hstate`. |
-| K14 | The pipe exists before its name is published. It is created with its access list, its integrity label, first-instance and reject-remote, or not at all. |
-| K15 | The agent ends when the service ends: it exits when its control pipe closes, and a job object ends it where Windows allows the assignment. |
+| K14 | The pipe exists before its name is published. It is created with its access list (the session's logon SID, individual rights, no right to create instances), its integrity label (no read or write from below), an explicit SYSTEM owner, first-instance and reject-remote, or not at all. The service deletes every published name when it starts. |
+| K15 | The agent ends when the service ends: it exits when its control pipe closes, and its own job object ends it where Windows allows the assignment. The control pipe is the service's, open to SYSTEM only, and accepts only the process the service has just created. |
 | K16 | ShareCtrlScreen never stores, caches or replays a Windows password or PIN. |
 | K17 | The normal desktop's capture and input path is the code that runs today; the agent is tried only after `OpenInputDesktop` was denied. |
 | K18 | `sas` and `lock` are honoured only for a session with control; `sas` at most once a second; `lock` is advertised only in `password` mode. |

@@ -9,16 +9,17 @@ in [10a](10a-STRUCTURE-AND-FLOWS.md). Nothing here is built yet.
 **Revision 2**, after the design review of the same day (§7). The review changed the trust
 model, the phases and several contracts; §2–§6 below already include its results.
 
-**Not verified from Microsoft's documentation.** `learn.microsoft.com` was unreachable from the
-session that wrote this plan and from its reviewer. Every statement about Windows behaviour comes
-from this repository's own design (`pans/04-NATIVE-REWRITE-PLAN.md` §8b) and general knowledge.
-§8 lists each one; step S is not complete until they are read and cited.
+**Revision 3**, after Microsoft's documentation was read for every Windows claim the design
+makes (2026-11-27, §8). The reading confirmed most of them, contradicted one contract (how the
+service hands the agent its control channel) and added constraints; §9 lists the changes, which
+are already in [10a](10a-STRUCTURE-AND-FLOWS.md). What the documentation does not say is listed
+in §8 as device-only and is answered by the U3.0 spike or a phase checklist.
 
 ## Progress
 
 | Step | What | Status |
 |---|---|---|
-| S | This plan + structure ([10a](10a-STRUCTURE-AND-FLOWS.md)), adversarial review folded in, Microsoft references read | **in progress**: plan and 10a written, review folded in (§7). Open: the Microsoft references (§8), the owner's answers to D3, D7 and D8 (§5) |
+| S | This plan + structure ([10a](10a-STRUCTURE-AND-FLOWS.md)), adversarial review folded in, Microsoft references read | **in progress**: plan and 10a written, review folded in (§7), Microsoft references read and folded in (§8, §9). Open: the owner's answers to D3, D7 and D8 (§5) |
 | U1 | The viewer is told what the host's screen is doing | not started |
 | U2 | Service: session events; a sign-in no longer waits out the launch delay | not started |
 | U3 | The agent: the lock screen of a signed-in user | not started (begins with a device spike) |
@@ -154,9 +155,9 @@ README's limits when U3 ships.
 ### 3.3 The pipe
 
 One named pipe per console session, served by the agent, with a **random name** the service
-publishes where only SYSTEM can write and users can read. Only SYSTEM and that session's user may
-open it; remote clients are refused. The host accepts a pipe only if the pipe object is owned by
-SYSTEM and served from the host's own session.
+publishes where only SYSTEM can write and users can read. Only SYSTEM and that sign-in session
+(its logon SID, so not the same user signed in elsewhere) may open it; remote clients are
+refused. The host accepts a pipe only if the pipe object is owned by SYSTEM (§8 rows 19, 20).
 
 Messages are small JSON documents with a length prefix and a version. The agent parses input from
 a less privileged process: every message has a size limit, and a malformed, unknown or
@@ -273,11 +274,28 @@ Microsoft references of §8 read and cited; D3, D7 and D8 answered by the owner.
 Built on a feature branch and merged when the whole phase passes, so no release ever ships an
 agent that does nothing.
 
-- U3.0 **Spike on a device, before anything else:** with the Winlogon desktop up, can the host
-  create the hardware encoder on its device, and does an encoder created earlier keep encoding?
-  Does Desktop Duplication work from a SYSTEM process in the session, with the display on and
-  with it asleep? Can that process be put in a job object created in session 0? If any answer is
-  no, U3's design returns to review before more is built.
+- U3.0 **Spike on a device, before anything else.** Each question is something Microsoft's
+  documentation does not answer (§8). If any answer is no, U3's design returns to review before
+  more is built.
+  1. **Does the lock screen accept a password typed by a SYSTEM process in the session, on a
+     fully updated Windows 11?** A Microsoft Q&A answer of 2026-11-24 (not documentation; §8
+     row 17) says the January 2026 security updates make Windows authentication dialogs accept
+     input only from "a physical keyboard, trusted UIAccess accessibility apps, or apps running
+     elevated", and calls elevation "a temporary mitigation". This is the first question because
+     a "no" ends the design of U3 as written.
+  2. With the Winlogon desktop up, can the host create the hardware encoder on its device, and
+     does an encoder created earlier keep encoding?
+  3. Does Desktop Duplication work from a SYSTEM process in the session whose thread is attached
+     to the input desktop? What does it do while the display is off (a locked console turns its
+     display off after 60 s by default, so this is the normal case for flow 10a §5.3): fail, or
+     deliver nothing?
+  4. Does `SendInput` from that thread reach the Winlogon desktop, and where does it go when the
+     thread is still attached to another desktop?
+  5. Does the lock event the service receives arrive before or after the input desktop becomes
+     `Winlogon`, and what does the session's lock state read at that moment (10a §3.5)?
+  6. Does `GetNamedPipeServerSessionId` work on a client handle (10a §3.4)?
+  7. Can the agent be the first process of a fresh job object created by the service (§8 row 6)?
+  8. What does a secure screen saver look like to the agent (input desktop `ScreenSaver`)?
 - U3.1 (no behaviour change) `capture::Duplicator` splits device creation from duplication; the
   `input` crate's keyboard hook moves behind a feature the agent does not enable; the handle leak
   in `InputDesktopFollower::follow` (`crates/elevation/src/desktop.rs:58`) is fixed.
@@ -346,6 +364,7 @@ Whole-feature review, the README status table, version bump, release.
 | A program running as the signed-in user uses the agent | The agent's reach is decided on the SYSTEM side (§3.2): the lock screen only, unless an administrator enables UAC prompts. What remains (the lock screen's picture, password guesses that can lock the account out, the typed password passing through the host) is stated in the README |
 | Another local account squats the pipe's name to imitate the agent or to block it | A random name published by the service after the pipe exists; the host accepts only a pipe owned by SYSTEM; the host connects without letting the server impersonate it |
 | The hardware encoder cannot be created, or stops, while the Winlogon desktop has input | U3.0 answers this on a device before the rest is built |
+| Windows refuses a password typed by software on the lock screen (§8 row 17) | U3.0 item 1 answers it first. A "no" stops U3 and opens the credential-provider question (§9 item 11) |
 | The verified normal-desktop path regresses | The duplication code does not change behaviour (U3.1); the agent is tried only after `OpenInputDesktop` is refused; the W8 checklist is re-run in U3 |
 | Keys stuck across the change between desktops (the Enter that submits the password, Win+L) | One ledger of held keys in the host, which sees every event; key-ups always pass (10a §3.8) |
 | The agent or the pipe dies while the machine is locked | The wrapper falls back to today's retry loop and reports `blocked`; the service restarts the agent with the existing doubling delay |
@@ -446,28 +465,82 @@ be checked (§8) and were accepted where the safer design costs little. Where th
   itself notes it does not close the ways code gets loaded into the host, and §3.2 no longer
   depends on the host being trustworthy.
 
-## 8. Unverified: to read and cite in step S
+## 8. What Microsoft's documentation says (read 2026-11-27)
 
-Each of these is used by the design and comes from memory or from `pans/04` §8b, not from a
-documentation read.
+Two research passes read `learn.microsoft.com` for every Windows claim of this plan and 10a; the
+deciding sentences were checked again against the saved pages before being accepted. `W` is
+`https://learn.microsoft.com/en-us/windows/win32`. **Confirmed** means a fetched page says it.
+**Device** means the documentation is silent and a device must show it (the U3.0 spike or the
+named checklist). Builders cite these pages in their modules' `//! ## References` blocks.
 
-| Claim | Where it matters |
-|---|---|
-| The lock screen, the sign-in screen and UAC prompts run on the `Winlogon` desktop, and only SYSTEM may open it | The whole design |
-| Desktop Duplication works on the secure desktop only for a LocalSystem process in that session whose thread is attached to the input desktop | U3.0 |
-| Desktop Duplication with the display asleep: delivers nothing, or fails | U3.0, 10a §5.4 |
-| The hardware encoder can be created and keeps working while the Winlogon desktop has input | U3.0 |
-| Setting `TokenSessionId` on a duplicate of a LocalSystem token needs SeTcbPrivilege and yields a SYSTEM process in the user's session | U3 |
-| A process in a user's session can be assigned to a job object created in session 0 | U3.0 |
-| A medium-integrity process cannot open a SYSTEM process or its token | 10a §3.4 (the design no longer needs it either way) |
-| Synchronous pipe I/O on one handle is serialised across threads | 10a §3.8 (the design uses overlapped I/O either way) |
-| An unnamed section's handle can be re-duplicated with more access by its holder | 10a §3.4 (the agent never reads the section) |
-| An unlabelled pipe is treated as medium integrity; an explicit label keeps low-integrity processes out | U3 |
-| Whether a session is locked can be read by a SYSTEM process (`WTSQuerySessionInformation`), reliably at the moment the desktop switches | U3, U5 |
-| `SendSAS(FALSE)` works from a LocalSystem service and is governed by the `SoftwareSASGeneration` policy, whose default forbids services; whether it also works from the agent | U4, D3 |
-| `RegisterServiceCtrlHandlerExW` with `SERVICE_ACCEPT_SESSIONCHANGE` delivers lock, unlock, logon, logoff and console connect events | U2 |
-| `OpenInputDesktop` in a disconnected session | U3 |
-| `SetThreadDesktop` fails on a thread that owns windows or hooks | U3 (already relied on, `adapters.rs:254-257`) |
-| A current Windows lock screen is dismissed by any key or click without Ctrl+Alt+Del unless policy says otherwise | U3, U4 |
+| # | Claim | Result | Source | Consequence |
+|---|---|---|---|---|
+| 1 | The sign-in screen, the Ctrl+Alt+Del screen and UAC prompts are on the `Winlogon` desktop of `WinSta0`; user programs cannot open it | **Confirmed.** "The Winlogon desktop's security descriptor allows access to a very restricted set of accounts, including the LocalSystem account"; the system switches to it "when the user presses the CTRL+ALT+DEL key sequence, or when the User Account Control (UAC) dialog box is open". The lock screen is only called "a secure desktop" | `W/winstation/desktops`, `W/secauthn/winlogon-states` | The allow-list of `Winlogon` (10a §3.5) stands. A secure screen saver uses a third desktop, `ScreenSaver`: U3.0 item 8 |
+| 2 | Desktop Duplication of the secure desktop needs LocalSystem | **Confirmed** for the account ("only an application that runs at LOCAL_SYSTEM can access the secure desktop"); a desktop switch or mode change gives `DXGI_ERROR_ACCESS_LOST`; not available in session 0. **Device** for the thread's desktop. New: "A process can have only one desktop duplication interface on a single desktop output"; `DXGI_ERROR_UNSUPPORTED` and `DXGI_ERROR_SESSION_DISCONNECTED` are retry cases | `W/api/dxgi1_2/nf-dxgi1_2-idxgioutput1-duplicateoutput`, `…/nf-dxgi1_2-idxgioutputduplication-acquirenextframe`, `W/direct3d11/direct3d-11-1-features` | The agent must be in the user's session (it is). One duplication per output in the agent: 10a §3.5 |
+| 3 | Desktop Duplication with the display asleep | **Device.** Documented nearby: "when the console is locked, Windows waits for 60 seconds of inactivity before powering off the display" | `https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/monitor-powers-off-when-pc-locked` | Connecting to an already locked host normally meets a display that is off: 10a §5.4 is the common path. U3.0 item 3 |
+| 4 | The hardware encoder works while the Winlogon desktop has input | **Device.** Nothing documented either way | — | U3.0 item 2 |
+| 5 | `TokenSessionId` on a duplicate of a LocalSystem token needs SeTcbPrivilege and gives a SYSTEM process in that session | **Confirmed** ("must have the Act As Part Of the Operating System privilege"; "The process is run in the session specified in the token") | `W/api/winnt/ne-winnt-token_information_class`, `W/api/processthreadsapi/nf-processthreadsapi-createprocessasuserw` | 10a §3.7 launch stands |
+| 6 | A process in a user's session can be put in a job object created in session 0 | **Confirmed with a condition:** "A job is associated with the session of the first process to be assigned to the job"; all its processes must be in that session | `W/api/jobapi2/nf-jobapi2-createjobobjectw`, `…/nf-jobapi2-assignprocesstojobobject` | A fresh job per agent launch, the agent its first process, never reused across sessions (10a §3.7). U3.0 item 7 confirms |
+| 7 | A SYSTEM process can read whether a session is locked | **Partly.** `WTSINFOEX_LEVEL1.SessionFlags` has `LOCK`, `UNLOCK` and `UNKNOWN` (0xFFFFFFFF); the query fails when Remote Desktop Services is not running; on Windows 7 the two values are reversed. `LockWorkStation`'s page says the documented way to know is the session notification. Timing against the desktop switch: **Device** | `W/api/wtsapi32/ns-wtsapi32-wtsinfoex_level1_w`, `…/nf-wtsapi32-wtsquerysessioninformationw`, `W/api/winuser/nf-winuser-lockworkstation` | The service's lock and unlock events are the primary source; the query gives the value at start; unknown never counts as locked (10a §3.5). U3.0 item 5 |
+| 8 | `SendSAS(FALSE)` works from a LocalSystem service and is governed by a policy whose default forbids services | **Confirmed** for both ("an application must either be running as a service or have the uiAccess attribute"; "If you disable or don't configure this setting, only Ease of Access applications running on the secure desktop can simulate the SAS"). The agent is not a service, so it cannot call it. The policy's key is `Software\Microsoft\Windows\CurrentVersion\Policies\System`; its value name and numbers are **not on Learn**. Which session a service in session 0 reaches is not documented; impersonating a token of the session is ("simulates a SAS on the session associated with the impersonated token") | `W/api/sas/nf-sas-sendsas`, `https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-admx-winlogon` | The call stays in the service (10a §3.6). D3's handling of the value is verified on a device in U4 |
+| 9 | `OpenInputDesktop` in a disconnected session | **Confirmed, and not a refusal:** it "returns a handle to the desktop that becomes active when the user restores the connection" | `W/api/winuser/nf-winuser-openinputdesktop` | A disconnected session is never reported as `blocked` because of this call |
+| 10 | `SetThreadDesktop` fails on a thread that owns windows or hooks | **Confirmed** | `W/api/winuser/nf-winuser-setthreaddesktop` | 10a §3.5 threads stand |
+| 11 | A current lock screen is dismissed without Ctrl+Alt+Del unless policy says otherwise | **Partly.** Dismissal by "touch, the keyboard, or by dragging it with the mouse" is documented; two Microsoft pages disagree on the policy's default | `https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-admx-controlpaneldisplay`, `…/policy-csp-localpoliciessecurityoptions` | A plain click may not be enough (U3 checklist). Managed machines can require the SAS: U4 is needed |
+| 12 | `RegisterServiceCtrlHandlerExW` with `SERVICE_ACCEPT_SESSIONCHANGE` delivers lock, unlock, logon, logoff and console events | **Confirmed**, with values (`SERVICE_CONTROL_SESSIONCHANGE` 0xE; `WTS_SESSION_LOGON` 0x5 … `WTS_SESSION_UNLOCK` 0x8) and rules: "a service will only be notified of a user logon if it is fully loaded before the logon attempt is made"; the handler "should avoid operations that might block, such as taking a lock"; controls are accepted only once running | `W/api/winsvc/nc-winsvc-lphandler_function_ex`, `W/termserv/wm-wtssession-change`, `W/api/winsvc/nf-winsvc-setservicestatus` | U2 as designed; the 2 s poll must stay |
+| 13 | `WTSQueryUserToken` when nobody is signed in | Needs LocalSystem and SeTcbPrivilege (**confirmed**); the error is **not documented**. `WTSGetActiveConsoleSessionId` returns 0xFFFFFFFF also while the console session is being attached or detached | `W/api/wtsapi32/nf-wtsapi32-wtsqueryusertoken`, `W/api/winbase/nf-winbase-wtsgetactiveconsolesessionid` | The supervisor treats any failure as "no user yet" and never branches on one error code |
+| 14 | Synchronous pipe I/O on one handle is serialised across threads | **Confirmed** ("If this flag is not specified, then I/O operations are serialized") | `W/api/fileapi/nf-fileapi-createfilew`, `W/ipc/synchronous-and-overlapped-input-and-output` | Overlapped I/O, one `OVERLAPPED` and event per pending operation |
+| 15 | An unlabelled pipe is treated as medium integrity; an explicit label keeps low-integrity processes out | **Confirmed**, with a refinement: the default policy blocks writes only | `W/secauthz/mandatory-integrity-control`, `W/api/winnt/ns-winnt-system_mandatory_label_ace` | The label also blocks reads: `S:(ML;;NWNR;;;ME)` (10a §3.4) |
+| 16 | A medium-integrity process cannot open a SYSTEM process or its token | **Partly.** Integrity leaves it at most `SYNCHRONIZE`, `PROCESS_QUERY_LIMITED_INFORMATION` and `PROCESS_TERMINATE`; whether the default access list grants those is not documented | `https://learn.microsoft.com/en-us/previous-versions/dotnet/articles/bb625962(v=msdn.10)` | The agent's process gets an explicit SYSTEM-only security descriptor (10a §3.7) |
+| 17 | Injected input reaches the lock screen's password box | **Device**, and at risk. `SendInput`'s page does not say which desktop receives the input, and a blocked call cannot be detected ("neither GetLastError nor the return value will indicate the failure was caused by UIPI blocking"). A Microsoft Q&A answer by vendor staff (2026-11-24, not documentation; the KB it cites, KB5080542, is on a site this work could not reach) says that since the January 2026 updates authentication dialogs "only accept input from trusted local sources, such as a physical keyboard, trusted UIAccess accessibility apps, or apps running elevated", with elevation "only as a temporary mitigation", and points to credential providers as the supported way | `W/api/winuser/nf-winuser-sendinput`, `https://learn.microsoft.com/en-us/answers/questions/6079966/supported-windows-11-integration-for-remote-assist` | U3.0 item 1. If typing is refused, U3 needs another way to unlock (§9) |
+| 18 | Handles reach the agent by inheritance from the service | **Contradicted.** "You cannot inherit handles across sessions. Additionally, if this parameter is TRUE, you must create the process in the same session as the caller"; anonymous pipes do not support overlapped I/O | `W/api/processthreadsapi/nf-processthreadsapi-createprocessasuserw`, `W/ipc/anonymous-pipe-operations` | 10a §3.6 rewritten: a named control pipe served by the service |
+| 19 | The host can tell the pipe's server is the agent | **Partly.** The owner can be read from the handle with `READ_CONTROL`. `GetNamedPipeServerSessionId` is documented only for a handle "created by the CreateNamedPipe function", which the host's is not | `W/api/aclapi/nf-aclapi-getsecurityinfo`, `W/api/winbase/nf-winbase-getnamedpipeserversessionid` | The owner check is the contract; the session check is added only if U3.0 item 6 shows it works |
+| 20 | The pipe's access list keeps other sessions and squatters out | **Confirmed**, with two corrections: pipe names are machine-wide and Microsoft says to "use the logon SID on the DACL"; `FILE_GENERIC_WRITE` includes the right to create instances ("FILE_APPEND_DATA and FILE_CREATE_PIPE_INSTANCE have the same definition") | `W/ipc/named-pipe-security-and-access-rights`, `W/api/namedpipeapi/nf-namedpipeapi-createnamedpipew` | Logon SID and individual rights on both ends (10a §3.4) |
+| 21 | An unnamed section's handle can be re-duplicated with more access by its holder | **Not documented** either way ("In some cases, the new handle can have more access rights than the original handle") | `W/api/handleapi/nf-handleapi-duplicatehandle` | Unchanged: the agent never reads a section. It is duplicated into the host read-only, with an explicit security descriptor |
+| 22 | A volatile registry value under `HKLM` disappears at restart | **Partly.** Volatility belongs to a key, is "ignored for keys that already exist", and lasts until "a full shutdown"; "a fast startup shutdown is the default" | `W/api/winreg/nf-winreg-regcreatekeyexw` | A volatile key with its own security descriptor; the service clears stale names when it starts (10a §3.4) |
+| 23 | The agent can make itself Per-Monitor-V2 aware without a manifest | **Confirmed**: the call must come "before you call any APIs that depend on the DPI awareness"; `ERROR_ACCESS_DENIED` means it was already set; Windows 10 1703 or later | `W/api/winuser/nf-winuser-setprocessdpiawarenesscontext` | 10a §3.5 start-up |
+| 24 | The lock action reports whether the machine locked | **No.** `LockWorkStation` "executes asynchronously"; success means "the operation has been initiated" | `W/api/winuser/nf-winuser-lockworkstation` | `actr` for `lock` means "requested"; the viewer learns of the lock from `hstate` (10a §5.7) |
 
 Nothing in this plan counts as working until its device checklist passes (decision #15).
+
+## 9. References review (2026-11-27) → changes
+
+What §8 changed in the design. Each item is in 10a already. The parts of 10a that changed belong
+to U3 and later; they are reviewed again with the rest of U3's structure after the U3.0 spike,
+before U3.1 starts. U1 and U2 are not affected except where noted.
+
+1. **The service ↔ agent channel is a named pipe served by the service** (10a §3.6). Inheriting
+   two anonymous pipe handles across sessions is ruled out by the documentation (§8 row 18).
+2. **`SendSAS` stays in the service** (§8 row 8); the branch "the agent may call it" is closed.
+   The service aims at the agent's session by impersonating the agent's end of the control pipe
+   while it calls, which is the documented way to choose the session.
+3. **Lock state comes from the service's session events**, with the query as the start value and
+   "unknown" never treated as locked (§8 row 7, 10a §3.5).
+4. **The client pipe** (10a §3.4): the session's logon SID instead of the user's SID; individual
+   access rights on both ends; a label that blocks reads as well as writes; the owner set
+   explicitly; the published name in a volatile key that the service clears at start; the host's
+   check rests on the owner.
+5. **The agent's process and its sections get explicit security descriptors** (§8 rows 16, 21).
+6. **One job object per agent launch** (§8 row 6); review item 11 of §7 is relaxed accordingly.
+7. **One duplication per output in the agent** (§8 row 2). What a second attachment to the same
+   output gets is open in 10a §3.5 and is settled in U3's structure review.
+8. **A sleeping display is the normal case** when connecting to a locked host (§8 row 3).
+9. **`lock` reports "requested"** (§8 row 24).
+10. **U2:** the handler takes no lock, controls are accepted only once the service reports
+    running, and the poll stays because a sign-in before the service has loaded is never
+    notified (§8 rows 12, 13).
+11. **U3.0 has a new first question** (§8 row 17). If Windows refuses a password typed by the
+    agent, the lock screen needs a different mechanism. Microsoft's answer names a credential
+    provider; that is a new design with its own plan, structure and review, and a decision for
+    the owner. Nothing of U3 beyond the spike is built before this is known. U1 and U2 are
+    useful either way.
+
+For the owner's open decisions (§5), from the reading:
+
+- **D3.** The policy exists and its default forbids services (§8 row 8). The value's name and
+  numbers are not in Microsoft's documentation, so "set it for the moment of sending and put it
+  back" rests on a device test in U4, not on a citation.
+- **D7.** Windows has its own administrator switch for a related case: "UIAccess programs
+  (including Windows Remote Assistance) can automatically disable the secure desktop for
+  elevation prompts" for standard users (`EnableUIADesktopToggle`, off by default). The host is a
+  UIAccess program (§2 fact 1). It does not replace D7: it does not cover administrators'
+  prompts, and it removes the secure desktop instead of serving it.
