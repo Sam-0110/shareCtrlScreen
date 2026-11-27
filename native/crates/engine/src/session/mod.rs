@@ -141,11 +141,22 @@ impl HostBlock {
     /// Record the host's state. Returns whether it changed. Written by the
     /// session's transport thread only; the loops only read.
     pub(crate) fn set(&self, blocked: bool) -> bool {
-        self.0
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                (blocked != (v % 2 == 1)).then_some(v + 1)
-            })
-            .is_ok()
+        // A compare-exchange loop, not `fetch_update`: that name is deprecated
+        // from Rust 1.100, and its replacement is newer than the workspace's
+        // minimum toolchain (`rust-version`).
+        let mut v = self.0.load(Ordering::SeqCst);
+        loop {
+            if blocked == (v % 2 == 1) {
+                return false;
+            }
+            match self
+                .0
+                .compare_exchange_weak(v, v + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return true,
+                Err(now) => v = now,
+            }
+        }
     }
 
     pub(crate) fn blocked(&self) -> bool {

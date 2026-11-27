@@ -1204,12 +1204,20 @@ impl Platform for MockPlatform {
         if lock(&self.permissions).screen_capture == PermissionState::Denied {
             return Err(CaptureError::PermissionDenied);
         }
-        let refused = self
-            .capture_refusals
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok();
-        if refused {
-            return Err(CaptureError::Lost);
+        // Take one refusal if any is left. A compare-exchange loop, not
+        // `fetch_update`: that name is deprecated from Rust 1.100, and its
+        // replacement is newer than the workspace's minimum toolchain.
+        let mut left = self.capture_refusals.load(Ordering::SeqCst);
+        while left > 0 {
+            match self.capture_refusals.compare_exchange_weak(
+                left,
+                left - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Err(CaptureError::Lost),
+                Err(now) => left = now,
+            }
         }
         Ok(Box::new(MockCapture::new(cfg)))
     }
